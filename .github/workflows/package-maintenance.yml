@@ -30,7 +30,8 @@ jobs:
           def api(path, *args):
               result = subprocess.run(["gh", "api", path, *args], capture_output=True, text=True)
               if result.returncode:
-                  raise SystemExit("Package API operation failed")
+                  error = json.loads(result.stdout) if result.stdout else {}
+                  raise SystemExit("Package API operation failed: " + str(error.get("message", result.returncode)))
               return json.loads(result.stdout) if result.stdout else None
           package = api(endpoint)
           print("Package visibility:", package["visibility"])
@@ -42,6 +43,10 @@ jobs:
               if package.get("repository", {}).get("full_name", "").lower() != os.environ["GITHUB_REPOSITORY"].lower():
                   raise SystemExit("Package repository ownership could not be verified")
               versions = api(endpoint + "/versions?per_page=100")
+              if versions and all(set(v["metadata"]["container"]["tags"]) and set(v["metadata"]["container"]["tags"]) <= requested for v in versions):
+                  api(endpoint, "--method", "DELETE")
+                  print("Withdrawn package containing only the selected revisions")
+                  raise SystemExit(0)
               removed = 0
               for version in versions:
                   tags = set(version["metadata"]["container"]["tags"])
