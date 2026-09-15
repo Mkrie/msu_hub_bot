@@ -8,6 +8,24 @@ import sys
 import tempfile
 from pathlib import Path
 
+PUBLIC_STATUS = {
+    "Image pulled; checking configuration and connections",
+    "Preflight passed; stopping the current poller",
+    "Release failed; restoring the previous poller",
+    "Previous poller restored",
+    "Rollback completed",
+    "Rollback failed; restoring the current release",
+}
+
+
+def report_result(result):
+    # SSH diagnostics can expose resolved IPs or host paths in public Actions logs.
+    for line in result.stdout.splitlines():
+        if line in PUBLIC_STATUS or re.fullmatch(r"Deployed [0-9a-f]{40} ghcr\.io/uburuntu/msu_hub_bot@sha256:[0-9a-f]{64}", line):
+            print(line)
+    if result.returncode:
+        print("Deployment failed; inspect the host privately for details", file=sys.stderr)
+
 
 def main():
     host = os.environ["DEPLOY_HOST"]
@@ -56,7 +74,9 @@ def main():
             user + "@" + host,
             "msu-hub-bot",
         ]
-        result = subprocess.run(command, input=json.dumps(payload), text=True)
+        print("Connecting to deployment host", flush=True)
+        result = subprocess.run(command, input=json.dumps(payload), text=True, capture_output=True)
+        report_result(result)
         raise SystemExit(result.returncode)
 
 
