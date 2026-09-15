@@ -358,8 +358,6 @@ async def on_startup(dp: Dispatcher):
     dp.register_message_handler(process_dyubs, MetaCommand('dyubs', 'дюбс'))
     dp.register_message_handler(process_popov, MetaCommand('popov', 'попов'))
 
-
-
     dp.register_channel_post_handler(process_forward_builder(test_chat_id), IDFilter(chat_id=kek_pek_id), content_types=ContentType.ANY)
     dp.register_channel_post_handler(process_forward_builder(related_chat_id), IDFilter(chat_id=unrelated_id), content_types=ContentType.ANY)
     dp.register_channel_post_handler(process_pookie_pook, IDFilter(chat_id=settings.pookie_chat_id), content_types=ContentType.ANY)

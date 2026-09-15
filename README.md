@@ -67,8 +67,9 @@ The launcher preserves the application's existing import layout. Ruff
 exceptions are limited to specific legacy files; runtime, deployment, and test
 code uses Ruff formatting.
 
-Demotivators use Liberation Serif. Image generation uses an external CAPTCHA
-service when configured. The debate dataset and font assets are bundled.
+Demotivators use Liberation Serif. Image generation integrations use an external
+CAPTCHA-solving service when configured. The debate dataset and font assets are
+bundled.
 
 Application license: **GPL-3.0-only**. Fonts retain their own licenses; see
 [third-party notices](THIRD_PARTY_NOTICES.md). ACRCloud binaries remain an

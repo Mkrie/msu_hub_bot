@@ -52,14 +52,6 @@ async def _push_posts(posts: List[VkPost], chat_id: int, vwps: Dict[Tuple[int, i
             await VkWallPosting.query(db).update2('owner_id', v.owner_id, 'chat_id', v.chat_id, last_post_id=post.id)
 
 
-
-
-
-
-
-
-
-
         except Exception as e:
             text = f'☢️ ' \
                    f'{hbold("VK Exception")}: {hcode(e)}\n\n' \
