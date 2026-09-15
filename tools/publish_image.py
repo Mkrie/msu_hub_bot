@@ -12,6 +12,10 @@ def run(*args, **kwargs):
 
 
 def main():
+    owner, name = os.environ["GITHUB_REPOSITORY"].split("/")
+    package = json.loads(run("gh", "api", f"users/{owner}/packages/container/{name}", capture_output=True, text=True).stdout)
+    if package["visibility"] != "private":
+        raise SystemExit("Image publication requires a private package")
     repository = "ghcr.io/" + os.environ["GITHUB_REPOSITORY"].lower()
     image = repository + ":" + os.environ["GITHUB_SHA"]
     run(

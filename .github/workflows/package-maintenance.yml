@@ -1,0 +1,54 @@
+name: Package maintenance
+
+on:
+  workflow_dispatch:
+    inputs:
+      remove_revisions:
+        description: Comma-separated image revision tags to withdraw; empty only inspects visibility
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  package:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect package and optionally withdraw selected revisions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REMOVE_REVISIONS: ${{ inputs.remove_revisions }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess
+          owner, name = os.environ["GITHUB_REPOSITORY"].split("/")
+          endpoint = f"users/{owner}/packages/container/{name}"
+          def api(path, *args):
+              result = subprocess.run(["gh", "api", path, *args], capture_output=True, text=True)
+              if result.returncode:
+                  raise SystemExit("Package API operation failed")
+              return json.loads(result.stdout) if result.stdout else None
+          package = api(endpoint)
+          print("Package visibility:", package["visibility"])
+          print("Package created:", package["created_at"])
+          requested = set(filter(None, os.environ["REMOVE_REVISIONS"].split(",")))
+          if not all(re.fullmatch("[0-9a-f]{40}", revision) for revision in requested):
+              raise SystemExit("Invalid revision tag")
+          if requested:
+              if package.get("repository", {}).get("full_name", "").lower() != os.environ["GITHUB_REPOSITORY"].lower():
+                  raise SystemExit("Package repository ownership could not be verified")
+              versions = api(endpoint + "/versions?per_page=100")
+              removed = 0
+              for version in versions:
+                  tags = set(version["metadata"]["container"]["tags"])
+                  if tags & requested:
+                      if not tags <= requested:
+                          raise SystemExit("Selected image also has other tags; leaving it intact")
+                      api(endpoint + "/versions/" + str(version["id"]), "--method", "DELETE")
+                      removed += 1
+              print("Withdrawn image versions:", removed)
+          PY
