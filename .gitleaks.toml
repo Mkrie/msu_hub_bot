@@ -1,0 +1,16 @@
+title = "MSU Hub Bot credential rules"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "literal-provider-token"
+description = "Literal token passed to an analytics or speech client, including commented examples"
+regex = '''(?:CountlyMiddleware|_?Wit)\(\s*['"]([A-Za-z0-9_-]{24,})['"]'''
+secretGroup = 1
+
+[[rules]]
+id = "literal-provider-password"
+description = "Literal password passed to the grammar client"
+regex = '''Orfogrammka\(\s*['"][^'"\r\n]+['"]\s*,\s*['"]([^'"\r\n]+)['"]'''
+secretGroup = 1

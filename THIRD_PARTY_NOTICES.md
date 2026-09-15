@@ -1,0 +1,19 @@
+# Third-party materials
+
+Application code is distributed under GPL-3.0-only. These font files retain
+their own licenses; the application license does not replace them.
+
+| Asset | Origin and terms |
+| --- | --- |
+| Liberation Serif Regular 2.1.5 | Liberation Fonts; SIL Open Font License 1.1. Retrieved from Debian's `fonts-liberation2` 2.1.5-1 package and checked against Debian's SHA256 metadata. See `licenses/Liberation.txt`. |
+| Lobster Regular | Pablo Impallari; SIL Open Font License 1.1. See `licenses/Lobster.txt`. |
+| Ubuntu Mono Regular | Canonical; Ubuntu Font Licence 1.0. See `licenses/UbuntuMono.txt`. |
+| Debate dataset | Bundled with the maintainer's confirmation that it may be redistributed. |
+
+Liberation Serif font SHA256:
+`29d12439831b7f59194efec85872f24f54eff05738933f9a860220d2abff88ba`.
+
+The ACRCloud Python SDK remains an external, pinned Git dependency. Its native
+binaries are not vendored in this repository. Deployment images remain private
+while redistribution terms are reviewed. All other dependencies retain their
+respective upstream licenses.
