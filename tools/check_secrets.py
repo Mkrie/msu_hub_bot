@@ -27,7 +27,11 @@ def main():
                 continue
             if path.name.startswith(".env") and path.name != ".env.example":
                 raise SystemExit("A real environment file is in the source manifest")
-            if path.suffix in {".dump", ".rdb", ".key", ".pem"} or path.name.startswith("core."):
+            if (
+                path.suffix in {".dump", ".rdb", ".key", ".pem", ".tar", ".tgz"}
+                or path.name.endswith(".tar.gz")
+                or path.name.startswith("core.")
+            ):
                 raise SystemExit("A private runtime artifact is in the source manifest")
             target = tree / rel
             target.parent.mkdir(parents=True, exist_ok=True)

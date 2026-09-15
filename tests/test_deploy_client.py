@@ -11,12 +11,12 @@ def test_public_deployment_output_excludes_ssh_diagnostics(capsys):
     result = CompletedProcess(
         args=[],
         returncode=1,
-        stdout="host banner at 192.0.2.42\nImage pulled; checking configuration and connections\n",
+        stdout="host banner at 192.0.2.42\nImage received; checking configuration and connections\n",
         stderr="Permission denied for operator@192.0.2.42 using /private/example/key",
     )
     client.report_result(result)
     output = capsys.readouterr()
-    assert "Image pulled" in output.out
+    assert "Image received" in output.out
     assert "Deployment failed" in output.err
     assert "192.0.2.42" not in output.out + output.err
     assert "/private/example/key" not in output.out + output.err

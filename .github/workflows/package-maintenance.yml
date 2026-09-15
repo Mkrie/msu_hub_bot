@@ -37,10 +37,11 @@ jobs:
           print("Package visibility:", package["visibility"])
           print("Package created:", package["created_at"])
           requested = set(filter(None, os.environ["REMOVE_REVISIONS"].split(",")))
-          if not all(re.fullmatch("[0-9a-f]{40}", revision) for revision in requested):
+          if not all(re.fullmatch("[0-9a-f]{40}|bootstrap", revision) for revision in requested):
               raise SystemExit("Invalid revision tag")
           if requested:
-              if package.get("repository", {}).get("full_name", "").lower() != os.environ["GITHUB_REPOSITORY"].lower():
+              repository = package.get("repository") or {}
+              if requested != {"bootstrap"} and repository.get("full_name", "").lower() != os.environ["GITHUB_REPOSITORY"].lower():
                   raise SystemExit("Package repository ownership could not be verified")
               versions = api(endpoint + "/versions?per_page=100")
               if versions and all(set(v["metadata"]["container"]["tags"]) and set(v["metadata"]["container"]["tags"]) <= requested for v in versions):

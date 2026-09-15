@@ -16,38 +16,21 @@ jobs:
   validate:
     uses: ./.github/workflows/ci.yml
 
-  publish:
-    if: github.ref == 'refs/heads/main'
-    needs: validate
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    outputs:
-      image: ${{ steps.image.outputs.image }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - name: Build, validate, and publish immutable image
-        id: image
-        run: python3 tools/publish_image.py
-        env:
-          GH_TOKEN: ${{ github.token }}
-
   deploy:
     if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
-    needs: publish
+    needs: validate
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
     environment: production
     permissions:
       contents: read
-      packages: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - name: Build and validate private image archive
+        id: image
+        run: python3 tools/build_release.py
       - name: Skip superseded revisions
         id: current
         env:
@@ -61,13 +44,12 @@ jobs:
         if: steps.current.outputs.deploy == 'true'
         run: python3 tools/deploy_client.py
         env:
-          DEPLOY_IMAGE: ${{ needs.publish.outputs.image }}
+          DEPLOY_ARCHIVE: ${{ steps.image.outputs.archive }}
           DEPLOY_HOST: ${{ secrets.SSH_HOST }}
           DEPLOY_USER: ${{ secrets.SSH_USER }}
           DEPLOY_PORT: ${{ secrets.SSH_PORT }}
           DEPLOY_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-          GH_TOKEN: ${{ github.token }}
           HUB_NAME: ${{ secrets.HUB_NAME }}
           HUB_BOT_TOKEN: ${{ secrets.HUB_BOT_TOKEN }}
           HUB_REDIS_HOST: ${{ secrets.HUB_REDIS_HOST }}
@@ -132,3 +114,11 @@ jobs:
           HUB_SUPPORTERS_TABLE: ${{ secrets.HUB_SUPPORTERS_TABLE }}
           HUB_SUPPORTERS_API_KEY: ${{ secrets.HUB_SUPPORTERS_API_KEY }}
           HUB_PYNATIVE_COOKIE: ${{ secrets.HUB_PYNATIVE_COOKIE }}
+      - name: Remove private image archive
+        if: always()
+        env:
+          DEPLOY_ARCHIVE: ${{ steps.image.outputs.archive }}
+        run: |
+          if [ -n "$DEPLOY_ARCHIVE" ]; then
+            rm -f -- "$DEPLOY_ARCHIVE" "$(dirname -- "$DEPLOY_ARCHIVE")/metadata.json"
+          fi

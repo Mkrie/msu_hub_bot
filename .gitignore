@@ -15,9 +15,11 @@ build/
 *.log
 *.dump
 *.rdb
+*.tar
+*.tar.gz
+*.tgz
 *.key
 *.pem
 core
 core.*
 .DS_Store
-

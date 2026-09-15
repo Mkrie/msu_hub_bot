@@ -49,7 +49,8 @@ references and tool versions are pinned. Production credentials are confined
 to the deployment job on the `production` environment.
 
 Main-branch changes run the same checks, build and test the release image,
-publish it to private GHCR storage, then deploy its immutable digest to the VPS.
+and transfer it directly to the VPS over SSH. The host verifies the archive
+and runs its immutable image ID. Images are kept on the runner and VPS.
 The bot reuses the existing Redis and EdgeDB services on the external `msu_db`
 network. Deployment does not run migrations or recreate shared infrastructure.
 

@@ -1,5 +1,8 @@
 import importlib.util
+import hashlib
+import io
 import json
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -12,15 +15,15 @@ SPEC.loader.exec_module(deployment)
 def payload():
     return {
         "action": "deploy",
-        "image": "ghcr.io/uburuntu/msu_hub_bot@sha256:" + "a" * 64,
+        "image": "sha256:" + "a" * 64,
         "revision": "b" * 40,
         "environment": {"HUB_BOT_TOKEN": "fake", "HUB_REDIS_HOST": "localhost", "HUB_EDGEDB_DSN": "fake"},
-        "registry_username": "example",
-        "registry_token": "fake",
+        "archive_sha256": "a" * 64,
+        "archive_size": 100,
     }
 
 
-@pytest.mark.parametrize("image", ["ghcr.io/elsewhere/bot:latest", "ghcr.io/uburuntu/msu_hub_bot:latest", "$(touch /tmp/pwned)"])
+@pytest.mark.parametrize("image", ["elsewhere/bot:latest", "msu-hub-bot:latest", "$(touch /tmp/pwned)"])
 def test_rejects_mutable_or_foreign_images(image):
     request = payload()
     request["image"] = image
@@ -35,6 +38,7 @@ def test_compose_only_manages_the_bot_and_literal_configuration(tmp_path):
     assert document["services"]["bot"]["env_file"][0]["format"] == "raw"
     assert "volumes" not in document
     assert "ports" not in document["services"]["bot"]
+    assert document["services"]["bot"]["pull_policy"] == "never"
 
 
 def test_failed_cutover_restores_legacy_after_stopping_replacement(tmp_path):
@@ -45,6 +49,12 @@ def test_failed_cutover_restores_legacy_after_stopping_replacement(tmp_path):
 
         def run(self, *args, **kwargs):
             return ""
+
+        def receive_image(self, *args):
+            pass
+
+        def record_container_failure(self):
+            pass
 
         def inspect(self, name):
             return {"State": {"Running": True}, "HostConfig": {"RestartPolicy": {"Name": "unless-stopped"}}}
@@ -80,17 +90,19 @@ def test_rollback_from_legacy_stops_it_before_starting_an_extracted_release(tmp_
     events = []
     deployer = deployment.Deployer(tmp_path)
     deployer.stop_replacement = lambda: events.append("stop_replacement")
+    deployer.ensure_image = lambda state: events.append("image_ready")
     deployer.stop_legacy = lambda: events.append("stop_legacy")
     deployer.compose = lambda *args: events.append("start_extracted")
     deployer.wait_healthy = lambda: events.append("ready")
     deployer.restore({"release": "prior"})
-    assert events == ["stop_replacement", "stop_legacy", "start_extracted", "ready"]
+    assert events == ["image_ready", "stop_replacement", "stop_legacy", "start_extracted", "ready"]
 
 
 def test_first_deployment_on_a_fresh_host_and_unavailable_rollback(tmp_path):
     deployer = deployment.Deployer(tmp_path)
     deployer.run = lambda *args, **kwargs: ""
     deployer.inspect = lambda name: None
+    deployer.receive_image = lambda *args: None
     deployer.compose = lambda *args, **kwargs: ""
     deployer.wait_healthy = lambda: None
     deployer.deploy(payload())
@@ -117,3 +129,56 @@ def test_failed_manual_rollback_restores_current_release(tmp_path):
         deployer.deploy({"action": "rollback"})
     assert events == ["old", "current"]
     assert deployer.read_state("current.json") == current
+
+
+def make_archive(path, *, foreign_tag=False, traversal=False, contains_env=False):
+    state = payload()
+    config = {
+        "architecture": "amd64",
+        "os": "linux",
+        "config": {
+            "User": "10001:10001",
+            "Entrypoint": ["/opt/msu_hub_bot/.venv/bin/msu-hub-bot"],
+            "Labels": {"org.opencontainers.image.revision": state["revision"]},
+            "Env": ["HUB_BOT_TOKEN=synthetic"] if contains_env else [],
+        },
+    }
+    raw = json.dumps(config).encode()
+    digest = hashlib.sha256(raw).hexdigest()
+    state["image"] = "sha256:" + digest
+    manifest = [
+        {"Config": digest + ".json", "RepoTags": ["neighbor:latest" if foreign_tag else "msu-hub-bot:" + state["revision"]], "Layers": []}
+    ]
+    files = {"manifest.json": json.dumps(manifest).encode(), digest + ".json": raw}
+    if traversal:
+        files["../outside"] = b"unsafe"
+    with tarfile.open(path, "w:gz") as archive:
+        for name, content in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            archive.addfile(info, io.BytesIO(content))
+    state["archive_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    state["archive_size"] = path.stat().st_size
+    return state
+
+
+@pytest.mark.parametrize("bad", [None, "foreign_tag", "traversal", "contains_env", "wrong_image", "truncated"])
+def test_image_archive_boundary(tmp_path, bad):
+    path = tmp_path / "image.tar.gz"
+    state = make_archive(path, **({bad: True} if bad in {"foreign_tag", "traversal", "contains_env"} else {}))
+    if bad == "wrong_image":
+        state["image"] = "sha256:" + "0" * 64
+    if bad == "truncated":
+        path.write_bytes(path.read_bytes()[:50])
+    if bad is None:
+        deployment.validate_archive(path, state)
+    else:
+        with pytest.raises(deployment.DeploymentError):
+            deployment.validate_archive(path, state)
+
+
+def test_interrupted_upload_removes_partial_image(tmp_path):
+    deployer = deployment.Deployer(tmp_path)
+    with pytest.raises(deployment.DeploymentError, match="interrupted"):
+        deployer.receive_image(payload(), tmp_path, io.BytesIO(b"partial"))
+    assert not (tmp_path / "image.tar.gz").exists()

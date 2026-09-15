@@ -4,8 +4,9 @@
 
 The application uses `~/msu_hub_bot` on the deployment host. The SSH deployment
 key is separate from personal SSH keys and is restricted to `deploy/deploy.py`
-as a forced command. The wrapper accepts only deploy/rollback JSON requests,
-validates the image repository and digest, and uses a host lock.
+as a forced command. The wrapper accepts only deploy/rollback requests and
+uses a host lock. A deployment sends one JSON header followed by a compressed
+image archive over the same encrypted SSH connection.
 
 Requirements: Linux x86-64, Python 3, Docker, Compose 2.30 or later, and access to
 the existing Redis/EdgeDB services through Docker network `msu_db`. The account
@@ -41,16 +42,20 @@ value through stdin with `gh secret set HUB_BOT_TOKEN --env production --repo
 uburuntu/msu_hub_bot`, then dispatch the Deploy workflow. Do not place secret
 values in `--body` arguments or shell history. Arrays and mappings must be JSON.
 
+Actions builds and tests the image before the transfer step receives any
+production configuration. Images are transferred directly over SSH. The host
+checks the archive checksum, image ID, revision label, platform, non-root user,
+entrypoint, and tag before loading it. Archives containing extra image tags,
+unsafe paths, or embedded runtime settings are rejected.
+
 The workflow sends configuration over authenticated SSH. The wrapper stores a
 mode-600 `runtime.env` for each release, outside any checkout. Its single JSON
 envelope is read using Compose's raw environment-file mode, preserving quotes,
-dollar signs, and multiline values without interpolation. Registry login uses
-the job's short-lived token in a temporary Docker configuration directory that
-is deleted after the pull. No permanent registry PAT is required.
+dollar signs, and multiline values without interpolation.
 
 ## Cutover and rollback
 
-Before stopping the current bot, the wrapper pulls the new image and runs a
+Before stopping the current bot, the wrapper verifies and loads the image and runs a
 separate preflight: configuration validation, Redis ping, EdgeDB `SELECT 1`,
 Telegram `getMe`, and required media programs. Preflight never polls Telegram,
 sends messages, or migrates the database.
@@ -69,9 +74,17 @@ existing container can deploy directly; manual rollback becomes available
 after a second successful release.
 
 Use **Actions → Rollback → Run workflow** from main to restore the preceding
-release. `current.json` and `previous.json` record revision, digest, and release
+release. `current.json` and `previous.json` record revision, image ID, and release
 directory. Stored runtime configuration is sensitive; do not attach these
 directories to issues or CI artifacts. Container logs are rotated locally.
+Failed Docker operations and startup logs are retained privately in the
+release's `failure.log`.
+
+The current and preceding release archives are retained on the VPS. Rollback
+can reload the preceding image if it was removed from Docker's local cache.
+Older generated release directories and unused application images are cleaned
+up after a successful deployment. Shared database containers and other
+applications are outside this cleanup.
 
 ## Moving VPSs
 

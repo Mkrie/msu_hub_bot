@@ -6,23 +6,36 @@ It never evaluates SSH_ORIGINAL_COMMAND or accepts shell commands or host paths.
 """
 
 import fcntl
+import hashlib
 import json
 import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-IMAGE_RE = re.compile(r"ghcr\.io/uburuntu/msu_hub_bot@sha256:[0-9a-f]{64}")
+IMAGE_RE = re.compile(r"sha256:[0-9a-f]{64}")
 REVISION_RE = re.compile(r"[0-9a-f]{40}")
 CONTAINER = "msu_hub_bot"
 LEGACY = "hub_bot"
+MAX_ARCHIVE_SIZE = 2 * 1024**3
 
 
 class DeploymentError(Exception):
     pass
+
+
+def report(message):
+    try:
+        print(message, flush=True)
+    except OSError:
+        # A disconnected CI runner must not interrupt cutover or rollback.
+        pass
 
 
 def validate_payload(payload):
@@ -32,10 +45,10 @@ def validate_payload(payload):
         if set(payload) != {"action"}:
             raise DeploymentError("Unexpected rollback fields")
         return
-    if set(payload) != {"action", "image", "revision", "environment", "registry_username", "registry_token"}:
+    if set(payload) != {"action", "image", "revision", "environment", "archive_sha256", "archive_size"}:
         raise DeploymentError("Unexpected deployment fields")
     if not isinstance(payload["image"], str) or not IMAGE_RE.fullmatch(payload["image"]):
-        raise DeploymentError("Image must be an immutable digest in this bot's repository")
+        raise DeploymentError("Image must be an immutable SHA256 image ID")
     if not isinstance(payload["revision"], str) or not REVISION_RE.fullmatch(payload["revision"]):
         raise DeploymentError("Invalid source revision")
     values = payload["environment"]
@@ -46,8 +59,60 @@ def validate_payload(payload):
             raise DeploymentError("Invalid runtime configuration")
     if not all(values.get(key) for key in ("HUB_BOT_TOKEN", "HUB_REDIS_HOST", "HUB_EDGEDB_DSN")):
         raise DeploymentError("Missing core runtime settings")
-    if not re.fullmatch(r"[A-Za-z0-9-]+", payload["registry_username"]) or not isinstance(payload["registry_token"], str):
-        raise DeploymentError("Invalid registry authentication")
+    if not isinstance(payload["archive_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", payload["archive_sha256"]):
+        raise DeploymentError("Invalid archive checksum")
+    if type(payload["archive_size"]) is not int or not 0 < payload["archive_size"] <= MAX_ARCHIVE_SIZE:
+        raise DeploymentError("Invalid archive size")
+
+
+def validate_archive(path, state):
+    with path.open("rb") as source:
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != state["archive_sha256"]:
+        raise DeploymentError("Image archive checksum mismatch")
+    with tarfile.open(path, "r:gz") as archive:
+        members, total = {}, 0
+        for member in archive:
+            name = PurePosixPath(member.name)
+            if name.is_absolute() or ".." in name.parts or not (member.isfile() or member.isdir()) or member.name in members:
+                raise DeploymentError("Unsafe image archive entry")
+            total += member.size
+            if total > 8 * 1024**3 or len(members) >= 4096:
+                raise DeploymentError("Expanded image archive is too large")
+            members[member.name] = member
+
+        def read_json(name):
+            member = members.get(name)
+            if not member or not member.isfile() or member.size > 1024 * 1024:
+                raise DeploymentError("Invalid image archive metadata")
+            data = archive.extractfile(member).read()
+            return data, json.loads(data)
+
+        _, manifests = read_json("manifest.json")
+        if not isinstance(manifests, list) or len(manifests) != 1:
+            raise DeploymentError("Archive must contain exactly one image")
+        manifest = manifests[0]
+        tag = "msu-hub-bot:" + state["revision"]
+        if manifest.get("RepoTags") not in ([tag], ["docker.io/library/" + tag]):
+            raise DeploymentError("Archive contains a foreign image tag")
+        raw, config = read_json(manifest["Config"])
+        if "sha256:" + hashlib.sha256(raw).hexdigest() != state["image"]:
+            raise DeploymentError("Image ID does not match its configuration")
+        if config.get("os") != "linux" or config.get("architecture") != "amd64":
+            raise DeploymentError("Unsupported image platform")
+        runtime = config.get("config", {})
+        if runtime.get("Labels", {}).get("org.opencontainers.image.revision") != state["revision"]:
+            raise DeploymentError("Image source revision mismatch")
+        if runtime.get("User") != "10001:10001" or runtime.get("Entrypoint") != ["/opt/msu_hub_bot/.venv/bin/msu-hub-bot"]:
+            raise DeploymentError("Image does not match this service's runtime contract")
+        if any(value.startswith(("HUB_", "DEPLOY_", "GH_TOKEN=", "GITHUB_TOKEN=")) for value in runtime.get("Env", [])):
+            raise DeploymentError("Image contains runtime configuration")
+        if not isinstance(manifest.get("Layers"), list) or any(
+            layer not in members or not members[layer].isfile() for layer in manifest["Layers"]
+        ):
+            raise DeploymentError("Invalid image layers")
 
 
 def write_private(path, data):
@@ -64,6 +129,7 @@ def compose_document(image, env_path):
         "services": {
             "bot": {
                 "image": image,
+                "pull_policy": "never",
                 "container_name": CONTAINER,
                 "env_file": [{"path": str(env_path), "format": "raw"}],
                 "restart": "unless-stopped",
@@ -84,6 +150,7 @@ def compose_document(image, env_path):
 class Deployer:
     def __init__(self, root):
         self.root = Path(root).resolve()
+        self.diagnostic_path = None
 
     def run(self, *args, input=None, timeout=180, check=True):
         try:
@@ -92,6 +159,8 @@ class Deployer:
             raise DeploymentError("Operation timed out") from None
         if check and result.returncode:
             # Docker/Compose errors can quote configuration: keep raw output private.
+            if self.diagnostic_path:
+                write_private(self.diagnostic_path, (result.stdout + result.stderr)[-131072:])
             raise DeploymentError("Docker operation failed")
         return result.stdout if result.returncode == 0 else None
 
@@ -102,6 +171,54 @@ class Deployer:
     def read_state(self, filename):
         path = self.root / filename
         return json.loads(path.read_text()) if path.exists() else None
+
+    def receive_image(self, payload, directory, stream):
+        archive = directory / "image.tar.gz"
+        remaining = payload["archive_size"]
+        if shutil.disk_usage(directory).free < remaining + 1024**3:
+            raise DeploymentError("Insufficient space for image transfer")
+        try:
+            with archive.open("xb") as output:
+                os.fchmod(output.fileno(), 0o600)
+                while remaining:
+                    chunk = stream.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise DeploymentError("Image transfer was interrupted")
+                    output.write(chunk)
+                    remaining -= len(chunk)
+            validate_archive(archive, payload)
+        except Exception:
+            archive.unlink(missing_ok=True)
+            raise
+        self.run("docker", "image", "load", "--input", str(archive), timeout=600)
+        if not self.run("docker", "image", "inspect", payload["image"], check=False):
+            raise DeploymentError("Transferred image was not loaded")
+
+    def ensure_image(self, state):
+        if self.run("docker", "image", "inspect", state["image"], check=False):
+            return
+        archive = self.root / "releases" / state["release"] / "image.tar.gz"
+        validate_archive(archive, state)
+        self.run("docker", "image", "load", "--input", str(archive), timeout=600)
+
+    def record_container_failure(self):
+        result = subprocess.run(["docker", "logs", "--tail", "200", CONTAINER], capture_output=True, text=True, timeout=20)
+        if self.diagnostic_path:
+            write_private(self.diagnostic_path, (result.stdout + result.stderr)[-131072:])
+
+    def prune_releases(self):
+        keep = [self.read_state(name) for name in ("current.json", "previous.json")]
+        directories = {state["release"] for state in keep if state and "release" in state}
+        images = {state["image"] for state in keep if state and "image" in state}
+        for directory in (self.root / "releases").iterdir():
+            if directory.name in directories or directory.is_symlink() or not re.fullmatch(r"[0-9a-f]{40}-[0-9]+", directory.name):
+                continue
+            metadata = directory / "release.json"
+            if metadata.exists():
+                old = json.loads(metadata.read_text())
+                if IMAGE_RE.fullmatch(old.get("image", "")) and old["image"] not in images:
+                    self.run("docker", "image", "rm", old["image"], check=False)
+            shutil.rmtree(directory)
 
     def compose(self, state, *args, timeout=180):
         directory = (self.root / "releases" / state["release"]).resolve()
@@ -151,6 +268,8 @@ for path in Path('/proc').iterdir():
         raise DeploymentError("Replacement did not become ready")
 
     def restore(self, previous):
+        if not previous.get("empty") and not previous.get("legacy"):
+            self.ensure_image(previous)
         self.stop_replacement()
         if previous.get("empty"):
             return
@@ -164,7 +283,7 @@ for path in Path('/proc').iterdir():
             self.compose(previous, "up", "--detach", "--no-deps", "bot")
             self.wait_healthy()
 
-    def deploy(self, payload):
+    def deploy(self, payload, stream=None):
         validate_payload(payload)
         if payload["action"] == "rollback":
             previous, current = self.read_state("previous.json"), self.read_state("current.json")
@@ -173,36 +292,26 @@ for path in Path('/proc').iterdir():
             try:
                 self.restore(previous)
             except Exception:
-                print("Rollback failed; restoring the current release", flush=True)
+                report("Rollback failed; restoring the current release")
                 self.restore(current)
                 raise DeploymentError("Rollback failed; current release restored") from None
             write_private(self.root / "current.json", json.dumps(previous))
             write_private(self.root / "previous.json", json.dumps(current))
-            print("Rollback completed", flush=True)
+            report("Rollback completed")
             return
         self.run("docker", "network", "inspect", "msu_db")
         release = payload["revision"] + "-" + str(time.time_ns())
         directory = self.root / "releases" / release
         directory.mkdir(mode=0o700, parents=True)
+        self.diagnostic_path = directory / "failure.log"
         environment = dict(payload["environment"])
         environment["HUB_LOGS_FILE"] = "/tmp/msu_hub_bot.log"
         write_private(directory / "runtime.env", "HUB_CONFIG_JSON=" + json.dumps(environment, ensure_ascii=True) + "\n")
         write_private(directory / "compose.json", json.dumps(compose_document(payload["image"], directory / "runtime.env"), indent=2))
-        state = {"release": release, "revision": payload["revision"], "image": payload["image"]}
-        with tempfile.TemporaryDirectory(prefix="registry-", dir=self.root) as config:
-            self.run(
-                "docker",
-                "--config",
-                config,
-                "login",
-                "ghcr.io",
-                "--username",
-                payload["registry_username"],
-                "--password-stdin",
-                input=payload["registry_token"],
-            )
-            self.run("docker", "--config", config, "pull", payload["image"], timeout=600)
-        print("Image pulled; checking configuration and connections", flush=True)
+        state = {"release": release, **{key: payload[key] for key in ("revision", "image", "archive_sha256", "archive_size")}}
+        write_private(directory / "release.json", json.dumps(state))
+        self.receive_image(payload, directory, stream)
+        report("Image received; checking configuration and connections")
         self.compose(state, "config", "--quiet")
         self.compose(
             state,
@@ -221,26 +330,36 @@ for path in Path('/proc').iterdir():
         if previous is None:
             legacy = self.inspect(LEGACY)
             previous = {"legacy": True, "restart_policy": legacy["HostConfig"]["RestartPolicy"]["Name"]} if legacy else {"empty": True}
-        print("Preflight passed; stopping the current poller", flush=True)
+        report("Preflight passed; stopping the current poller")
         try:
             self.stop_legacy()
             self.stop_replacement()
             self.compose(state, "up", "--detach", "--no-deps", "bot")
             self.wait_healthy()
         except Exception:
-            print("Release failed; restoring the previous poller", flush=True)
+            report("Release failed; restoring the previous poller")
+            try:
+                self.record_container_failure()
+            except Exception:
+                pass
             self.restore(previous)
-            print("Previous poller restored", flush=True)
+            report("Previous poller restored")
             raise DeploymentError("Release failed and was rolled back") from None
         write_private(self.root / "previous.json", json.dumps(previous))
         write_private(self.root / "current.json", json.dumps(state))
-        print("Deployed " + payload["revision"] + " " + payload["image"], flush=True)
+        report("Deployed " + payload["revision"] + " " + payload["image"])
+        try:
+            self.prune_releases()
+        except Exception:
+            # Cleanup must not turn a healthy release into a failed deployment.
+            pass
 
 
 def main():
     os.umask(0o077)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
     root = Path(__file__).resolve().parent
-    data = sys.stdin.read(131_073)
+    data = sys.stdin.buffer.readline(131_073)
     if len(data) > 131_072:
         raise DeploymentError("Deployment request is too large")
     try:
@@ -250,7 +369,7 @@ def main():
     validate_payload(payload)
     with (root / "deployment.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        Deployer(root).deploy(payload)
+        Deployer(root).deploy(payload, sys.stdin.buffer)
 
 
 if __name__ == "__main__":
