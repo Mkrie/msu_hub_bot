@@ -2,7 +2,6 @@
 
 import asyncio
 import hashlib
-import io
 import logging
 from dataclasses import dataclass
 from collections.abc import Mapping, Sequence
@@ -13,7 +12,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramAPIError
 from aiogram.types import InputSticker, Sticker
 from pydantic import BaseModel
 
-from msu_hub_bot.telegram.files import input_file
+from msu_hub_bot.telegram.files import DownloadTooLarge, download_by_file_id, input_file
 
 logger = logging.getLogger(__name__)
 LOOKUP_TIMEOUT = 5
@@ -31,6 +30,7 @@ class UploadMetadata(BaseModel):
     file_unique_id: str | None = None
     sha256: str | None = None
     size: int | None = None
+    emojis_explicit: bool = False
 
 
 @dataclass(frozen=True)
@@ -41,12 +41,24 @@ class UploadedSticker:
     file_unique_id: str | None = None
     sha256: str | None = None
     size: int | None = None
+    keywords: tuple[str, ...] | None = None
+    emojis_explicit: bool = False
 
     def input_sticker(self) -> InputSticker:
-        return InputSticker(sticker=self.file_id, format=self.format, emoji_list=list(self.emojis))
+        return InputSticker(
+            sticker=self.file_id,
+            format=self.format,
+            emoji_list=list(self.emojis),
+            keywords=list(self.keywords) if self.keywords is not None else None,
+        )
 
-    def metadata(self) -> dict[str, str | int | None]:
-        return {"file_unique_id": self.file_unique_id, "sha256": self.sha256, "size": self.size}
+    def metadata(self) -> dict[str, str | int | bool | None]:
+        return {
+            "file_unique_id": self.file_unique_id,
+            "sha256": self.sha256,
+            "size": self.size,
+            "emojis_explicit": self.emojis_explicit,
+        }
 
     @classmethod
     def from_pending(cls, data: Mapping[str, Any]) -> "UploadedSticker":
@@ -54,14 +66,32 @@ class UploadedSticker:
         metadata = UploadMetadata.model_validate(data.get("sticker_upload", {}))
         if not isinstance(sticker.sticker, str):
             raise ValueError("Pending stickers must reference an uploaded file")
-        return cls(sticker.sticker, sticker.format, tuple(sticker.emoji_list), metadata.file_unique_id, metadata.sha256, metadata.size)
+        return cls(
+            sticker.sticker,
+            sticker.format,
+            tuple(sticker.emoji_list),
+            metadata.file_unique_id,
+            metadata.sha256,
+            metadata.size,
+            tuple(sticker.keywords) if sticker.keywords is not None else None,
+            metadata.emojis_explicit,
+        )
 
 
 class StickerSetClient:
     def __init__(self, bot: Bot) -> None:
         self.bot = bot
 
-    async def upload(self, user_id: int, payload: bytes, kind: str, emojis: Sequence[str]) -> UploadedSticker:
+    async def upload(
+        self,
+        user_id: int,
+        payload: bytes,
+        kind: str,
+        emojis: Sequence[str],
+        *,
+        keywords: tuple[str, ...] | None = None,
+        emojis_explicit: bool = False,
+    ) -> UploadedSticker:
         suffix = {"static": "webp", "animated": "tgs", "video": "webm"}[kind]
         uploaded = await self.bot.upload_sticker_file(
             user_id=user_id,
@@ -69,19 +99,53 @@ class StickerSetClient:
             sticker_format=kind,
         )
         return UploadedSticker(
-            uploaded.file_id, kind, tuple(emojis), uploaded.file_unique_id, hashlib.sha256(payload).hexdigest(), len(payload)
+            uploaded.file_id,
+            kind,
+            tuple(emojis),
+            uploaded.file_unique_id,
+            hashlib.sha256(payload).hexdigest(),
+            len(payload),
+            keywords,
+            emojis_explicit,
         )
+
+    async def update_metadata(self, file_id: str, sticker: UploadedSticker) -> bool:
+        """Apply explicit metadata to the resolved target-pack sticker after save.
+
+        Exact duplicate additions are a no-op in Telegram, including concurrent
+        additions after the initial lookup. A failed metadata update never turns
+        a confirmed save into a mutation retry.
+        """
+        try:
+            async with asyncio.timeout(LOOKUP_TIMEOUT):
+                if sticker.emojis_explicit:
+                    await self.bot.set_sticker_emoji_list(sticker=file_id, emoji_list=list(sticker.emojis))
+                if sticker.keywords is not None:
+                    await self.bot.set_sticker_keywords(sticker=file_id, keywords=list(sticker.keywords))
+        except TimeoutError, TelegramAPIError:
+            logger.warning("Saved sticker metadata could not be updated")
+            return False
+        return True
 
     async def _add(self, name: str, user_id: int, sticker: UploadedSticker) -> None:
         await self.bot.add_sticker_to_set(user_id=user_id, name=name, sticker=sticker.input_sticker())
 
-    async def save(self, name: str, user_id: int, sticker: UploadedSticker, title: str | None = None) -> bool:
-        """Return False if a title is needed; True after a confirmed save.
+    @classmethod
+    def _contains_reference(cls, stickers: Sequence[Sticker], uploaded: UploadedSticker) -> bool:
+        return any(
+            cls._same_format(sticker, uploaded.format)
+            and (sticker.file_id == uploaded.file_id or bool(uploaded.file_unique_id and sticker.file_unique_id == uploaded.file_unique_id))
+            for sticker in stickers
+        )
 
-        An uncertain network result is never retried as a mutation.
+    async def save(self, name: str, user_id: int, sticker: UploadedSticker, title: str | None = None) -> bool:
+        """Return False if a title is needed; True after registration is verified.
+
+        Known destination references are not added again. An uncertain network
+        result is never retried as a mutation.
         """
         try:
-            await self.bot.get_sticker_set(name)
+            pack = await self.bot.get_sticker_set(name)
         except TelegramBadRequest as lookup_error:
             if not sticker_error(lookup_error, "STICKERSET_INVALID"):
                 raise
@@ -98,14 +162,16 @@ class StickerSetClient:
             except TelegramBadRequest as creation_error:
                 # A concurrent admin may have created this exact chat pack.
                 try:
-                    await self.bot.get_sticker_set(name)
+                    pack = await self.bot.get_sticker_set(name)
                 except TelegramBadRequest as retry_error:
                     if not sticker_error(retry_error, "STICKERSET_INVALID"):
                         raise
                     raise creation_error
-                await self._add(name, user_id, sticker)
+                if not self._contains_reference(pack.stickers, sticker):
+                    await self._add(name, user_id, sticker)
         else:
-            await self._add(name, user_id, sticker)
+            if not self._contains_reference(pack.stickers, sticker):
+                await self._add(name, user_id, sticker)
         return True
 
     @staticmethod
@@ -121,6 +187,8 @@ class StickerSetClient:
         Missing/ambiguous results fall back to a pack link at the caller.
         """
         checked: set[str] = set()
+        fingerprinted = False
+        digest, size = uploaded.sha256, uploaded.size
         try:
             async with asyncio.timeout(LOOKUP_TIMEOUT):
                 unique_id = uploaded.file_unique_id
@@ -132,20 +200,38 @@ class StickerSetClient:
                     pack = await self.bot.get_sticker_set(name)
                     candidates = [s for s in pack.stickers if self._same_format(s, uploaded.format)]
                     for sticker in candidates:
-                        if unique_id and sticker.file_unique_id == unique_id:
+                        if sticker.file_id == uploaded.file_id or unique_id and sticker.file_unique_id == unique_id:
                             return sticker.file_id
-                    if uploaded.sha256 and uploaded.size is not None and 0 < uploaded.size <= MAX_STICKER_BYTES:
+                    if digest is None and not fingerprinted:
+                        # Cross-pack copies can get a new identity. Read the source
+                        # only after the zero-download identity path has failed.
+                        fingerprinted = True
+                        try:
+                            source = await download_by_file_id(uploaded.file_id, self.bot, max_bytes=MAX_STICKER_BYTES)
+                        except DownloadTooLarge:
+                            source = None
+                        if source is not None:
+                            with source:
+                                payload = source.getvalue()
+                            if payload:
+                                digest, size = hashlib.sha256(payload).hexdigest(), len(payload)
+                    if digest and size is not None and 0 < size <= MAX_STICKER_BYTES:
                         # Order only prioritizes downloads; it never determines the reply.
                         for sticker in reversed(candidates):
                             if len(checked) >= MAX_CONTENT_LOOKUPS:
                                 break
-                            if sticker.file_size != uploaded.size or sticker.file_unique_id in checked:
+                            if sticker.file_size != size or sticker.file_unique_id in checked:
                                 continue
                             checked.add(sticker.file_unique_id)
-                            data = io.BytesIO()
-                            await self.bot.download(sticker.file_id, destination=data)
-                            payload = data.getvalue()
-                            if len(payload) == uploaded.size and hashlib.sha256(payload).hexdigest() == uploaded.sha256:
+                            try:
+                                data = await download_by_file_id(sticker.file_id, self.bot, max_bytes=size)
+                            except DownloadTooLarge:
+                                continue
+                            if data is None:
+                                continue
+                            with data:
+                                payload = data.getvalue()
+                            if len(payload) == size and hashlib.sha256(payload).hexdigest() == digest:
                                 return sticker.file_id
         except TimeoutError, TelegramAPIError:
             pass

@@ -30,17 +30,21 @@ def handlers():
     ns = {"__name__": "synthetic_sticker"}
     exec(compile(source, "<sticker>", "exec"), ns)
 
-    async def download(file, bot):
+    async def download(file, bot, **kwargs):
         return io.BytesIO(file.data)
 
-    async def execute(function, *args):
-        return function(*args), False
+    async def execute(factory, function):
+        return function(*(await factory())), False
 
     ns["download"] = download
-    ns["cpu_executor"] = SimpleNamespace(run=AsyncMock(side_effect=execute))
+    ns["cpu_executor"] = SimpleNamespace(run_prepared=AsyncMock(side_effect=execute))
     original = ns["process_sticker_chat"]
 
     async def process_sticker_chat(message, meta, state):
+        if meta is None:
+            meta = SimpleNamespace(text="", extract_text=lambda: (message, ""))
+        if not hasattr(meta, "text"):
+            meta.text = meta.extract_text()[1]
         return await original(message, meta, state, message.bot, ns["cpu_executor"])
 
     ns["process_sticker_chat"] = process_sticker_chat
@@ -114,7 +118,7 @@ def test_bad_tgs(data):
 
 
 def test_invalid_duration_rejected_before_encoding(monkeypatch):
-    monkeypatch.setattr(media, "_probe", lambda path: ({}, {"codec_name": "h264"}, 0))
+    monkeypatch.setattr(media, "_probe", lambda path: ({}, {"codec_name": "h264", "width": 64, "height": 64}, 0))
     calls = []
     monkeypatch.setattr(media, "_run", lambda command: calls.append(command))
     with pytest.raises(media.StickerMediaError, match="длительность"):
@@ -126,7 +130,7 @@ def test_invalid_duration_rejected_before_encoding(monkeypatch):
 def test_video_conversion_command(monkeypatch, duration):
     probes = iter(
         [
-            ({}, {"codec_name": "h264"}, duration),
+            ({}, {"codec_name": "h264", "width": 64, "height": 64}, duration),
             ({"streams": [{"codec_type": "video"}]}, {"codec_name": "vp9", "width": 512, "height": 288, "avg_frame_rate": "30/1"}, 2.967),
         ]
     )
@@ -141,6 +145,7 @@ def test_video_conversion_command(monkeypatch, duration):
     assert media.prepare_video(b"source") == media.PreparedMedia("video", b"encoded", trimmed=duration > 7)
     command = commands[0]
     assert "-an" in command
+    assert command[command.index("-protocol_whitelist") + 1] == "file,pipe"
     if duration > 7:
         assert command.index("-t") < command.index("-i")
         assert command[command.index("-t") + 1] == "7"
@@ -188,6 +193,8 @@ def message(admin=True, kind="static"):
             delete_sticker_from_set=AsyncMock(return_value=True),
             get_chat_administrators=chat.get_administrators,
             get_sticker_set=AsyncMock(return_value=registered_pack(kind)),
+            set_sticker_emoji_list=AsyncMock(return_value=True),
+            set_sticker_keywords=AsyncMock(return_value=True),
             get_file=AsyncMock(return_value=SimpleNamespace(file_unique_id="unique-uploaded")),
         ),
     )
@@ -258,10 +265,11 @@ def test_non_admin_cannot_add(handlers):
 @pytest.mark.parametrize("kind", ["static", "animated", "video"])
 def test_upload_and_add_modern_api(handlers, kind):
     m = message(kind=kind)
+    m.bot.get_sticker_set.side_effect = [SimpleNamespace(stickers=[]), registered_pack(kind)]
     handlers["prepare_media"] = lambda data, kind: media.PreparedMedia(kind, b"prepared")
     meta = SimpleNamespace(extract_text=lambda: (m, "😎"))
     asyncio.run(handlers["process_sticker_chat"](m, meta, None))
-    handlers["cpu_executor"].run.assert_awaited_once_with(handlers["prepare_media"], b"data", kind)
+    assert handlers["cpu_executor"].run_prepared.call_args.args[1] is handlers["prepare_media"]
     m.bot.upload_sticker_file.assert_awaited_once()
     m.bot.add_sticker_to_set.assert_awaited_once()
     added = m.bot.add_sticker_to_set.call_args.kwargs["sticker"]
@@ -281,7 +289,7 @@ def test_trimmed_video_notice_after_success(handlers):
 
 def test_executor_timeout_never_uploads(handlers):
     m = message(kind="video")
-    handlers["cpu_executor"].run = AsyncMock(return_value=(None, True))
+    handlers["cpu_executor"].run_prepared = AsyncMock(return_value=(None, True))
     asyncio.run(handlers["process_sticker_chat"](m, None, None))
     m.bot.upload_sticker_file.assert_not_awaited()
     m.bot.add_sticker_to_set.assert_not_awaited()
@@ -381,8 +389,9 @@ def test_saved_sticker_preview_failure_never_repeats_the_addition(handlers, fail
     handlers["prepare_media"] = lambda data, kind: media.PreparedMedia(kind, b"prepared", trimmed=True)
     meta = SimpleNamespace(extract_text=lambda: (m, ""))
     if failure == "lookup":
-        m.bot.get_sticker_set.side_effect = [registered_pack("video"), error("unavailable", network=True)]
+        m.bot.get_sticker_set.side_effect = [SimpleNamespace(stickers=[]), error("unavailable", network=True)]
     else:
+        m.bot.get_sticker_set.side_effect = [SimpleNamespace(stickers=[]), registered_pack("video")]
         m.reply_sticker.side_effect = error("preview rejected")
     asyncio.run(handlers["process_sticker_chat"](m, meta, None))
     m.bot.upload_sticker_file.assert_awaited_once()
@@ -423,7 +432,7 @@ def test_successful_creation_clears_pending_state_even_when_preview_fails(handle
 
 
 def test_oversized_video_is_encoded_once(monkeypatch):
-    monkeypatch.setattr(media, "_probe", lambda path: ({}, {"codec_name": "h264"}, 6))
+    monkeypatch.setattr(media, "_probe", lambda path: ({}, {"codec_name": "h264", "width": 64, "height": 64}, 6))
     calls = []
 
     def encode(command):
@@ -437,7 +446,7 @@ def test_oversized_video_is_encoded_once(monkeypatch):
 
 
 def test_encoder_failure_is_not_retried(monkeypatch):
-    monkeypatch.setattr(media, "_probe", lambda path: ({}, {"codec_name": "h264"}, 6))
+    monkeypatch.setattr(media, "_probe", lambda path: ({}, {"codec_name": "h264", "width": 64, "height": 64}, 6))
     calls = []
 
     def fail(command):
@@ -498,7 +507,7 @@ def test_oversized_metadata_rejected_before_download(handlers):
     handlers["download"] = AsyncMock()
     asyncio.run(handlers["process_sticker_chat"](m, None, None))
     handlers["download"].assert_not_awaited()
-    handlers["cpu_executor"].run.assert_not_awaited()
+    handlers["cpu_executor"].run_prepared.assert_not_awaited()
     m.bot.upload_sticker_file.assert_not_awaited()
     m.bot.add_sticker_to_set.assert_not_awaited()
     m.bot.create_new_sticker_set.assert_not_awaited()
@@ -512,10 +521,10 @@ def test_tgs_compressed_and_expanded_limits(data):
 
 def test_subprocess_deadline_becomes_media_error(monkeypatch):
     def time_out(command, **kwargs):
-        assert kwargs == dict(check=True, capture_output=True, timeout=60)
+        assert kwargs == dict(timeout=60, max_output_bytes=0)
         raise subprocess.TimeoutExpired(command, 60)
 
-    monkeypatch.setattr(media.subprocess, "run", time_out)
+    monkeypatch.setattr(media, "run_process", time_out)
     with pytest.raises(media.StickerMediaError, match="слишком много времени"):
         media._run(["ffmpeg", "synthetic-input"])
 

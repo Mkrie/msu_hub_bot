@@ -9,17 +9,18 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.base import StorageKey
-from aiogram.types import Message, InputSticker
+from aiogram.types import Message, InputSticker, Sticker
 from aiogram.utils.markdown import hlink
 from pydantic import BaseModel
 
 from msu_hub_bot.execution.executor import TPExecutor
+from msu_hub_bot.commands.sticker_input import custom_emoji_source, parse_metadata, reusable_sticker
 from msu_hub_bot.telegram.extraction import Extractor
 from msu_hub_bot.telegram.files import DownloadableMedia, download, download_by_file_id, input_file
 from msu_hub_bot.telegram.filters import MetaInfo
 from msu_hub_bot.telegram.state import ReleasableEventIsolation, UpdateStateContext, release_state_isolation
 from msu_hub_bot.utils import image_bytes_io
-from msu_hub_bot.media.sticker_media import MAX_INPUT_BYTES, StickerMediaError, prepare_media
+from msu_hub_bot.media.sticker_media import MAX_INPUT_BYTES, StickerMediaError, prepare_media, prepare_custom_emoji
 from msu_hub_bot.telegram.sticker_sets import StickerSetClient, UploadedSticker, UploadMetadata, sticker_error
 
 sticker_set_name_template = "with_love_for_{id}_by_msu_hub_bot"
@@ -193,8 +194,8 @@ class Stickers:
                 continue
             if target.sticker:
                 sticker = target.sticker
-                if sticker.type != "regular":
-                    raise StickerMediaError("Пришлите обычный стикер, а не маску или custom emoji.")
+                if sticker.type == "mask":
+                    raise StickerMediaError("Маски не подходят для обычного стикерпака. Пришлите стикер, картинку или эмодзи.")
                 kind = "animated" if sticker.is_animated else "video" if sticker.is_video else "static"
                 return sticker, kind
             if target.animation or target.video or target.video_note:
@@ -224,23 +225,58 @@ class Stickers:
         if message.from_user is None:
             return True
         try:
+            metadata = parse_metadata(meta.text, meta.extract_text()[1])
             source, kind = cls.source_media(message)
+            if source is None:
+                source = await custom_emoji_source(message, bot)
+                if source is not None:
+                    kind = "animated" if source.is_animated else "video" if source.is_video else "static"
             if source is None:
                 _, source = await Extractor.image(message, with_profile_photo=True)
                 kind = "static"
             if source is None:
-                return await message.reply("Ответьте /sc на картинку, GIF, видео или стикер.")
+                return await message.reply("Ответьте /sc на картинку, GIF, видео, стикер или кастомный эмодзи.")
             if (source.file_size or 0) > MAX_INPUT_BYTES:
                 raise StickerMediaError("Файл больше 20 МБ. Стикер не добавлен.")
-            file = await download(source, bot)
-            if file is None:
-                raise StickerMediaError("Не удалось скачать файл. Стикер не добавлен.")
-            prepared, timeouted = await cpu_executor.run(prepare_media, file.getvalue(), kind or "static")
-            if timeouted:
-                raise StickerMediaError("Обработка заняла слишком много времени. Стикер не добавлен.")
-            emojis = list(dict.fromkeys(e["emoji"] for e in emoji.emoji_list(meta.extract_text()[1])))[:5] or ["✨"]
             client = StickerSetClient(bot)
-            uploaded = await client.upload(message.from_user.id, prepared.payload, prepared.kind, emojis)
+            trimmed = False
+            if isinstance(source, Sticker) and reusable_sticker(source):
+                uploaded = UploadedSticker(
+                    source.file_id,
+                    kind or "static",
+                    metadata.emojis,
+                    source.file_unique_id,
+                    size=source.file_size,
+                    keywords=metadata.keywords,
+                    emojis_explicit=metadata.emojis_explicit,
+                )
+            else:
+                is_custom = isinstance(source, Sticker) and source.type == "custom_emoji"
+                if isinstance(source, Sticker) and source.type == "custom_emoji" and source.needs_repainting:
+                    raise StickerMediaError(
+                        "Этот эмодзи меняет цвет под тему Telegram. Пока не могу сохранить его цвета в обычном стикере. "
+                        "Пришлите картинку, GIF или видео с нужным цветом."
+                    )
+
+                async def prepare_input() -> tuple[bytes, str]:
+                    file = await download(source, bot, max_bytes=MAX_INPUT_BYTES)
+                    if file is None:
+                        raise StickerMediaError("Не удалось скачать файл. Стикер не добавлен.")
+                    with file:
+                        return file.getvalue(), kind or "static"
+
+                prepared, timeouted = await cpu_executor.run_prepared(prepare_input, prepare_custom_emoji if is_custom else prepare_media)
+                if timeouted:
+                    raise StickerMediaError("Обработка заняла слишком много времени. Стикер не добавлен.")
+                uploaded = await client.upload(
+                    message.from_user.id,
+                    prepared.payload,
+                    prepared.kind,
+                    metadata.emojis,
+                    keywords=metadata.keywords,
+                    emojis_explicit=metadata.emojis_explicit,
+                )
+                trimmed = prepared.trimmed
             if not await client.save(name, message.from_user.id, uploaded):
                 draft = ChatStickerDraft(
                     mixed_sticker=uploaded.input_sticker(),
@@ -249,12 +285,12 @@ class Stickers:
                     sticker_chat_id=message.chat.id,
                     sticker_user_id=message.from_user.id,
                     sticker_origin_message_id=message.message_id,
-                    sticker_trimmed=prepared.trimmed,
+                    sticker_trimmed=trimmed,
                 )
                 await state.set_data(draft.model_dump(mode="json"))
                 await state.set_state(StickerStates.sticker_set_name)
                 return await message.reply("🎈 Пришлите название стикерпака (1–64 символа) или /cancel.")
-            return await cls.reply_saved_sticker(message, client, name, uploaded, trimmed=prepared.trimmed)
+            return await cls.reply_saved_sticker(message, client, name, uploaded, trimmed=trimmed)
         except StickerMediaError as exc:
             return await message.reply(str(exc))
         except TelegramBadRequest as exc:
@@ -275,6 +311,10 @@ class Stickers:
     ) -> Message:
         # A failed preview must never repeat the save.
         file_id = await client.resolve(name, uploaded)
+        metadata_notice = ""
+        if uploaded.emojis_explicit or uploaded.keywords is not None:
+            if file_id is None or not await client.update_metadata(file_id, uploaded):
+                metadata_notice = "Стикер сохранён. Обновление эмодзи и меток не подтверждено; их можно задать повторной командой /sc."
         link = hlink("стикерпак", f"https://t.me/addstickers/{name}")
         if file_id is not None:
             try:
@@ -287,12 +327,16 @@ class Stickers:
                     notices.append(f"✨ Стикерпак чата: {link}")
                 if trimmed:
                     notices.append(trimmed_sticker_notice)
+                if metadata_notice:
+                    notices.append(metadata_notice)
                 if notices:
                     await message.reply("\n".join(notices))
                 return reply
         text = f"✨ Стикер добавлен в {link}. Откройте его в паке."
         if trimmed:
             text += "\n" + trimmed_sticker_notice
+        if metadata_notice:
+            text += "\n" + metadata_notice
         return await message.reply(text)
 
     @classmethod

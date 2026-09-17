@@ -65,9 +65,9 @@ def check_media(audio):
     ImageDraw.Draw(image).text((30, 35), "ПРИВЕТ МИР 314", font=ImageFont.truetype(str(ubuntu_mono_font), 72), fill="black")
     png = io.BytesIO()
     image.save(png, format="PNG")
-    png.seek(0)
-    assert to_text(png).strip() == "ПРИВЕТ МИР 314", "Cyrillic OCR failed"
-    sticker = prepare_static(png.getvalue())
+    payload = png.getvalue()
+    assert to_text(io.BytesIO(payload)).strip() == "ПРИВЕТ МИР 314", "Cyrillic OCR failed"
+    sticker = prepare_static(payload)
     with Image.open(io.BytesIO(sticker.payload)) as webp:
         assert webp.format == "WEBP" and max(webp.size) == 512
 
@@ -101,6 +101,49 @@ def check_media(audio):
         assert converted.kind == "video" and converted.payload and not converted.trimmed
 
 
+def check_sticker_animation_formats():
+    from PIL import Image
+
+    from msu_hub_bot.media.sticker_media import prepare_media
+
+    frames = [Image.new("RGBA", (32, 32), color) for color in ((255, 0, 0, 128), (0, 255, 0, 128), (0, 0, 255, 128))]
+    with tempfile.TemporaryDirectory(prefix="hub-animation-smoke-") as directory:
+        for format_name in ("PNG", "WEBP"):
+            source = io.BytesIO()
+            frames[0].save(source, format=format_name, save_all=True, append_images=frames[1:], duration=[100, 400, 200], loop=0)
+            prepared = prepare_media(source.getvalue(), "static")
+            assert prepared.kind == "video" and not prepared.trimmed
+            output = Path(directory) / "sticker.webm"
+            output.write_bytes(prepared.payload)
+            decoded = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-nostdin",
+                    "-v",
+                    "error",
+                    "-c:v",
+                    "libvpx-vp9",
+                    "-i",
+                    str(output),
+                    "-vf",
+                    "format=rgba,scale=1:1",
+                    "-pix_fmt",
+                    "rgba",
+                    "-f",
+                    "rawvideo",
+                    "pipe:1",
+                ],
+                check=True,
+                capture_output=True,
+                timeout=30,
+            ).stdout
+            pixels = [decoded[index : index + 4] for index in range(0, len(decoded), 4)]
+            assert 20 <= len(pixels) <= 22, f"{format_name} frame timing changed"
+            colors = [max(range(3), key=lambda channel: pixel[channel]) for pixel in pixels]
+            assert all(abs(colors.count(color) - count) <= 1 for color, count in ((0, 3), (1, 12), (2, 6)))
+            assert all(120 <= pixel[3] <= 136 for pixel in pixels), f"{format_name} transparency lost"
+
+
 def check_animation():
     from msu_hub_bot.commands.animate import AnimateTextSticker, MatrixSticker, animate
 
@@ -118,6 +161,31 @@ def check_animation():
         assert document["w"] == document["h"] == 512
         assert 0 < (document["op"] - document["ip"]) / document["fr"] <= 3
         assert has_outline(document), "Animated sticker has no rendered glyphs"
+
+    from lottie import NVector, objects
+    from lottie.exporters.svg import export_svg
+    from lottie.utils.color import Color
+    from PIL import Image
+    import resvg_py
+
+    from msu_hub_bot.media.sticker_media import prepare_custom_emoji
+
+    animation = objects.Animation(30)
+    animation.width = animation.height = 100
+    layer = animation.add_layer(objects.ShapeLayer())
+    rectangle = layer.add_shape(objects.Rect())
+    rectangle.position.value = NVector(50, 50)
+    rectangle.size.value = NVector(80, 80)
+    layer.add_shape(objects.Fill(Color(1, 0, 0)))
+    prepared = prepare_custom_emoji(gzip.compress(json.dumps(animation.to_dict()).encode()), "animated")
+    normalized = objects.Animation.load(json.loads(gzip.decompress(prepared.payload)))
+    svg = io.BytesIO()
+    export_svg(normalized, svg, frame=0, pretty=False)
+    rendered = resvg_py.svg_to_bytes(svg_string=svg.getvalue().decode(), skip_system_fonts=True)
+    with Image.open(io.BytesIO(rendered)) as image:
+        assert image.size == (512, 512)
+        assert image.getpixel((256, 256)) == (255, 0, 0, 255)
+        assert image.getpixel((0, 0)) == (0, 0, 0, 0)
 
 
 def check_youtube_runtime():
@@ -182,6 +250,7 @@ async def main():
     audio = synthetic_audio()
     check_fingerprint(audio)
     check_media(audio)
+    check_sticker_animation_formats()
     check_animation()
     check_youtube_runtime()
     check_chess()

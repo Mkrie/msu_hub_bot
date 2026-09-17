@@ -97,12 +97,39 @@ async def test_concurrent_saves_resolve_their_own_stickers():
     assert bot.add_sticker_to_set.await_count == 2
 
 
-async def test_duplicate_addition_can_resolve_an_existing_sticker():
+async def test_known_duplicate_resolves_without_repeating_addition():
     bot = bot_with_pack(registered("wanted"), registered("newer"))
     client = StickerSetClient(bot)
     assert await client.save("pack", 1, upload())
     assert await client.resolve("pack", upload()) == "registered-wanted"
+    bot.add_sticker_to_set.assert_not_awaited()
+
+
+@pytest.mark.parametrize("kind", ["static", "animated", "video"])
+async def test_exact_registered_file_reference_is_not_added_again(kind):
+    bot = bot_with_pack(registered("identity", kind, file_id="known-file"))
+    bot.get_file.return_value = SimpleNamespace(file_unique_id="identity")
+    source = UploadedSticker("known-file", kind, ("✨",))
+    client = StickerSetClient(bot)
+    assert await client.save("pack", 1, source)
+    assert await client.resolve("pack", source) == "known-file"
+    bot.add_sticker_to_set.assert_not_awaited()
+    bot.create_new_sticker_set.assert_not_awaited()
+
+
+async def test_duplicate_identity_in_another_format_does_not_skip_addition():
+    bot = bot_with_pack(registered("wanted", "static"))
+    assert await StickerSetClient(bot).save("pack", 1, upload(kind="video"))
     bot.add_sticker_to_set.assert_awaited_once()
+
+
+async def test_creation_race_with_the_same_artwork_does_not_repeat_addition():
+    bot = bot_with_pack()
+    bot.get_sticker_set.side_effect = [error("STICKERSET_INVALID"), pack(registered("wanted"))]
+    bot.create_new_sticker_set.side_effect = error("name was taken concurrently")
+    assert await StickerSetClient(bot).save("pack", 1, upload(), title="Pack")
+    bot.create_new_sticker_set.assert_awaited_once()
+    bot.add_sticker_to_set.assert_not_awaited()
 
 
 async def test_changed_identity_requires_matching_file_contents():
@@ -111,6 +138,50 @@ async def test_changed_identity_requires_matching_file_contents():
     bot.download.side_effect = lambda _, destination: destination.write(next(payloads))
     assert await StickerSetClient(bot).resolve("pack", upload(payload=b"data")) == "registered-changed-id"
     assert bot.download.await_count == 2
+
+
+async def test_content_lookup_bounds_actual_bytes_and_closes_candidate_buffers():
+    bot = bot_with_pack(registered("matching"), registered("oversized"))
+    destinations = []
+
+    def download(file_id, *, destination):
+        destinations.append(destination)
+        destination.write(b"data" if file_id == "registered-matching" else b"x" * 5)
+
+    bot.download.side_effect = download
+    assert await StickerSetClient(bot).resolve("pack", upload(payload=b"data")) == "registered-matching"
+    assert len(destinations) == 2 and all(destination.closed for destination in destinations)
+
+
+async def test_cross_pack_reuse_fingerprints_source_only_after_identity_changes():
+    bot = bot_with_pack(registered("new-identity"), registered("unrelated"))
+    payloads = {"source-sticker": b"data", "registered-new-identity": b"data", "registered-unrelated": b"nope"}
+    destinations = []
+
+    def download(file_id, *, destination):
+        destinations.append(destination)
+        destination.write(payloads[file_id])
+
+    bot.download.side_effect = download
+    source = UploadedSticker("source-sticker", "video", ("✨",), "old-identity")
+    assert await StickerSetClient(bot).resolve("pack", source) == "registered-new-identity"
+    assert [call.args[0] for call in bot.download.call_args_list] == ["source-sticker", "registered-unrelated", "registered-new-identity"]
+    assert all(destination.closed for destination in destinations)
+    bot.add_sticker_to_set.assert_not_awaited()
+
+
+async def test_missing_identity_fingerprint_is_attempted_only_once_and_is_bounded():
+    bot = bot_with_pack(registered("unrelated"))
+    destinations = []
+
+    def oversized(file_id, *, destination):
+        destinations.append(destination)
+        destination.write(b"x" * (sticker_sets.MAX_STICKER_BYTES + 1))
+
+    bot.download.side_effect = oversized
+    assert await StickerSetClient(bot).resolve("pack", upload("old-identity")) is None
+    bot.download.assert_awaited_once()
+    assert destinations[0].closed
 
 
 async def test_matching_bytes_with_another_format_are_not_used():
