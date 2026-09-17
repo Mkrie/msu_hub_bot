@@ -3,13 +3,13 @@ import json
 import logging
 import math
 import subprocess
+import time
 from fractions import Fraction
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from msu_hub_bot.execution.process import ProcessOutputTooLarge, run_process
-from msu_hub_bot.media.limits import MediaDimensionsError, validate_dimensions
-from msu_hub_bot.utils import FakeBytesIO
+from msu_hub_bot.media.limits import LOCAL_MEDIA_FORMATS, MediaDimensionsError, validate_dimensions
 
 
 FFMPEG_TIMEOUT = 120
@@ -31,20 +31,24 @@ def _positive(value: object) -> float:
         return 0
 
 
-def _validate_source(source: Path, *, reverse: bool) -> None:
+def _validate_source(source: Path, *, reverse: bool, timeout: float = FFPROBE_TIMEOUT) -> None:
     data = json.loads(
         run_process(
             [
                 "ffprobe",
                 "-v",
                 "error",
+                "-protocol_whitelist",
+                "file,pipe",
+                "-format_whitelist",
+                LOCAL_MEDIA_FORMATS,
                 "-show_entries",
                 "stream=codec_type,width,height,avg_frame_rate,r_frame_rate,duration,nb_frames,sample_rate,channels:format=duration",
                 "-of",
                 "json",
                 str(source),
             ],
-            timeout=FFPROBE_TIMEOUT,
+            timeout=timeout,
             max_output_bytes=1024 * 1024,
         )
     )
@@ -83,9 +87,14 @@ def _validate_source(source: Path, *, reverse: bool) -> None:
 
 
 def ffmpeg(
-    file: io.BytesIO, parameters: list[str] | None = None, out_suffix: str | None = None, *, reverse: bool = False
+    file: io.BytesIO,
+    parameters: list[str] | None = None,
+    out_suffix: str | None = None,
+    *,
+    reverse: bool = False,
+    timeout: float | None = None,
 ) -> io.BytesIO | None:
-    return ffmpeg2(file, parameters2=parameters, out_suffix=out_suffix, reverse=reverse)
+    return ffmpeg2(file, parameters2=parameters, out_suffix=out_suffix, reverse=reverse, timeout=timeout)
 
 
 def ffmpeg2(
@@ -95,8 +104,13 @@ def ffmpeg2(
     out_suffix: str | None = None,
     *,
     reverse: bool = False,
+    timeout: float | None = None,
 ) -> io.BytesIO | None:
     """Convert in a disposable workspace, killing native work at its own deadline."""
+    budget = FFMPEG_TIMEOUT + FFPROBE_TIMEOUT if timeout is None else timeout
+    if not math.isfinite(budget) or budget <= 0:
+        return None
+    deadline = time.monotonic() + budget
     with TemporaryDirectory(prefix="hub-media-") as directory:
         source = Path(directory) / "source"
         output = Path(directory) / ("result" + (out_suffix or ""))
@@ -113,6 +127,10 @@ def ffmpeg2(
             "-threads",
             "2",
             *(parameters1 or []),
+            "-protocol_whitelist",
+            "file,pipe",
+            "-format_whitelist",
+            LOCAL_MEDIA_FORMATS,
             "-i",
             str(source),
             *(parameters2 or []),
@@ -123,12 +141,18 @@ def ffmpeg2(
         try:
             # Close the writer before FFmpeg opens even a very small input.
             source.write_bytes(file.read())
-            _validate_source(source, reverse=reverse)
-            run_process(command, timeout=FFMPEG_TIMEOUT)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, budget)
+            _validate_source(source, reverse=reverse, timeout=min(FFPROBE_TIMEOUT, remaining))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, budget)
+            run_process(command, timeout=min(FFMPEG_TIMEOUT, remaining))
             if output.stat().st_size > MAX_OUTPUT_BYTES:
                 logger.warning("FFmpeg output exceeded its size limit")
                 return None
-            result = FakeBytesIO(output.read_bytes())
+            result = io.BytesIO(output.read_bytes())
         except subprocess.TimeoutExpired:
             logger.warning("FFmpeg conversion exceeded its deadline")
             return None

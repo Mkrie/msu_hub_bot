@@ -4,6 +4,9 @@ MAX_IMAGE_PIXELS = 16_000_000
 MAX_IMAGE_SIDE = 8192
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 
+# Data containers used by chat media; playlists and session descriptions are excluded.
+LOCAL_MEDIA_FORMATS = "mov,matroska,avi,mpeg,mpegts,ogg,asf,flv,gif,apng,image2,image2pipe,png_pipe,jpeg_pipe,webp_pipe,wav,mp3,aac,flac"
+
 
 class MediaDimensionsError(ValueError):
     """The input exceeds the media worker's decoded-image budget."""

@@ -2,10 +2,11 @@ from msu_hub_bot.settings import MissingIntegration
 
 import asyncio
 import io
+import time
+from contextlib import ExitStack
 from functools import cached_property
 from itertools import cycle
 from typing import List, Optional, cast
-from typing_extensions import Buffer
 
 import aiohttp
 from aiogram.types import Audio, Message, Video, VideoNote, Voice
@@ -15,29 +16,19 @@ from throttler import Throttler
 
 from msu_hub_bot.telemetry import Boundary, Provider, Telemetry
 
-from msu_hub_bot.execution.executor import TPExecutor
+from msu_hub_bot.execution.executor import ExecutorBusy, TPExecutor
 from msu_hub_bot.providers.exceptions import ExternalServiceError
 from msu_hub_bot.telegram.middlewares.settings import Settings
 from msu_hub_bot.telegram.runtime import gather_complete
 from msu_hub_bot.telegram.utils import send_super_reply
 from msu_hub_bot.telegram.context import bot_for
-from msu_hub_bot.utils import megabytes, FakeBytesIO
+from msu_hub_bot.telegram.files import DownloadTooLarge
+from msu_hub_bot.telegram.media_jobs import DownloadUnavailable, run_downloaded
+from msu_hub_bot.media.limits import MAX_DOWNLOAD_BYTES
 from msu_hub_bot.media.ffmpeg import ffmpeg
 
-
-class _AudioTooLarge(ValueError):
-    pass
-
-
-class _AudioBuffer(FakeBytesIO):
-    def __init__(self, limit: int) -> None:
-        super().__init__()
-        self.limit = limit
-
-    def write(self, data: Buffer) -> int:
-        if self.tell() + memoryview(data).nbytes > self.limit:
-            raise _AudioTooLarge()
-        return super().write(data)
+CHUNK_PREPARATION_TIMEOUT = 120
+MAX_PCM_BYTES = 64 * 1024 * 1024
 
 
 class WitAPIError(ExternalServiceError):
@@ -123,6 +114,11 @@ class Wit(ManyWitAPI):
 
     @staticmethod
     def to_raw_chunks(file: io.BytesIO, duration: int, max_size: int = 20_000, overlap: int = 100) -> List[io.BytesIO]:
+        if any(not isinstance(value, int) or isinstance(value, bool) for value in (duration, max_size, overlap)):
+            return []
+        if duration <= 0 or overlap < 0 or max_size <= 2 * overlap:
+            return []
+        deadline = time.monotonic() + CHUNK_PREPARATION_TIMEOUT
         parameters = [
             "-f",
             "s16le",
@@ -139,29 +135,64 @@ class Wit(ManyWitAPI):
         length = step + overlap
         duration = duration * 1000
 
-        chunks = []
-        for start in range(0, duration, step):
-            file.seek(0)
-            chunk = ffmpeg(file, out_suffix=".flac", parameters=parameters + ["-ss", f"{start}ms", "-t", f"{length}ms"])
-            if chunk is None:
-                return []
-            chunks.append(chunk)
+        chunks: list[io.BytesIO] = []
+        total_bytes = 0
+        complete = False
+        try:
+            for start in range(0, duration, step):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return []
+                file.seek(0)
+                chunk = ffmpeg(
+                    file,
+                    out_suffix=".flac",
+                    parameters=parameters + ["-ss", f"{start}ms", "-t", f"{length}ms"],
+                    timeout=remaining,
+                )
+                if chunk is None:
+                    return []
+                chunks.append(chunk)
+                with chunk.getbuffer() as view:
+                    size = view.nbytes
+                total_bytes += size
+                if not size or total_bytes > MAX_PCM_BYTES or time.monotonic() >= deadline:
+                    return []
+            complete = True
+            return chunks
+        finally:
+            if not complete:
+                for chunk in chunks:
+                    chunk.close()
 
-        return chunks
+    @staticmethod
+    def _prepare_audio(file: io.BytesIO, duration: int) -> tuple[bytes, ...]:
+        chunks = Wit.to_raw_chunks(file, duration)
+        try:
+            return tuple(chunk.getvalue() for chunk in chunks)
+        finally:
+            for chunk in chunks:
+                chunk.close()
 
     async def stt(self, file: io.BytesIO, duration: int) -> Optional[str]:
         if self.executor is None:
             raise RuntimeError("Speech executor is not configured")
-        chunks, timeouted = await self.executor.run(self.to_raw_chunks, file, duration)
-        if timeouted or not chunks or any(chunk is None for chunk in chunks):
+        chunks, timeouted = await self.executor.run(self._prepare_audio, file, duration)
+        if timeouted:
             return None
+        return await self._recognize_chunks(chunks)
 
-        texts: List[str] = await gather_complete(
-            *[
-                self.instance.speech(chunk, content_type="audio/raw;encoding=signed-integer;bits=16;rate=16000;endian=little")
-                for chunk in chunks
-            ]
-        )
+    async def _recognize_chunks(self, chunks: tuple[bytes, ...] | None) -> Optional[str]:
+        if not chunks or any(not chunk for chunk in chunks):
+            return None
+        with ExitStack() as buffers:
+            audio = [buffers.enter_context(io.BytesIO(chunk)) for chunk in chunks]
+            texts: List[str] = await gather_complete(
+                *[
+                    self.instance.speech(chunk, content_type="audio/raw;encoding=signed-integer;bits=16;rate=16000;endian=little")
+                    for chunk in audio
+                ]
+            )
 
         if texts and texts[-1] == "":
             texts.pop()
@@ -187,20 +218,25 @@ class Wit(ManyWitAPI):
                 target = message.reply_to_message
                 dest = target.voice or target.video_note or target.audio or target.video
 
-        limit = int(megabytes(20))
-        if dest is None or (dest.file_size is not None and dest.file_size > limit):
+        if dest is None or (dest.file_size is not None and dest.file_size > MAX_DOWNLOAD_BYTES):
             return True
 
         if not self.instances:
             raise MissingIntegration("wit_tokens")
 
-        file = _AudioBuffer(limit)
+        if self.executor is None:
+            raise RuntimeError("Speech executor is not configured")
         try:
-            await bot_for(message).download(dest.file_id, destination=file)
-        except _AudioTooLarge:
+            chunks, timeouted = await run_downloaded(self.executor, dest, self._prepare_audio, int(dest.duration), bot=bot_for(message))
+        except DownloadUnavailable, DownloadTooLarge:
             return True
-        file.seek(0)
-        text = await self.stt(file, duration=int(dest.duration))
+        except ExecutorBusy:
+            if explicit:
+                raise
+            return True
+        if timeouted:
+            return True
+        text = await self._recognize_chunks(chunks)
         if not text:
             return True
 

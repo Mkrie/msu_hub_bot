@@ -11,6 +11,17 @@ from msu_hub_bot.telegram.runtime import Supervisor
 from msu_hub_bot.settings import MissingIntegration
 
 from msu_hub_bot.providers import wit
+from msu_hub_bot.telegram import media_jobs
+
+
+def recognizer():
+    async def prepare_job(prepare, func, **kwargs):
+        return func(*(await prepare())), False
+
+    client = wit.Wit(["synthetic"], executor=SimpleNamespace(run_prepared=AsyncMock(side_effect=prepare_job)))
+    client._prepare_audio = Mock(side_effect=lambda stream, duration: (stream.read(),))
+    client._recognize_chunks = AsyncMock(return_value="transcript")
+    return client
 
 
 def audio_message(*, size=3, payload=b"pcm", reply=None, kind="voice"):
@@ -45,25 +56,22 @@ async def test_disabled_automatic_stt_never_downloads_incoming_or_replied_audio(
 async def test_explicit_stt_keeps_reply_selection_when_automatic_stt_is_disabled(monkeypatch, kind):
     reply, audio = audio_message(kind=kind, size=None)
     command = SimpleNamespace(voice=None, video_note=None, reply_to_message=reply, bot=reply.bot)
-    client = wit.Wit(["synthetic"])
-    client.stt = AsyncMock(return_value="transcript")
+    client = recognizer()
     send = AsyncMock()
     monkeypatch.setattr(wit, "send_super_reply", send)
 
     await client.process_stt_command(command, SimpleNamespace(auto_speech_recognition=False))
 
     audio.download.assert_awaited_once()
-    downloaded = client.stt.await_args.args[0]
-    assert downloaded.read() == b"pcm"
-    assert client.stt.await_args.kwargs == {"duration": 1}
+    client._recognize_chunks.assert_awaited_once_with((b"pcm",))
+    assert client._prepare_audio.call_args.args[1] == 1
     send.assert_awaited_once_with(reply, "transcript")
 
 
 async def test_enabled_automatic_stt_uses_incoming_voice(monkeypatch):
     reply, replied_audio = audio_message()
     incoming, audio = audio_message(reply=reply)
-    client = wit.Wit(["synthetic"])
-    client.stt = AsyncMock(return_value="transcript")
+    client = recognizer()
     send = AsyncMock()
     monkeypatch.setattr(wit, "send_super_reply", send)
 
@@ -88,23 +96,15 @@ async def test_missing_speech_provider_is_checked_before_download_or_conversion(
 
 @pytest.mark.parametrize("declared_size", [None, 1, 5])
 async def test_download_size_limit_covers_missing_and_inaccurate_metadata(monkeypatch, declared_size):
-    monkeypatch.setattr(wit, "megabytes", lambda _value: 4)
+    monkeypatch.setattr(wit, "MAX_DOWNLOAD_BYTES", 4)
+    monkeypatch.setattr(media_jobs, "MAX_DOWNLOAD_BYTES", 4)
     incoming, audio = audio_message(size=declared_size, payload=b"12345")
-    client = wit.Wit(["synthetic"])
-    client.stt = AsyncMock()
+    client = recognizer()
 
     assert await client.process_stt(incoming, SimpleNamespace(auto_speech_recognition=True)) is True
 
     assert audio.download.await_count == (0 if declared_size == 5 else 1)
-    client.stt.assert_not_awaited()
-
-
-def test_audio_buffer_rejects_the_chunk_that_exceeds_the_limit():
-    buffer = wit._AudioBuffer(4)
-    assert buffer.write(b"123") == 3
-    with pytest.raises(wit._AudioTooLarge):
-        buffer.write(b"45")
-    assert buffer.getvalue() == b"123"
+    client._recognize_chunks.assert_not_awaited()
 
 
 def test_failed_native_conversion_stops_chunking(monkeypatch):
@@ -125,14 +125,16 @@ async def test_failed_preprocessing_never_submits_an_empty_request(result):
 
 
 async def test_failed_chunk_keeps_sibling_requests_owned_until_they_finish():
-    chunks = [io.BytesIO(b"first"), io.BytesIO(b"second")]
+    chunks = (b"first", b"second")
     client = wit.Wit(["synthetic"], executor=SimpleNamespace(run=AsyncMock(return_value=(chunks, False))))
     supervisor = Supervisor()
     entered, release, settled = asyncio.Event(), asyncio.Event(), asyncio.Event()
     original = wit.WitAPIError(503, "synthetic failure")
+    opened = []
 
     async def speech(chunk, **kwargs):
-        if chunk is chunks[0]:
+        opened.append(chunk)
+        if chunk.getvalue() == chunks[0]:
             raise original
         entered.set()
         try:
@@ -154,10 +156,12 @@ async def test_failed_chunk_keeps_sibling_requests_owned_until_they_finish():
         drain = asyncio.create_task(supervisor.drain(1, cancel_timeout=0.1))
         done, _ = await asyncio.wait({task, drain}, timeout=0.01)
         assert not done and supervisor.update_count == 1
+        assert all(not chunk.closed for chunk in opened)
         release.set()
         with pytest.raises(wit.WitAPIError) as caught:
             await task
         assert caught.value is original and settled.is_set()
+        assert all(chunk.closed for chunk in opened)
         await drain
     finally:
         release.set()

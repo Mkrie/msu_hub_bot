@@ -31,6 +31,8 @@ def test_small_input_is_readable_by_native_ffmpeg(convert):
     with wave.open(result) as audio:
         assert audio.getnframes() == 400
         assert audio.getframerate() == 8000
+    result.close()
+    assert result.closed
 
 
 @pytest.mark.parametrize("failure", ["error", "missing", "timeout", "missing-output"])
@@ -144,3 +146,48 @@ def test_native_audio_reverse_preserves_every_sample():
     with wave.open(result) as audio:
         assert audio.getnframes() == 400
         assert audio.readframes(400) == b"".join(reversed(samples))
+
+
+def test_caller_budget_includes_probe_and_conversion(monkeypatch):
+    now = [0.0]
+    budgets = []
+    monkeypatch.setattr(media, "time", type("Clock", (), {"monotonic": staticmethod(lambda: now[0])}))
+
+    def probe(*args, timeout, **kwargs):
+        budgets.append(timeout)
+        now[0] += 2
+
+    def convert(command, *, timeout):
+        budgets.append(timeout)
+        Path(command[-1]).write_bytes(b"converted")
+
+    monkeypatch.setattr(media, "_validate_source", probe)
+    monkeypatch.setattr(media, "run_process", convert)
+    result = media.ffmpeg(io.BytesIO(b"input"), out_suffix=".wav", timeout=5)
+    assert result is not None and budgets == [5, 3]
+
+
+def test_expired_probe_budget_never_starts_conversion(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(media, "time", type("Clock", (), {"monotonic": staticmethod(lambda: now[0])}))
+
+    def probe(*args, **kwargs):
+        now[0] = 6
+
+    def convert(*args, **kwargs):
+        pytest.fail("conversion started after the caller deadline")
+
+    monkeypatch.setattr(media, "_validate_source", probe)
+    monkeypatch.setattr(media, "run_process", convert)
+    assert media.ffmpeg(io.BytesIO(b"input"), out_suffix=".wav", timeout=5) is None
+
+
+@pytest.mark.skipif(shutil.which("ffprobe") is None, reason="FFprobe is not installed")
+def test_uploaded_playlist_cannot_open_a_local_fifo(tmp_path):
+    target = tmp_path / "victim"
+    os.mkfifo(target)
+    source = tmp_path / "source"
+    source.write_text("ffconcat version 1.0\nfile 'victim'\n")
+    # Opening this FIFO would block until the deadline; rejection must happen first.
+    with pytest.raises(subprocess.CalledProcessError):
+        media._validate_source(source, reverse=False, timeout=2)
