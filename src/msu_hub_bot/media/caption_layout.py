@@ -2,6 +2,7 @@
 
 import re
 import math
+from contextlib import ExitStack, closing
 from dataclasses import dataclass
 from pathlib import Path
 from io import BytesIO
@@ -10,6 +11,7 @@ from typing import cast
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from msu_hub_bot.resources import lobster_font, times_new_roman_font
+from msu_hub_bot.media.limits import validate_dimensions
 
 MAX_CAPTION_LENGTH = 1024
 MIN_FONT_SIZE = 18
@@ -121,15 +123,21 @@ def fit_caption(text: str, font_path: Path, width: int, height: int, preferred_s
 
 
 def base_image(file: BytesIO, preserve_alpha: bool = False) -> Image.Image:
-    with Image.open(file) as original:
-        image = ImageOps.exif_transpose(original).convert("RGBA")
-    image.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE), Image.Resampling.LANCZOS)
-    if max(image.size) < 320:
-        scale = 320 / max(image.size)
-        image = image.resize(cast(tuple[int, int], tuple(max(1, round(side * scale)) for side in image.size)), Image.Resampling.LANCZOS)
-    canvas = Image.new("RGBA" if preserve_alpha else "RGB", (max(320, image.width), max(240, image.height)), "black")
-    canvas.paste(image, ((canvas.width - image.width) // 2, (canvas.height - image.height) // 2), None if preserve_alpha else image)
-    return canvas
+    with ExitStack() as images:
+        # Preserve caller ownership while Pillow closes its own image buffer.
+        source = images.enter_context(BytesIO(file.getvalue()))
+        original = images.enter_context(closing(Image.open(source)))
+        validate_dimensions(*original.size)
+        oriented = images.enter_context(closing(ImageOps.exif_transpose(original)))
+        image = images.enter_context(closing(oriented.convert("RGBA")))
+        image.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE), Image.Resampling.LANCZOS)
+        if max(image.size) < 320:
+            scale = 320 / max(image.size)
+            size = cast(tuple[int, int], tuple(max(1, round(side * scale)) for side in image.size))
+            image = images.enter_context(closing(image.resize(size, Image.Resampling.LANCZOS)))
+        canvas = Image.new("RGBA" if preserve_alpha else "RGB", (max(320, image.width), max(240, image.height)), "black")
+        canvas.paste(image, ((canvas.width - image.width) // 2, (canvas.height - image.height) // 2), None if preserve_alpha else image)
+        return canvas
 
 
 def lobster_image(file: BytesIO, text: str) -> Image.Image:

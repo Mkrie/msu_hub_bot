@@ -12,7 +12,7 @@ from aiogram.utils.markdown import hcode, hitalic, hbold, hide_link, hlink
 from msu_hub_bot.execution.executor import TPExecutor
 from msu_hub_bot import json
 from msu_hub_bot.providers.ydl import YDL
-from msu_hub_bot.telegram.files import download
+from msu_hub_bot.telegram.media_jobs import DownloadUnavailable, run_downloaded
 from msu_hub_bot.utils import megabytes, prettify_duration
 
 
@@ -62,13 +62,14 @@ async def process_song(message: Message, bot: Bot, cpu_executor: TPExecutor) -> 
         return True
 
     m = await target.reply(hitalic("🔄 Ожидание..."))
-    file = await download(dest, bot)
-    if file is None:
+    try:
+        text, timeouted = await run_downloaded(cpu_executor, dest, recognize_song, bot=bot)
+    except DownloadUnavailable:
         return await m.edit_text(hitalic("Не удалось распознать песню 😔"))
-
-    text, timeouted = await cpu_executor.run(recognize_song, file)
     if timeouted:
         return await m.edit_text(hcode("🤷🏻‍♂️ Timeout"))
+    if text is None:
+        return await m.edit_text(hitalic("Не удалось распознать песню 😔"))
 
     result = json.loads(text)
 

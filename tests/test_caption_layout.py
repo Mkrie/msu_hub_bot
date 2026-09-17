@@ -5,6 +5,7 @@ from PIL import Image, ImageChops
 
 from msu_hub_bot.resources import lobster_font, times_new_roman_font
 from msu_hub_bot.media import caption_layout as layout
+from msu_hub_bot.media import limits
 
 TEXTS = [
     "Длинная русская подпись с буквами Ё, й и щ: слова должны помещаться целиком. " * 5,
@@ -14,6 +15,19 @@ TEXTS = [
     "Первая строка\n\nВторая строка\nThird line",
     "Пятница 🙂 ✨ ❤️\nHappy friends 👨‍👩‍👧‍👦!",
 ]
+
+
+def test_oversized_caption_source_is_rejected_before_decoding(monkeypatch):
+    file = source((2, 2))
+    monkeypatch.setattr(limits, "MAX_IMAGE_PIXELS", 3)
+
+    def decode(*args, **kwargs):
+        pytest.fail("caption source decoded before checking dimensions")
+
+    monkeypatch.setattr(Image.Image, "load", decode)
+    with pytest.raises(limits.MediaDimensionsError):
+        layout.base_image(file)
+    assert not file.closed
 
 
 def source(size=(640, 480), color="#527893", exif=None):

@@ -16,7 +16,11 @@ from telegram_helpers import make_bot, make_message
 
 
 def executor(result):
-    return SimpleNamespace(run=AsyncMock(return_value=(result, False)))
+    async def prepare_job(prepare, func, **kwargs):
+        await prepare()
+        return result, False
+
+    return SimpleNamespace(run=AsyncMock(return_value=(result, False)), run_prepared=AsyncMock(side_effect=prepare_job))
 
 
 @pytest.mark.asyncio
@@ -38,9 +42,9 @@ async def test_tts_upload_keeps_filename_and_metadata():
 @pytest.mark.asyncio
 async def test_long_ocr_output_uploads_a_named_utf8_document():
     bot = make_bot()
-    message = make_message(bot)
+    message = make_message(bot, photo=[{"file_id": "image", "file_unique_id": "unique", "width": 2, "height": 2}])
     text = "Длинный текст " * 500
-    meta = SimpleNamespace(extract_image_with_downloading=AsyncMock(return_value=(message, io.BytesIO(b"image"))))
+    meta = SimpleNamespace(extract_image=AsyncMock(return_value=(message, message.photo[-1])))
     await tesseract.process_image_to_text(message, meta, executor(text))
     sent = bot.session.methods[-1]
     assert isinstance(sent, SendDocument)

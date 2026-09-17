@@ -1,4 +1,5 @@
 import io
+from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -9,8 +10,9 @@ from aiogram.types import Message
 from msu_hub_bot.execution.executor import TPExecutor
 from msu_hub_bot.telegram.chat_actioner import ChatActioner
 from msu_hub_bot.telegram.filters import MetaInfo
-from msu_hub_bot.telegram.files import download, input_file
+from msu_hub_bot.telegram.files import input_file
 from msu_hub_bot.telegram.keyboards import rate_keyboard
+from msu_hub_bot.telegram.media_jobs import DownloadUnavailable, run_downloaded
 from msu_hub_bot.utils import image_bytes_io, megabytes
 from msu_hub_bot.media.caption_layout import (
     CaptionLayoutError,
@@ -24,7 +26,7 @@ from msu_hub_bot.media.ffmpeg import ffmpeg
 
 
 async def process_lobster(message: Message, meta: MetaInfo, cpu_executor: TPExecutor) -> Message | bool:
-    target, file = await meta.extract_image_with_downloading(with_profile_photo=True)
+    target, file = await meta.extract_image(with_profile_photo=True)
     if file is None:
         return True
 
@@ -34,14 +36,20 @@ async def process_lobster(message: Message, meta: MetaInfo, cpu_executor: TPExec
 
     async with ChatActioner(message, ChatAction.UPLOAD_PHOTO):
         try:
-            image, timeouted = await cpu_executor.run(lobster_image, file, text)
+            image, timeouted = await run_downloaded(cpu_executor, file, lobster_image, text, bot=message.bot)
+        except DownloadUnavailable:
+            return True
         except CaptionLayoutError as exc:
             return await message.reply(str(exc))
         if timeouted:
             return await message.reply("🤷🏻‍♂️ Timeout")
+    if image is None:
+        return await message.reply("🤷🏻‍♂️ Не удалось обработать картинку")
+    with closing(image), image_bytes_io(image, ext="png") as output:
+        photo = input_file(output, "image.png")
 
     return await target.reply_photo(
-        input_file(image_bytes_io(image, ext="png"), "image.png"),
+        photo,
         reply_markup=rate_keyboard() if message.chat.type != ChatType.PRIVATE else None,
     )
 
@@ -51,7 +59,7 @@ async def process_demotivator(message: Message, meta: MetaInfo, cpu_executor: TP
     if video:
         return await process_demotivator_video(message, meta, cpu_executor)
 
-    target, file = await meta.extract_image_with_downloading(with_profile_photo=True)
+    target, file = await meta.extract_image(with_profile_photo=True)
     if file is None:
         return True
 
@@ -61,14 +69,20 @@ async def process_demotivator(message: Message, meta: MetaInfo, cpu_executor: TP
 
     async with ChatActioner(message, ChatAction.UPLOAD_PHOTO):
         try:
-            image, timeouted = await cpu_executor.run(demotivator_image, file, text)
+            image, timeouted = await run_downloaded(cpu_executor, file, demotivator_image, text, bot=message.bot)
+        except DownloadUnavailable:
+            return True
         except CaptionLayoutError as exc:
             return await message.reply(str(exc))
         if timeouted:
             return await message.reply("🤷🏻‍♂️ Timeout")
+    if image is None:
+        return await message.reply("🤷🏻‍♂️ Не удалось обработать картинку")
+    with closing(image), image_bytes_io(image, ext="png") as output:
+        photo = input_file(output, "image.png")
 
     return await target.reply_photo(
-        input_file(image_bytes_io(image, ext="png"), "image.png"),
+        photo,
         reply_markup=rate_keyboard() if message.chat.type != ChatType.PRIVATE else None,
     )
 
@@ -118,16 +132,14 @@ async def process_demotivator_video(message: Message, meta: MetaInfo, cpu_execut
         return True
     if (getattr(file, "file_size", None) or 0) > megabytes(20):
         return await message.reply("🤷🏻‍♂️ Файл больше 20 Мб, не смогу скачать")
-    io_bytes = await download(file)
-    if io_bytes is None:
-        return await message.reply("🤷🏻‍♂️ Что-то пошло не так")
-
     _, text = meta.extract_text()
     if not text:
         return True
 
     try:
-        video, timeouted = await cpu_executor.run(demotivator_video, io_bytes, getattr(file, "width", 384), text)
+        video, timeouted = await run_downloaded(cpu_executor, file, demotivator_video, getattr(file, "width", 384), text, bot=message.bot)
+    except DownloadUnavailable:
+        return await message.reply("🤷🏻‍♂️ Что-то пошло не так")
     except CaptionLayoutError as exc:
         return await message.reply(str(exc))
     if timeouted:

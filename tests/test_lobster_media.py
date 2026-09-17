@@ -20,8 +20,11 @@ def lobster(monkeypatch):
     async def no_chat_action(*args):
         yield
 
+    async def downloaded(executor, media, func, *args, **kwargs):
+        return await executor.run(func, media if isinstance(media, io.BytesIO) else io.BytesIO(b"video"), *args)
+
     monkeypatch.setattr(lobster_module, "ChatActioner", no_chat_action)
-    monkeypatch.setattr(lobster_module, "download", AsyncMock(return_value=io.BytesIO(b"video")))
+    monkeypatch.setattr(lobster_module, "run_downloaded", downloaded)
     return lobster_module
 
 
@@ -35,8 +38,12 @@ def photo_input(argument):
     Image.new("RGB", (2, 3)).save(source, "PNG")
     source.seek(0)
     target = SimpleNamespace(reply_photo=AsyncMock())
-    meta = SimpleNamespace(arguments=[argument], extract_image_with_downloading=AsyncMock(return_value=(target, source)))
-    message = SimpleNamespace(reply=AsyncMock(), chat=SimpleNamespace(type="private"))
+    meta = SimpleNamespace(
+        arguments=[argument],
+        extract_image_with_downloading=AsyncMock(return_value=(target, source)),
+        extract_image=AsyncMock(return_value=(target, source)),
+    )
+    message = SimpleNamespace(reply=AsyncMock(), chat=SimpleNamespace(type="private"), bot=None)
     return message, meta, target
 
 
@@ -64,7 +71,7 @@ async def test_video_conversion_failure_replies_without_sending_none(lobster, wo
     target = SimpleNamespace(reply_video=AsyncMock())
     video = SimpleNamespace(file_size=100, width=32, download=AsyncMock(return_value=io.BytesIO(b"invalid video")))
     meta = SimpleNamespace(extract_video=AsyncMock(return_value=(target, video)), extract_text=lambda: (target, "Привет"))
-    message = SimpleNamespace(reply=AsyncMock(), chat=SimpleNamespace(type="private"))
+    message = SimpleNamespace(reply=AsyncMock(), chat=SimpleNamespace(type="private"), bot=None)
     await lobster.process_demotivator_video(message, meta, worker)
     message.reply.assert_awaited_once()
     target.reply_video.assert_not_awaited()
@@ -77,7 +84,7 @@ async def test_video_without_size_metadata_reaches_conversion(lobster, worker, m
     target = SimpleNamespace(reply_video=AsyncMock())
     video = SimpleNamespace(**metadata, width=None, download=AsyncMock(return_value=io.BytesIO(b"video")))
     meta = SimpleNamespace(extract_video=AsyncMock(return_value=(target, video)), extract_text=lambda: (target, "Привет"))
-    message = SimpleNamespace(reply=AsyncMock(), chat=SimpleNamespace(type="private"))
+    message = SimpleNamespace(reply=AsyncMock(), chat=SimpleNamespace(type="private"), bot=None)
     await lobster.process_demotivator_video(message, meta, worker)
     assert target.reply_video.call_args.args[0].data == result.getvalue()
     assert target.reply_video.call_args.kwargs == {"reply_markup": None}

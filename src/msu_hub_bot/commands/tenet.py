@@ -1,4 +1,5 @@
 import io
+from contextlib import closing
 from typing import Optional
 
 from PIL import Image, ImageFile, ImageOps
@@ -7,10 +8,12 @@ from aiogram.types import Message, InputPollOption, InputSticker
 from aiogram.utils.markdown import hcode
 
 from msu_hub_bot.execution.executor import TPExecutor
-from msu_hub_bot.telegram.files import download, input_file
+from msu_hub_bot.telegram.files import DownloadableMedia, input_file
+from msu_hub_bot.telegram.media_jobs import DownloadUnavailable, run_downloaded
+from msu_hub_bot.media.limits import validate_dimensions
 from msu_hub_bot.telegram.utils import action_by_type
 from msu_hub_bot.utils import megabytes, image_bytes_io
-from msu_hub_bot.media.ffmpeg import ffmpeg
+from msu_hub_bot.media.ffmpeg import ReverseMediaError, ffmpeg
 from msu_hub_bot.settings import settings
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -27,7 +30,7 @@ def reverse_audio(file: io.BytesIO) -> Optional[io.BytesIO]:
         "-acodec",
         "libopus",
     ]
-    result = ffmpeg(file, parameters=parameters, out_suffix=".ogg")
+    result = ffmpeg(file, parameters=parameters, out_suffix=".ogg", reverse=True)
     return result
 
 
@@ -40,7 +43,7 @@ def reverse_video(file: io.BytesIO) -> Optional[io.BytesIO]:
         "-f",
         "mp4",
     ]
-    result = ffmpeg(file, parameters=parameters, out_suffix=".mp4")
+    result = ffmpeg(file, parameters=parameters, out_suffix=".mp4", reverse=True)
     return result
 
 
@@ -51,24 +54,35 @@ def reverse_webm(file: io.BytesIO) -> Optional[io.BytesIO]:
         "-c:v",
         "libvpx-vp9",
     ]
-    result = ffmpeg(file, parameters=parameters, out_suffix=".webm")
+    result = ffmpeg(file, parameters=parameters, out_suffix=".webm", reverse=True)
     return result
 
 
 def mirror_image(file: io.BytesIO, name: str = "", ext: str = "png") -> io.BytesIO:
-    image = ImageOps.mirror(Image.open(file))
-    return image_bytes_io(image, name or "image", ext)
+    with closing(Image.open(file)) as source:
+        validate_dimensions(*source.size)
+        with closing(ImageOps.mirror(source)) as image:
+            return image_bytes_io(image, name or "image", ext)
 
 
 async def process_reverse(message: Message, bot: Bot, cpu_executor: TPExecutor) -> Message | bool:
+    async def mirror(media: DownloadableMedia, name: str = "", ext: str = "png") -> io.BytesIO | None:
+        try:
+            result, timeouted = await run_downloaded(cpu_executor, media, mirror_image, name, ext, bot=bot)
+        except DownloadUnavailable:
+            return None
+        if timeouted:
+            await message.reply(hcode("🤷🏻‍♂️ Timeout"))
+        return result
+
     target = message.reply_to_message
     if not target:
         if message.from_user:
             photos = (await bot.get_user_profile_photos(user_id=message.from_user.id, limit=1)).photos
             if photos:
-                file = await download(photos[0][-1], bot)
+                file = await mirror(photos[0][-1])
                 if file is not None:
-                    return await message.reply_photo(input_file(mirror_image(file), "image.png"))
+                    return await message.reply_photo(input_file(file, "image.png"))
         return True
 
     if action := action_by_type(target.content_type):
@@ -79,11 +93,13 @@ async def process_reverse(message: Message, bot: Bot, cpu_executor: TPExecutor) 
     if sticker := target.sticker:
         if sticker.is_animated:
             return True
-        file = await download(sticker, bot)
-        if file is None:
-            return True
         if sticker.is_video:
-            result_file, timeouted = await cpu_executor.run(reverse_webm, file)
+            try:
+                result_file, timeouted = await run_downloaded(cpu_executor, sticker, reverse_webm, bot=bot)
+            except DownloadUnavailable:
+                return True
+            except ReverseMediaError as exc:
+                return await message.reply(str(exc))
             if timeouted:
                 return await message.reply(hcode("🤷🏻‍♂️ Timeout"))
             if not result_file:
@@ -97,7 +113,10 @@ async def process_reverse(message: Message, bot: Bot, cpu_executor: TPExecutor) 
             await target.reply_sticker(pack.stickers[-1].file_id)
             await bot.delete_sticker_from_set(sticker=pack.stickers[-1].file_id)
             return True
-        return await target.reply_sticker(input_file(mirror_image(file, ext="webp"), "sticker.webp"))
+        file = await mirror(sticker, ext="webp")
+        if file is None:
+            return True
+        return await target.reply_sticker(input_file(file, "sticker.webp"))
 
     if poll := target.poll:
         return await target.reply_poll(
@@ -116,31 +135,33 @@ async def process_reverse(message: Message, bot: Bot, cpu_executor: TPExecutor) 
 
     caption = html.quote(target.caption[::-1]) if target.caption else ""
     if target.photo:
-        file = await download(target.photo[-1], bot)
+        file = await mirror(target.photo[-1])
         if file is None:
             return True
-        return await target.reply_photo(input_file(mirror_image(file), "image.png"), caption=caption)
+        return await target.reply_photo(input_file(file, "image.png"), caption=caption)
 
     document = target.document
     if document and document.mime_type in ("image/jpeg", "image/jpg", "image/png"):
         if (document.file_size or 0) > megabytes(20):
             return await message.reply(hcode("🤷🏻‍♂️ Мне недоступны файлы больше 20 Мб"))
-        file = await download(document, bot)
-        if file is None:
-            return True
         name = (document.file_name or "image").rsplit(".", 1)[0][::-1]
         ext = "png" if document.mime_type == "image/png" else "jpeg"
-        return await target.reply_document(input_file(mirror_image(file, name, ext), f"{name}.{ext}"), caption=caption)
+        file = await mirror(document, name, ext)
+        if file is None:
+            return True
+        return await target.reply_document(input_file(file, f"{name}.{ext}"), caption=caption)
 
     media = target.voice or target.audio or target.animation or target.video_note or target.video
     if media:
         if (media.file_size or 0) > megabytes(20):
             return await message.reply(hcode("🤷🏻‍♂️ Мне недоступны файлы больше 20 Мб"))
-        file = await download(media, bot)
-        if file is None:
-            return True
         reverse = reverse_audio if target.voice or target.audio else reverse_video
-        result_file, timeouted = await cpu_executor.run(reverse, file)
+        try:
+            result_file, timeouted = await run_downloaded(cpu_executor, media, reverse, bot=bot)
+        except DownloadUnavailable:
+            return True
+        except ReverseMediaError as exc:
+            return await message.reply(str(exc))
         if timeouted:
             return await message.reply(hcode("🤷🏻‍♂️ Timeout"))
         if not result_file:

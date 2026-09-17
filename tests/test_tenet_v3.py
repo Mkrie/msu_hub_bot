@@ -6,15 +6,21 @@ from unittest.mock import AsyncMock
 
 import pytest
 from PIL import Image
-from aiogram.methods import AddStickerToSet, DeleteStickerFromSet, SendDocument, SendPoll, SendSticker, SendVoice
-from aiogram.types import BufferedInputFile, Sticker, StickerSet
+from aiogram.methods import AddStickerToSet, DeleteStickerFromSet, SendDocument, SendPhoto, SendPoll, SendSticker, SendVoice
+from aiogram.types import BufferedInputFile, PhotoSize, Sticker, StickerSet, UserProfilePhotos
 
 from msu_hub_bot.commands import tenet
+from msu_hub_bot.execution.executor import TPExecutor
+from msu_hub_bot.media import limits
 from telegram_helpers import make_bot, make_message
 
 
 def worker(payload=b"converted"):
-    return SimpleNamespace(run=AsyncMock(return_value=(io.BytesIO(payload), False)))
+    async def prepare_job(prepare, func, **kwargs):
+        await prepare()
+        return io.BytesIO(payload), False
+
+    return SimpleNamespace(run=AsyncMock(return_value=(io.BytesIO(payload), False)), run_prepared=AsyncMock(side_effect=prepare_job))
 
 
 @pytest.mark.parametrize("kind", ["quiz", "regular"])
@@ -52,7 +58,7 @@ async def test_voice_without_size_metadata_uploads_converted_audio():
     assert isinstance(method.voice, BufferedInputFile)
     assert method.voice.data == b"converted" and method.voice.filename == "audio.ogg"
     assert method.caption == "&gt;тевирП&lt;" and method.duration == 3
-    assert executor.run.call_args.args[0] is tenet.reverse_audio
+    executor.run_prepared.assert_awaited_once()
 
 
 async def test_image_document_without_filename_is_mirrored():
@@ -63,7 +69,11 @@ async def test_image_document_without_filename_is_mirrored():
     source.save(buffer, format="PNG")
     bot.session.download_bytes = buffer.getvalue()
     target = make_message(bot, document=dict(file_id="image", file_unique_id="image-id", mime_type="image/png"))
-    await tenet.process_reverse(make_message(bot, reply_to_message=target), bot, worker())
+    executor = TPExecutor(1)
+    try:
+        await tenet.process_reverse(make_message(bot, reply_to_message=target), bot, executor)
+    finally:
+        executor.shutdown(wait=True)
     method = bot.session.methods[-1]
     assert isinstance(method, SendDocument)
     assert method.document.filename == "egami.png"
@@ -90,3 +100,55 @@ async def test_video_sticker_uses_native_add_preview_delete(monkeypatch):
     sent, removed = methods[-2:]
     assert isinstance(sent, SendSticker) and sent.sticker == "saved"
     assert isinstance(removed, DeleteStickerFromSet) and removed.sticker == "saved"
+
+
+async def test_reverse_budget_failure_explains_the_actual_limit(monkeypatch):
+    bot = make_bot()
+    target = make_message(bot, voice=dict(file_id="voice", file_unique_id="voice-id", duration=3))
+    explanation = "Файл слишком большой для разворота. Попробуй более короткий фрагмент или меньшее разрешение."
+    monkeypatch.setattr(tenet, "run_downloaded", AsyncMock(side_effect=tenet.ReverseMediaError(explanation)))
+    await tenet.process_reverse(make_message(bot, reply_to_message=target), bot, worker())
+    assert bot.session.methods[-1].text == explanation
+
+
+@pytest.mark.parametrize("kind", ["avatar", "photo", "sticker"])
+async def test_mirror_jobs_keep_the_original_telegram_media_type(monkeypatch, kind):
+    bot = make_bot()
+    buffer = io.BytesIO()
+    with Image.new("RGB", (2, 1), "red") as source:
+        source.save(buffer, format="PNG")
+    bot.session.download_bytes = buffer.getvalue()
+    photo = PhotoSize(file_id="image", file_unique_id="image-id", width=2, height=1)
+    if kind == "avatar":
+        monkeypatch.setattr(bot, "get_user_profile_photos", AsyncMock(return_value=UserProfilePhotos(total_count=1, photos=[[photo]])))
+        message = make_message(bot)
+    elif kind == "photo":
+        message = make_message(bot, reply_to_message=make_message(bot, photo=[photo]))
+    else:
+        sticker = Sticker(file_id="image", file_unique_id="image-id", type="regular", width=2, height=1, is_animated=False, is_video=False)
+        message = make_message(bot, reply_to_message=make_message(bot, sticker=sticker))
+    executor = TPExecutor(1)
+    try:
+        await tenet.process_reverse(message, bot, executor)
+    finally:
+        executor.shutdown(wait=True)
+    method = bot.session.methods[-1]
+    assert isinstance(method, SendSticker if kind == "sticker" else SendPhoto)
+    prepared = method.sticker if kind == "sticker" else method.photo
+    with Image.open(io.BytesIO(prepared.data)) as image:
+        assert image.size == (2, 1)
+
+
+def test_oversized_mirror_is_rejected_before_decoding(monkeypatch):
+    buffer = io.BytesIO()
+    with Image.new("RGB", (2, 2), "red") as source:
+        source.save(buffer, format="PNG")
+    buffer.seek(0)
+    monkeypatch.setattr(limits, "MAX_IMAGE_PIXELS", 3)
+
+    def decode(*args, **kwargs):
+        pytest.fail("mirror decoded an image before checking dimensions")
+
+    monkeypatch.setattr(Image.Image, "load", decode)
+    with pytest.raises(limits.MediaDimensionsError):
+        tenet.mirror_image(buffer)
