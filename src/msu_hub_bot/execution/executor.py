@@ -1,8 +1,9 @@
 """Bound submitted thread work while keeping caller deadlines independent.
 
 Running threads retain their admission slots after cancellation or timeout.
-Waiting callers have no separate queue limit; jobs must bound their own I/O,
-subprocesses and decoded media. Shutdown cannot terminate running threads.
+Waiting callers have a finite backlog; asynchronous preparation starts only
+after admission. Jobs must bound their own I/O, subprocesses and decoded media.
+Shutdown cannot terminate running threads.
 """
 
 import asyncio
@@ -20,14 +21,21 @@ from msu_hub_bot.telemetry import Backend, Boundary, GaugeName, Outcome, Telemet
 ResultT = TypeVar("ResultT")
 
 
+class ExecutorBusy(RuntimeError):
+    """All worker slots and pending admissions are occupied."""
+
+
 class TPExecutor:
     ExecutorClass: Callable[..., Executor] = ThreadPoolExecutor
     ExecutorException: type[RuntimeError] = BrokenThreadPool
 
-    def __init__(self, max_workers: int, telemetry: Telemetry | None = None) -> None:
+    def __init__(self, max_workers: int, telemetry: Telemetry | None = None, *, max_pending: int = 3) -> None:
         if not isinstance(max_workers, int) or isinstance(max_workers, bool) or max_workers <= 0:
             raise ValueError("max_workers must be a positive integer")
+        if not isinstance(max_pending, int) or isinstance(max_pending, bool) or max_pending < 0:
+            raise ValueError("max_pending must be a nonnegative integer")
         self.max_workers = max_workers
+        self.max_pending = max_pending
         self.telemetry = telemetry or Telemetry()
         self._slots = asyncio.BoundedSemaphore(max_workers)
         self._closed = False
@@ -67,8 +75,19 @@ class TPExecutor:
                 raise
 
     async def run(self, func: Callable[..., Any], *args: Any, timeout: float | None = 180) -> tuple[Any, bool]:
+        async def prepare() -> tuple[Any, ...]:
+            return args
+
+        return await self.run_prepared(prepare, func, timeout=timeout)
+
+    async def run_prepared(
+        self, prepare: Callable[[], Awaitable[tuple[Any, ...]]], func: Callable[..., Any], *, timeout: float | None = 180
+    ) -> tuple[Any, bool]:
         """Apply a caller deadline to queueing, execution, and one pool recovery.
 
+        Reserve a worker slot before downloading or retaining expensive inputs.
+        ``prepare`` returns arguments for ``func`` and runs at most once. Keep
+        preparation cancellable and release its own temporary resources on error.
         Timeout/cancellation cannot stop a running thread. Its slot stays occupied
         until the concurrent future finishes; jobs need their own I/O/process limits.
         Use this executor from a single application event loop.
@@ -79,11 +98,15 @@ class TPExecutor:
             return None, True
         loop = asyncio.get_running_loop()
         limit = asyncio.timeout(timeout)
+        args: tuple[Any, ...] | None = None
         try:
             async with limit:
                 for attempt in range(2):
                     pool = None
                     try:
+                        if self._slots.locked() and self._waiting >= self.max_pending:
+                            with self.telemetry.operation(Boundary.MEDIA, "worker.queue", backend=Backend.NATIVE):
+                                raise ExecutorBusy("Media worker queue is full")
                         self._waiting += 1
                         self.telemetry.gauge(GaugeName.WORKERS_QUEUED, self._waiting)
                         try:
@@ -92,6 +115,10 @@ class TPExecutor:
                             self._waiting -= 1
                             self.telemetry.gauge(GaugeName.WORKERS_QUEUED, self._waiting)
                         try:
+                            if self._closed:
+                                raise RuntimeError("cannot schedule new futures after shutdown")
+                            if args is None:
+                                args = await self._observe("worker.prepare", prepare(), limit)
                             pool = self.executor
                             started = time.monotonic()
                             future = pool.submit(func, *args)

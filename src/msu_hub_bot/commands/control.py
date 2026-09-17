@@ -12,7 +12,10 @@ from aiogram.utils.markdown import hbold, hpre
 from aiohttp import ClientError
 from cachetools import TTLCache
 
+from msu_hub_bot.execution.executor import ExecutorBusy
+from msu_hub_bot.media.limits import MediaDimensionsError
 from msu_hub_bot.providers.exceptions import ExternalServiceError
+from msu_hub_bot.telegram.files import DownloadTooLarge
 from msu_hub_bot.telegram.state import UpdateStateContext, release_state_isolation
 from msu_hub_bot.commands.debug import process_json
 from msu_hub_bot.texts import cmd_start
@@ -56,6 +59,15 @@ async def process_expired_callback(query: CallbackQuery) -> None:
 
 async def process_error(event: ErrorEvent, bot: Bot) -> bool:
     update, error = event.update, event.exception
+    if isinstance(error, ExecutorBusy):
+        await reply_error(update, "Сейчас обрабатываю несколько задач. Попробуй ещё раз чуть позже 🙂")
+        return True
+    if isinstance(error, DownloadTooLarge):
+        await reply_error(update, "Файл слишком большой. Пришли версию до 20 Мб.")
+        return True
+    if isinstance(error, MediaDimensionsError):
+        await reply_error(update, "Изображение слишком большое: максимум 16 Мп и 8192 пикселя по стороне.")
+        return True
     if isinstance(error, MissingIntegration):
         await reply_error(update, "Эта функция пока не настроена на этом экземпляре бота.")
         return True

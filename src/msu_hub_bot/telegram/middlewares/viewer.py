@@ -8,6 +8,7 @@ from aiogram.enums import MessageEntityType
 from aiogram.types import InputMediaDocument, InputMediaVideo, Message, TelegramObject, URLInputFile
 from yarl import URL
 
+from msu_hub_bot.execution.executor import ExecutorBusy
 from msu_hub_bot.providers.exceptions import ExternalServiceError
 from msu_hub_bot.providers.instagram import InstagramViewer
 from msu_hub_bot.providers.topdf import convert_to_pdf
@@ -63,7 +64,10 @@ class ViewerMiddleware(BaseMiddleware):
             await reply_album(message, videos)
 
     async def handle_video(self, message: Message, url: URL) -> None:
-        result, timed_out = await self.executor.run(YDL.text_with_preview, str(url), timeout=60)
+        try:
+            result, timed_out = await self.executor.run(YDL.text_with_preview, str(url), timeout=60)
+        except ExecutorBusy:
+            return
         if timed_out or result is None:
             return
         text, preview = result

@@ -7,7 +7,7 @@ from concurrent.futures.thread import BrokenThreadPool
 
 import pytest
 
-from msu_hub_bot.execution.executor import TPExecutor
+from msu_hub_bot.execution.executor import ExecutorBusy, TPExecutor
 
 
 class CountingPool(ThreadPoolExecutor):
@@ -228,3 +228,135 @@ async def test_owned_thread_executor_closes_after_work():
     await asyncio.to_thread(executor.shutdown, wait=True)
     with pytest.raises(RuntimeError, match="shutdown"):
         await executor.run(lambda: None)
+
+
+@pytest.mark.parametrize("pending", [0, 1, 3])
+async def test_saturation_rejects_before_preparation_and_recovers(pending):
+    executor = TPExecutor(1, max_pending=pending)
+    release = threading.Event()
+    started = threading.Event()
+    prepared = []
+
+    def block():
+        started.set()
+        assert release.wait(3)
+
+    async def prepare():
+        prepared.append(True)
+        return ("ok",)
+
+    active = asyncio.create_task(executor.run(block))
+    waiting = []
+    try:
+        await wait_until(started.is_set)
+        waiting = [asyncio.create_task(executor.run_prepared(prepare, str)) for _ in range(pending)]
+        await wait_until(lambda: executor._waiting == pending)
+        with pytest.raises(ExecutorBusy):
+            await executor.run_prepared(prepare, str)
+        assert not prepared
+        release.set()
+        await active
+        assert await asyncio.gather(*waiting) == [("ok", False)] * pending
+        assert await executor.run_prepared(prepare, str) == ("ok", False)
+        assert len(prepared) == pending + 1
+    finally:
+        release.set()
+        await asyncio.gather(active, *waiting, return_exceptions=True)
+        executor.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("stop", ["cancel", "timeout", "error"])
+async def test_preparation_holds_slot_and_releases_it_on_failure(stop):
+    executor = TPExecutor(1, max_pending=0)
+    entered = asyncio.Event()
+    finish = asyncio.Event()
+    started = threading.Event()
+
+    async def prepare():
+        entered.set()
+        await finish.wait()
+        raise ValueError("synthetic preparation failure")
+
+    task = asyncio.create_task(executor.run_prepared(prepare, started.set, timeout=0.1 if stop == "timeout" else None))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        with pytest.raises(ExecutorBusy):
+            await executor.run(lambda: None)
+        if stop == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        elif stop == "timeout":
+            assert await task == (None, True)
+        else:
+            finish.set()
+            with pytest.raises(ValueError, match="preparation"):
+                await task
+        assert not started.is_set()
+        assert await executor.run(lambda: "recovered") == ("recovered", False)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        executor.shutdown(wait=True)
+
+
+async def test_cancelled_waiter_frees_backlog_without_preparing_input():
+    executor = TPExecutor(1, max_pending=1)
+    release = threading.Event()
+    started = threading.Event()
+    prepared = []
+
+    def block():
+        started.set()
+        assert release.wait(3)
+
+    async def prepare():
+        prepared.append(True)
+        return ()
+
+    active = asyncio.create_task(executor.run(block))
+    pending = None
+    try:
+        await wait_until(started.is_set)
+        pending = asyncio.create_task(executor.run_prepared(prepare, lambda: None))
+        await wait_until(lambda: executor._waiting == 1)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert executor._waiting == 0
+        assert await executor.run_prepared(prepare, lambda: None, timeout=0.01) == (None, True)
+        assert not prepared
+        release.set()
+        await active
+        assert await executor.run_prepared(prepare, lambda: "ok") == ("ok", False)
+    finally:
+        release.set()
+        await asyncio.gather(active, *([pending] if pending else []), return_exceptions=True)
+        executor.shutdown(wait=True)
+
+
+async def test_broken_pool_does_not_repeat_preparation():
+    executor = TPExecutor(1)
+    pools, prepared = [], []
+
+    def factory(**kwargs):
+        pool = (BrokenPool if not pools else CountingPool)(**kwargs)
+        pools.append(pool)
+        return pool
+
+    async def prepare():
+        prepared.append(True)
+        return ("downloaded once",)
+
+    executor.ExecutorClass = factory
+    try:
+        assert await executor.run_prepared(prepare, str) == ("downloaded once", False)
+        assert len(prepared) == 1
+    finally:
+        executor.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("pending", [-1, 1.5, True])
+def test_invalid_pending_limit_rejected(pending):
+    with pytest.raises(ValueError):
+        TPExecutor(1, max_pending=pending)

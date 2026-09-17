@@ -95,6 +95,7 @@ OPERATIONS = frozenset(
         "wit.recognize",
         "wolfram.query",
         "worker.queue",
+        "worker.prepare",
         "worker.execute",
         "worker.run",
         "ffmpeg.convert",
@@ -202,8 +203,14 @@ def safe_failure(error: BaseException) -> dict[str, str | int]:
     from aiogram import exceptions as telegram
     from msu_hub_bot.providers.exceptions import ExternalServiceError
     from msu_hub_bot.settings import MissingIntegration
+    from msu_hub_bot.execution.executor import ExecutorBusy
+    from msu_hub_bot.media.limits import MediaDimensionsError
+    from msu_hub_bot.telegram.files import DownloadTooLarge
 
     classes: tuple[tuple[type[BaseException], str, int | None], ...] = (
+        (ExecutorBusy, "worker_busy", None),
+        (DownloadTooLarge, "media_too_large", None),
+        (MediaDimensionsError, "media_dimensions", None),
         (telegram.TelegramRetryAfter, "rate_limited", 429),
         (telegram.TelegramBadRequest, "bad_request", 400),
         (telegram.TelegramForbiddenError, "forbidden", 403),
@@ -406,10 +413,13 @@ def failure_outcome(error: BaseException) -> Outcome:
     from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter
     from aiogram.dispatcher.event.bases import CancelHandler, SkipHandler
     from msu_hub_bot.providers.exceptions import ExternalServiceError
+    from msu_hub_bot.execution.executor import ExecutorBusy
+    from msu_hub_bot.media.limits import MediaDimensionsError
+    from msu_hub_bot.telegram.files import DownloadTooLarge
 
     if isinstance(error, SkipHandler):
         return Outcome.IGNORED
-    if isinstance(error, CancelHandler):
+    if isinstance(error, (CancelHandler, ExecutorBusy, DownloadTooLarge, MediaDimensionsError)):
         return Outcome.REJECTED
     if isinstance(error, asyncio.CancelledError):
         return Outcome.CANCELLED

@@ -7,6 +7,9 @@ from aiogram.types import CallbackQuery, ErrorEvent, Update
 from aiohttp import ClientError
 
 from msu_hub_bot.providers.exceptions import ExternalServiceError
+from msu_hub_bot.execution.executor import ExecutorBusy
+from msu_hub_bot.media.limits import MediaDimensionsError
+from msu_hub_bot.telegram.files import DownloadTooLarge
 from msu_hub_bot.commands import control
 from msu_hub_bot.settings import MissingIntegration, settings
 from telegram_helpers import make_bot, make_message
@@ -20,6 +23,9 @@ from telegram_helpers import make_bot, make_message
         (ClientError("transport details"), "связаться"),
         (ExternalServiceError("Попробуйте <ещё>"), "&lt;ещё&gt;"),
         (MissingIntegration("unused"), "не настроена"),
+        (ExecutorBusy("transport details"), "несколько задач"),
+        (DownloadTooLarge("transport details"), "20 Мб"),
+        (MediaDimensionsError("transport details"), "16 Мп"),
     ],
 )
 async def test_provider_error_replies_are_useful_and_safe(error, expected):

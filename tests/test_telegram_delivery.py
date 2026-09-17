@@ -1,11 +1,13 @@
 import io
+import asyncio
+from types import SimpleNamespace
 
 import pytest
 from aiogram import Bot
 from aiogram.types import BufferedInputFile, InputMediaDocument, InputMediaPhoto, ReplyParameters
 
 from msu_hub_bot.telegram.delivery import ReplyTarget, reply_album, send_album
-from msu_hub_bot.telegram.files import download_by_file_id, download_text, input_file
+from msu_hub_bot.telegram.files import DownloadTooLarge, download, download_by_file_id, download_text, input_file
 from telegram_helpers import RecordingSession, make_message
 
 
@@ -65,3 +67,44 @@ async def test_download_rewinds_owned_stream_and_decodes_unicode():
     assert stream.read() == session.download_bytes
     stream.close()
     assert await download_text("file", bot) == "Привет 🐈"
+
+
+@pytest.mark.parametrize("size", [4, 5])
+async def test_download_enforces_actual_byte_limit_with_aiogram_streaming(size):
+    class ChunkedSession(RecordingSession):
+        async def stream_content(self, url, **kwargs):
+            yield b"123"
+            yield b"45"
+
+    bot = Bot("123456789:" + "a" * 35, session=ChunkedSession())
+    if size == 4:
+        with pytest.raises(DownloadTooLarge):
+            await download_by_file_id("file", bot, max_bytes=size)
+    else:
+        with await download_by_file_id("file", bot, max_bytes=size) as stream:
+            assert stream.read() == b"12345"
+
+
+@pytest.mark.parametrize("failure", ["size", "cancel", "network"])
+async def test_failed_download_closes_partial_buffer(failure):
+    buffers = []
+
+    async def transfer(file_id, destination):
+        buffers.append(destination)
+        destination.write(b"123")
+        if failure == "size":
+            destination.write(b"456")
+        elif failure == "cancel":
+            raise asyncio.CancelledError
+        else:
+            raise OSError("synthetic network failure")
+
+    expected = {"size": DownloadTooLarge, "cancel": asyncio.CancelledError, "network": OSError}[failure]
+    with pytest.raises(expected):
+        await download_by_file_id("file", SimpleNamespace(download=transfer), max_bytes=4)
+    assert len(buffers) == 1 and buffers[0].closed
+
+
+async def test_declared_oversize_download_is_rejected_before_request():
+    with pytest.raises(DownloadTooLarge):
+        await download(SimpleNamespace(file_id="file", file_size=6), SimpleNamespace(), max_bytes=5)
