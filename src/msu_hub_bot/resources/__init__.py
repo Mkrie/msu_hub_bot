@@ -7,6 +7,7 @@ def path(filename: str) -> Path:
 
 lobster_font = path("Lobster-Regular.ttf")
 times_new_roman_font = path("LiberationSerif-Regular.ttf")
+meme_font = path("LiberationSans-Regular.ttf")
 ubuntu_mono_font = path("UbuntuMono-Regular.ttf")
 
 debate = path("debate.csv")
