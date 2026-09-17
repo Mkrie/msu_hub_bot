@@ -311,6 +311,38 @@ async def test_inline_and_inaccessible_callbacks_never_resolve_shared_state():
         assert isolation.key_count == 0
 
 
+@pytest.mark.parametrize("actor", ["user", "actor_chat", "counts"])
+async def test_passive_reactions_never_read_or_lock_conversation_state(actor, monkeypatch):
+    async with application() as (dispatcher, bot, storage, isolation):
+        general = StorageKey(bot_id=bot.id, chat_id=KEY.chat_id, user_id=10)
+        await storage.set_state(general, "general-draft")
+        payload = {"chat": {"id": KEY.chat_id, "type": "supergroup"}, "message_id": 42, "date": 1_700_000_000}
+        if actor == "counts":
+            kind = "message_reaction_count"
+            payload["reactions"] = []
+        else:
+            kind = "message_reaction"
+            payload.update(old_reaction=[], new_reaction=[{"type": "emoji", "emoji": "👍"}])
+            payload[actor] = (
+                {"id": 10, "is_bot": False, "first_name": "Synthetic"}
+                if actor == "user"
+                else {"id": -1002, "type": "channel", "title": "Synthetic actor"}
+            )
+
+        async def forbidden(*args, **kwargs):
+            pytest.fail("A reaction accessed conversation state")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(storage, "get_state", forbidden)
+            # Holding the real general-chat lease also proves passive updates
+            # cannot queue behind that user's ongoing command.
+            async with isolation.lock(general):
+                result = await asyncio.wait_for(dispatcher.feed_update(bot, Update.model_validate({"update_id": 10, kind: payload})), 1)
+                assert result is UNHANDLED
+        assert await storage.get_state(general) == "general-draft"
+        assert isolation.key_count == 0
+
+
 async def test_general_topics_and_users_have_independent_state_keys():
     async with application() as (dispatcher, bot, storage, isolation):
         keys = []

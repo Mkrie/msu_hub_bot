@@ -7,7 +7,17 @@ from aiogram import BaseMiddleware
 from aiogram.dispatcher.event.bases import UNHANDLED
 from aiogram.dispatcher.flags import get_flag
 from aiogram.filters.command import CommandObject
-from aiogram.types import CallbackQuery, Chat, InaccessibleMessage, Message, TelegramObject, Update, User
+from aiogram.types import (
+    CallbackQuery,
+    Chat,
+    InaccessibleMessage,
+    Message,
+    MessageReactionCountUpdated,
+    MessageReactionUpdated,
+    TelegramObject,
+    Update,
+    User,
+)
 
 from msu_hub_bot.telemetry import Boundary, Outcome, Telemetry
 from msu_hub_bot.telegram.filters import MetaInfo
@@ -39,13 +49,16 @@ class DispatchTelemetryMiddleware(BaseMiddleware):
             except Exception:
                 pass
         message = _message(target)
+        reaction = target if isinstance(target, (MessageReactionUpdated, MessageReactionCountUpdated)) else None
+        actor_chat = target.actor_chat if isinstance(target, MessageReactionUpdated) else None
         user = data.get("event_from_user", getattr(target, "from_user", None))
         chat = data.get("event_chat", message.chat if message is not None else getattr(target, "chat", None))
         with (
             self.telemetry.context(
                 user_id=user.id if isinstance(user, User) else None,
+                actor_chat_id=actor_chat.id if actor_chat is not None else None,
                 chat_id=chat.id if isinstance(chat, Chat) else None,
-                message_id=message.message_id if message is not None else None,
+                message_id=message.message_id if message is not None else reaction.message_id if reaction is not None else None,
                 thread_id=message.message_thread_id if isinstance(message, Message) else None,
                 update_id=update_id,
                 reply_to_message_id=message.reply_to_message.message_id

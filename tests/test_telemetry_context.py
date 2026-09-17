@@ -20,7 +20,14 @@ from telegram_helpers import RecordingSession, make_bot, make_message
 from telemetry_helpers import Capture, config
 
 CANARY = "SYNTHETIC_CONTEXT_PRIVATE_CONTENT"
-IDS = {"telegram.user_id", "telegram.chat_id", "telegram.message_id", "telegram.thread_id", "telegram.update_id"}
+IDS = {
+    "telegram.user_id",
+    "telegram.actor_chat_id",
+    "telegram.chat_id",
+    "telegram.message_id",
+    "telegram.thread_id",
+    "telegram.update_id",
+}
 METRIC_LABELS = {"boundary", "operation", "outcome", "provider", "backend", "update.kind"}
 
 
@@ -199,6 +206,7 @@ async def test_context_rejects_unregistered_commands_and_invalid_identifiers():
     try:
         with telemetry.context(
             user_id=CANARY,
+            actor_chat_id=CANARY,
             chat_id=True,
             message_id=2**100,
             handler=CANARY,
@@ -215,6 +223,66 @@ async def test_context_rejects_unregistered_commands_and_invalid_identifiers():
     assert values.get("command", "unknown") == "unknown"
     assert CANARY not in sink.serialized()
     assert sink.logs() == []
+
+
+@pytest.mark.parametrize("actor", ["user", "actor_chat", "counts"])
+@pytest.mark.parametrize("failure", [False, True])
+async def test_passive_reaction_metrics_and_failures_preserve_identity_without_content(actor, failure):
+    sink = Capture()
+    telemetry = Telemetry(config(), transport=sink)
+    await telemetry.start()
+    dispatcher = Dispatcher(disable_fsm=True)
+    dispatcher.update.outer_middleware(DispatchTelemetryMiddleware(telemetry))
+
+    async def fail(handler, event, data):
+        raise RuntimeError(CANARY)
+
+    if failure:
+        dispatcher.update.outer_middleware(fail)
+    payload = {"chat": {"id": -7001, "type": "supergroup", "title": CANARY}, "message_id": 123, "date": 1_700_000_000}
+    if actor == "counts":
+        kind = "message_reaction_count"
+        payload["reactions"] = [{"type": {"type": "custom_emoji", "custom_emoji_id": CANARY}, "total_count": 7}]
+    else:
+        kind = "message_reaction"
+        payload.update(old_reaction=[], new_reaction=[{"type": "custom_emoji", "custom_emoji_id": CANARY}])
+        payload[actor] = (
+            {"id": 501, "is_bot": False, "first_name": CANARY, "username": CANARY}
+            if actor == "user"
+            else {"id": -8001, "type": "channel", "title": CANARY}
+        )
+    bot = make_bot()
+    try:
+        incoming = Update.model_validate({"update_id": 987, kind: payload})
+        if failure:
+            with pytest.raises(RuntimeError, match=CANARY):
+                await dispatcher.feed_update(bot, incoming)
+        else:
+            await dispatcher.feed_update(bot, incoming)
+    finally:
+        await dispatcher.fsm.close()
+        await bot.session.close()
+        await telemetry.close()
+
+    points = list(metric_points(sink))
+    assert any(attributes(point).get("update.kind") == kind for point in points)
+    assert all(attributes(point).keys() <= METRIC_LABELS for point in points)
+    assert CANARY not in sink.serialized()
+    if not failure:
+        assert not sink.spans() and not sink.logs()
+        return
+    assert len(sink.spans()) == 1 and len(sink.logs()) == 1
+    for item in [*sink.spans(), *sink.logs()]:
+        values = attributes(item)
+        assert values["telegram.chat_id"] == -7001 and values["telegram.message_id"] == 123
+        assert values["telegram.update_id"] == 987
+        assert (values.get("telegram.user_id"), values.get("telegram.actor_chat_id")) == {
+            "user": (501, None),
+            "actor_chat": (None, -8001),
+            "counts": (None, None),
+        }[actor]
+        assert "telegram.thread_id" not in values
+        assert "command" not in values and "handler" not in values
 
 
 @pytest.mark.parametrize("inline", [False, True])

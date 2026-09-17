@@ -14,7 +14,7 @@ from typing import Any, cast
 from aiogram import Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.enums import ParseMode
+from aiogram.enums import ParseMode, UpdateType
 from aiogram.filters import Command
 from aiogram.fsm.storage.base import DefaultKeyBuilder
 from aiogram.fsm.storage.redis import RedisStorage as FSMRedisStorage
@@ -56,10 +56,10 @@ from msu_hub_bot.telemetry import Backend, Telemetry, TelemetryConfig
 
 logger = logging.getLogger(__name__)
 
-# None deliberately preserves Telegram's existing server-side subscription.
-# aiogram's UNSET default would instead derive a narrower list from handlers,
-# dropping passive update history and middleware-only event kinds.
-ALLOWED_UPDATES: list[str] | None = None
+# Subscribe to every supported kind, including passive history and reactions.
+# Handler-derived defaults omit middleware-only events; Telegram's empty-list
+# default also excludes reaction and membership changes.
+ALLOWED_UPDATES: list[str] = [kind.value for kind in UpdateType]
 SHUTDOWN_SECONDS = 85.0
 DRAIN_SECONDS = 65.0
 

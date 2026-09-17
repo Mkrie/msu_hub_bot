@@ -130,6 +130,8 @@ UPDATE_KINDS = frozenset(
         "chat_join_request",
         "poll",
         "poll_answer",
+        "message_reaction",
+        "message_reaction_count",
         "unknown",
     }
 )
@@ -533,6 +535,7 @@ class Telemetry:
         self,
         *,
         user_id: int | None = None,
+        actor_chat_id: int | None = None,
         chat_id: int | None = None,
         message_id: int | None = None,
         thread_id: int | None = None,
@@ -545,6 +548,7 @@ class Telemetry:
         attributes = _request_attributes()
         for key, identifier in (
             ("user_id", user_id),
+            ("actor_chat_id", actor_chat_id),
             ("chat_id", chat_id),
             ("message_id", message_id),
             ("thread_id", thread_id),

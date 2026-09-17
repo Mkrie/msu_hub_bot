@@ -28,6 +28,8 @@ The exporter is an owned asyncio task with asynchronous DNS, not a blocking expo
 
 Callbacks and FSM steps use explicit handler keys, not callback payloads or state data. Command context comes from matched `MetaInfo` or `CommandObject`: only a registered keyword and its slash/hashtag kind, never arguments or a bot mention. Dispatch failures before handler selection use a small, sanitized `bot.dispatch` failure span. Do not create a trace for each `getUpdates` request, empty poll, readiness heartbeat or ignored chat message.
 
+Polling explicitly subscribes to every update kind supported by the installed Telegram client, including passive reaction and membership events. Successful reaction archival contributes storage and dispatch metrics without a per-reaction trace. Reactions never enter conversation state; their channel actor, if present, is distinct from a human user.
+
 Middleware binds numeric request identity and the selected handler/command to a scoped context. Provider, storage and Telegram boundaries inherit it without changing handler signatures. Supervised jobs receive a fresh task context containing only those allowlisted fields and a trace link; they start independent spans rather than extending an update indefinitely. Other context variables and OpenTelemetry baggage are discarded. Scope exit and cancellation restore the previous context, so concurrent updates cannot borrow each other's identity. A worker's late completion contributes aggregate metrics rather than attaching to another update.
 
 ## Exported data
@@ -38,7 +40,7 @@ Construct telemetry from an allowlist before calling the SDK. The following fiel
 | --- | --- |
 | Service, environment and release | Fixed service name, deployment environment enum and public release identifier. No hostnames, filesystem roots or private repository metadata. |
 | Handler, command, update kind and operation | Names chosen from application registrations or fixed enums. Command kind is slash or hashtag. No arguments or dynamically generated names. |
-| Telegram identity | Numeric `telegram.user_id`, `telegram.chat_id`, `telegram.message_id`, `telegram.update_id`, `telegram.thread_id` and `telegram.reply_to_message_id` when available. Outgoing requests may add `telegram.target_chat_id` and `telegram.target_message_id`. Never metric labels. |
+| Telegram identity | Numeric `telegram.user_id`, `telegram.actor_chat_id`, `telegram.chat_id`, `telegram.message_id`, `telegram.update_id`, `telegram.thread_id` and `telegram.reply_to_message_id` when available. A reaction's channel actor remains separate from a human user. Outgoing requests may add `telegram.target_chat_id` and `telegram.target_message_id`. Never metric labels. |
 | Outcome and failure category | Fixed values such as success, rejected, unavailable, timeout, cancelled or unexpected; a vetted exception class or provider error category. |
 | Provider and backend | Configured type/name enum, not account, endpoint or instance identifiers. |
 | Measurements | Durations, counts, retry number and coarse size buckets. HTTP status codes and bounded Telegram retry delays are allowed; response bodies are not. |
@@ -46,7 +48,7 @@ Construct telemetry from an allowlist before calling the SDK. The following fiel
 
 Numeric Telegram IDs deliberately support investigations across requests and help locate affected users or chats. Treat the Logfire project as private operational data: restrict project membership and read credentials, and avoid sharing raw records or dashboards publicly. This correlation is an explicit privacy tradeoff; it does not authorize message-content collection.
 
-Never export message text, captions, command arguments, prompts, speech/transcripts, replies, names, usernames, Telegram file IDs, callback data, locations, file contents or user-provided filenames. Hashing a prohibited value does not make it permitted.
+Never export message text, captions, command arguments, prompts, speech/transcripts, replies, names, usernames, Telegram file IDs, callback data, reaction emoji or custom emoji IDs, locations, file contents or user-provided filenames. Hashing a prohibited value does not make it permitted.
 
 Never export credentials, environment snapshots, connection strings, headers, cookies, full URLs, HTTP bodies, SQL text or query parameters. Telegram credentials can appear in URL paths; provider keys can appear in query strings. Allowing a field called `url` is therefore insufficient protection.
 

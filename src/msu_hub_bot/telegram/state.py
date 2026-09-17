@@ -67,6 +67,9 @@ def _context(data: dict[str, Any]) -> UpdateStateContext:
 
 
 def state_eligible(update: Update) -> bool:
+    # Reaction events have no topic and must not enter the actor's conversation.
+    if update.message_reaction is not None or update.message_reaction_count is not None:
+        return False
     callback = update.callback_query
     return callback is None or isinstance(callback.message, Message)
 

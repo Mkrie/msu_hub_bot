@@ -203,6 +203,92 @@ def test_reaction_receipts_preserve_event_fields_without_inventing_message_bodie
     assert row.kind == kind and row.messages == []
     assert row.data[kind] == data
     assert reference_payload({kind: data}) == {kind: data}
+    assert row.reaction is not None
+    assert (row.reaction.kind, row.reaction.chat_id, row.reaction.message_id, row.reaction.event_at) == (
+        "actor" if kind == "message_reaction" else "counts",
+        -1001,
+        42,
+        NOW,
+    )
+    assert row.memberships == [] and row.topics == []
+
+
+@pytest.mark.parametrize("actor", ["user", "actor_chat"])
+def test_reaction_actor_snapshots_use_new_selection_and_clamp_profile_dates(actor):
+    changed = NOW - timedelta(minutes=5)
+    identity = user(10).model_dump() if actor == "user" else {"id": -1002, "type": "channel", "title": "Synthetic actor"}
+    payload = {
+        "chat": {"id": -1001, "type": "supergroup", "is_forum": True},
+        "message_id": 42,
+        "date": changed,
+        actor: identity,
+        "old_reaction": [{"type": "emoji", "emoji": "❤"}],
+        "new_reaction": [
+            {"type": "emoji", "emoji": "❤️"},
+            {"type": "custom_emoji", "custom_emoji_id": "0007"},
+            {"type": "custom_emoji", "custom_emoji_id": "0007"},
+            {"type": "paid"},
+        ],
+    }
+    row = archive_observation(Update.model_validate({"update_id": 13, "message_reaction": payload}), False, received_at=NOW)
+    assert row.reaction is not None
+    assert [(item.key, item.count) for item in row.reaction.reactions] == [("e:❤️", 1), ("c:0007", 1), ("paid", 1)]
+    assert (row.reaction.user_id, row.reaction.actor_chat_id) == ((10, None) if actor == "user" else (None, -1002))
+    assert row.reaction.event_at == changed
+    assert row.reaction.previous_active is True
+    assert all(profile.observed_at == changed for profile in row.users + row.chats)
+    assert row.messages == [] and row.topics == [] and row.memberships == []
+    assert row.data["message_reaction"]["old_reaction"] == [{"type": "emoji", "emoji": "❤"}]
+
+
+def test_anonymous_reactions_keep_absolute_counts_without_inventing_users_or_authors():
+    changed = NOW - timedelta(minutes=2)
+    payload = {
+        "chat": {"id": -1001, "type": "channel"},
+        "message_id": 42,
+        "date": changed,
+        "reactions": [
+            {"type": {"type": "emoji", "emoji": "👍"}, "total_count": 12},
+            {"type": {"type": "custom_emoji", "custom_emoji_id": "0007"}, "total_count": 3},
+            {"type": {"type": "paid"}, "total_count": 1000},
+        ],
+    }
+    row = archive_observation(Update.model_validate({"update_id": 14, "message_reaction_count": payload}), False, received_at=NOW)
+    assert row.reaction is not None
+    assert row.reaction.kind == "counts" and row.reaction.user_id is None and row.reaction.actor_chat_id is None
+    assert row.reaction.previous_active is None
+    assert [(item.key, item.count) for item in row.reaction.reactions] == [("e:👍", 12), ("c:0007", 3), ("paid", 1000)]
+    assert row.users == [] and row.messages == [] and row.memberships == [] and row.topics == []
+    assert row.chats[0].observed_at == changed
+
+
+def test_ordinary_updates_have_no_reaction_snapshot():
+    row = archive_observation(Update(update_id=15, message=message()), True, received_at=NOW)
+    assert row.reaction is None
+
+
+@pytest.mark.parametrize(
+    "previous,expected",
+    [
+        ([], False),
+        ([{"type": "paid"}], False),
+        ([{"type": "emoji", "emoji": "❤"}], True),
+        ([{"type": "custom_emoji", "custom_emoji_id": "0007"}], True),
+        ([{"type": "paid"}, {"type": "emoji", "emoji": "👍"}], True),
+    ],
+)
+def test_previous_active_uses_telegram_old_selection_not_the_new_snapshot(previous, expected):
+    event = {
+        "chat": {"id": -1001, "type": "supergroup"},
+        "message_id": 42,
+        "date": NOW,
+        "user": {"id": 10, "is_bot": False, "first_name": "Synthetic"},
+        "old_reaction": previous,
+        "new_reaction": [{"type": "emoji", "emoji": "🔥"}],
+    }
+    row = archive_observation(Update.model_validate({"update_id": 16, "message_reaction": event}), False, received_at=NOW)
+    assert row.reaction.previous_active is expected
+    assert [reaction.key for reaction in row.reaction.reactions] == ["e:🔥"]
 
 
 @pytest.mark.parametrize("extra", [{"type": "channel"}, {"old_reaction": [], "new_reaction": []}, {"reactions": []}])

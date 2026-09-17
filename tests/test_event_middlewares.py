@@ -61,6 +61,35 @@ async def test_archive_preserves_aliases_integer_dates_and_actual_outcome(result
     assert len(db.archive_update.call_args.args[0].chats) == 1
 
 
+async def test_unhandled_reaction_uses_the_same_single_owned_archive_write():
+    supervisor = Supervisor()
+    db = SimpleNamespace(archive_update=AsyncMock())
+    middleware = UpdatesMiddleware(db, supervisor)
+    update = Update.model_validate(
+        {
+            "update_id": 12,
+            "message_reaction": {
+                "chat": {"id": -1001, "type": "supergroup"},
+                "message_id": 42,
+                "date": 1_700_000_000,
+                "user": {"id": 10, "is_bot": False, "first_name": "Synthetic"},
+                "old_reaction": [{"type": "emoji", "emoji": "👍"}],
+                "new_reaction": [],
+            },
+        }
+    )
+    result = await asyncio.create_task(dispatch_archive(middleware, supervisor, AsyncMock(return_value=UNHANDLED), update))
+    assert result is UNHANDLED
+    drained = await supervisor.drain(1, cancel_timeout=0.1)
+    assert drained.failed_jobs == 0
+    db.archive_update.assert_awaited_once()
+    row = db.archive_update.call_args.args[0]
+    assert row.handled is False and row.kind == "message_reaction"
+    assert row.reaction.user_id == 10 and row.reaction.reactions == []
+    assert row.reaction.previous_active is True
+    assert row.messages == []
+
+
 async def test_archive_failure_remains_owned_and_reported():
     supervisor = Supervisor()
     db = SimpleNamespace(archive_update=AsyncMock(side_effect=RuntimeError("archive failure")))

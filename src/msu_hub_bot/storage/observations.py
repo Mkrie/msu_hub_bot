@@ -18,6 +18,9 @@ from aiogram.types import (
     MessageOriginUser,
     MessageReactionCountUpdated,
     MessageReactionUpdated,
+    ReactionTypeCustomEmoji,
+    ReactionTypeEmoji,
+    ReactionTypePaid,
     TelegramObject,
     Update,
     User,
@@ -29,6 +32,8 @@ from msu_hub_bot.storage.models import (
     ChatObservation,
     MembershipObservation,
     MessageObservation,
+    ReactionObservation,
+    ReactionValue,
     TopicObservation,
     UserObservation,
 )
@@ -145,6 +150,40 @@ def _user_observation(user: User, observed_at: datetime) -> UserObservation:
     )
 
 
+def _reaction_key(reaction: ReactionTypeEmoji | ReactionTypeCustomEmoji | ReactionTypePaid) -> str:
+    match reaction:
+        case ReactionTypeEmoji():
+            return f"e:{reaction.emoji}"
+        case ReactionTypeCustomEmoji():
+            return f"c:{reaction.custom_emoji_id}"
+        case ReactionTypePaid():
+            return "paid"
+    raise ValueError("Unsupported reaction type")
+
+
+def _reaction_observation(update: Update) -> ReactionObservation | None:
+    if actor := update.message_reaction:
+        return ReactionObservation(
+            kind="actor",
+            chat_id=actor.chat.id,
+            message_id=actor.message_id,
+            event_at=actor.date,
+            user_id=actor.user.id if actor.user is not None else None,
+            actor_chat_id=actor.actor_chat.id if actor.actor_chat is not None else None,
+            previous_active=any(not isinstance(reaction, ReactionTypePaid) for reaction in actor.old_reaction),
+            reactions=[ReactionValue(key=_reaction_key(reaction)) for reaction in actor.new_reaction],
+        )
+    if counts := update.message_reaction_count:
+        return ReactionObservation(
+            kind="counts",
+            chat_id=counts.chat.id,
+            message_id=counts.message_id,
+            event_at=counts.date,
+            reactions=[ReactionValue(key=_reaction_key(reaction.type), count=reaction.total_count) for reaction in counts.reactions],
+        )
+    return None
+
+
 def archive_observation(
     update: Update,
     handled: bool,
@@ -190,7 +229,17 @@ def archive_observation(
         if isinstance(value, Message):
             version = datetime.fromtimestamp(value.edit_date, UTC) if value.edit_date is not None else value.date
             observed_at = min(observed_at, version)
-        elif isinstance(value, (ChatMemberUpdated, MessageOriginUser, MessageOriginChat, MessageOriginChannel)):
+        elif isinstance(
+            value,
+            (
+                ChatMemberUpdated,
+                MessageOriginUser,
+                MessageOriginChat,
+                MessageOriginChannel,
+                MessageReactionUpdated,
+                MessageReactionCountUpdated,
+            ),
+        ):
             observed_at = min(observed_at, value.date)
         if isinstance(value, User):
             if value.id not in users or observed_at > users[value.id].observed_at:
@@ -278,4 +327,5 @@ def archive_observation(
         memberships=list(memberships.values()),
         topics=list(topics.values()),
         messages=list(messages.values()),
+        reaction=_reaction_observation(update),
     )

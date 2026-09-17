@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 from uuid import UUID, uuid4
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, StrictBool, field_validator, model_validator
 
 BigInt = Annotated[int, Field(strict=True, ge=-(2**63), lt=2**63)]
+PositiveBigInt = Annotated[int, Field(strict=True, gt=0, lt=2**63)]
 
 
 def utc_now() -> datetime:
@@ -117,6 +118,54 @@ class MessageObservation(DatabaseModel):
     data: dict[str, JsonValue]
 
 
+class ReactionValue(DatabaseModel):
+    key: Annotated[str, Field(strict=True, min_length=1, max_length=256)]
+    count: PositiveBigInt = 1
+
+    @field_validator("key")
+    @classmethod
+    def canonical_key(cls, value: str) -> str:
+        if value != "paid" and not (value.startswith(("e:", "c:")) and len(value) > 2):
+            raise ValueError("Reaction key requires an emoji, custom emoji or paid type")
+        if any(ord(character) < 32 or ord(character) == 127 for character in value):
+            raise ValueError("Reaction keys cannot contain control characters")
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("Reaction keys require valid Unicode") from None
+        return value
+
+
+class ReactionObservation(DatabaseModel):
+    """One actor selection or an anonymous message count snapshot."""
+
+    kind: Literal["actor", "counts"]
+    chat_id: BigInt
+    message_id: PositiveBigInt
+    event_at: AwareDatetime
+    user_id: BigInt | None = None
+    actor_chat_id: BigInt | None = None
+    previous_active: StrictBool | None = None
+    reactions: list[ReactionValue] = Field(max_length=256)
+
+    @model_validator(mode="after")
+    def snapshot_contract(self) -> Self:
+        actors = int(self.user_id is not None) + int(self.actor_chat_id is not None)
+        if actors != (1 if self.kind == "actor" else 0):
+            raise ValueError("Actor snapshots require exactly one actor; count snapshots have none")
+        if (self.previous_active is not None) != (self.kind == "actor"):
+            raise ValueError("Only actor snapshots require a previous selection status")
+        unique: dict[str, ReactionValue] = {}
+        for reaction in self.reactions:
+            if self.kind == "actor" and reaction.count != 1:
+                raise ValueError("An actor can select each reaction only once")
+            previous = unique.setdefault(reaction.key, reaction)
+            if previous.count != reaction.count:
+                raise ValueError("A reaction snapshot cannot contain conflicting counts")
+        self.reactions = list(unique.values())
+        return self
+
+
 class ArchivedUpdate(DatabaseModel):
     id: UUID = Field(default_factory=uuid4)
     update_id: BigInt
@@ -129,6 +178,7 @@ class ArchivedUpdate(DatabaseModel):
     memberships: list[MembershipObservation] = Field(default_factory=list)
     topics: list[TopicObservation] = Field(default_factory=list)
     messages: list[MessageObservation] = Field(default_factory=list)
+    reaction: ReactionObservation | None = None
 
 
 class UsageStats(DatabaseModel):

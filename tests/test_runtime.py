@@ -4,6 +4,7 @@ import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
+from aiogram.enums import UpdateType
 from aiogram.methods import DeleteWebhook, GetMe
 
 from msu_hub_bot.settings import Settings
@@ -85,7 +86,7 @@ async def test_startup_failure_runs_owned_cleanup(app_settings, boundaries):
     assert session.methods == []
 
 
-async def test_polling_keeps_subscription_backlog_and_session_ownership(app_settings, boundaries, monkeypatch):
+async def test_polling_explicitly_subscribes_to_all_kinds_and_preserves_backlog(app_settings, boundaries, monkeypatch):
     from msu_hub_bot.app import Application
 
     session, _, _ = boundaries
@@ -94,8 +95,15 @@ async def test_polling_keeps_subscription_backlog_and_session_ownership(app_sett
     monkeypatch.setattr(application.dispatcher, "start_polling", start_polling)
     await application.run()
     start_polling.assert_awaited_once_with(
-        application.bot, polling_timeout=60, handle_as_tasks=True, allowed_updates=None, close_bot_session=False
+        application.bot,
+        polling_timeout=60,
+        handle_as_tasks=True,
+        allowed_updates=[kind.value for kind in UpdateType],
+        close_bot_session=False,
     )
+    subscribed = start_polling.call_args.kwargs["allowed_updates"]
+    assert {"message_reaction", "message_reaction_count", "chat_member", "business_message", "poll_answer"} <= set(subscribed)
+    assert next(method for method in session.methods if isinstance(method, DeleteWebhook)).drop_pending_updates is False
     assert session.closed
 
 
