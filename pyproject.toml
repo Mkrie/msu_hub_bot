@@ -29,7 +29,6 @@ dependencies = [
     "pydantic==2.13.5",
     "pydantic-settings==2.15.0",
     "pyfiglet==1.0.4",
-    "pytesseract==0.3.13",
     "pytz==2026.3.post1",
     "redis==7.4.1",
     "requests==2.34.2",
@@ -90,6 +89,7 @@ files = [
     "src/msu_hub_bot/storage/observations.py",
     "src/msu_hub_bot/storage/supabase.py",
     "src/msu_hub_bot/execution/executor.py",
+    "src/msu_hub_bot/execution/process.py",
     "src/msu_hub_bot/providers/dvach.py",
     "src/msu_hub_bot/providers/ydl.py",
     "src/msu_hub_bot/uptime.py",
@@ -100,6 +100,7 @@ files = [
     "src/msu_hub_bot/telegram/delivery.py",
     "src/msu_hub_bot/telegram/extraction.py",
     "src/msu_hub_bot/telegram/files.py",
+    "src/msu_hub_bot/telegram/media_jobs.py",
     "src/msu_hub_bot/telegram/filters.py",
     "src/msu_hub_bot/telegram/keyboards.py",
     "src/msu_hub_bot/telegram/middlewares/check_gets.py",
@@ -159,6 +160,7 @@ files = [
     "src/msu_hub_bot/commands/song.py",
     "src/msu_hub_bot/commands/stats.py",
     "src/msu_hub_bot/commands/sticker.py",
+    "src/msu_hub_bot/commands/sticker_input.py",
     "src/msu_hub_bot/commands/tenet.py",
     "src/msu_hub_bot/commands/tesseract.py",
     "src/msu_hub_bot/commands/tts.py",
@@ -171,6 +173,7 @@ files = [
     "src/msu_hub_bot/routing.py",
     "src/msu_hub_bot/media/caption_layout.py",
     "src/msu_hub_bot/media/ffmpeg.py",
+    "src/msu_hub_bot/media/limits.py",
     "src/msu_hub_bot/providers/jdoodle.py",
     "src/msu_hub_bot/execution/sed.py",
     "src/msu_hub_bot/media/sticker_media.py",
@@ -189,7 +192,7 @@ files = [
 
 [[tool.mypy.overrides]]
 # Remove each provider/native exception when its SDK ships types; adapters remain checked.
-module = ["yt_dlp", "yt_dlp.*", "aiocache", "arxiv", "gtts", "pytesseract", "acrcloud.recognizer", "lottie", "lottie.*", "fontTools.pens.boundsPen", "throttler", "transliterate", "pyfiglet", "airtable", "ccxt", "ccxt.async_support"]
+module = ["yt_dlp", "yt_dlp.*", "aiocache", "arxiv", "gtts", "acrcloud.recognizer", "lottie", "lottie.*", "fontTools.pens.boundsPen", "throttler", "transliterate", "pyfiglet", "airtable", "ccxt", "ccxt.async_support"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
