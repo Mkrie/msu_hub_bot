@@ -32,6 +32,7 @@ from msu_hub_bot.storage.models import (
     VkSubscription,
 )
 from msu_hub_bot.settings import Settings
+from msu_hub_bot.storage.reactions import ReactionScoreboard
 from msu_hub_bot.telemetry import Backend, Boundary, Outcome, Telemetry
 
 _Result = TypeVar("_Result")
@@ -341,6 +342,17 @@ class SupabaseRepository:
         if since.tzinfo is None or since.utcoffset() is None:
             raise ValueError("Statistics require a timezone-aware timestamp")
         return await self._rpc("statistics", {"p_since": since.isoformat()}, lambda value: _record(UsageStats, value))
+
+    async def reaction_scoreboard(self, chat_id: int, *, days: int = 30, limit: int = 10) -> ReactionScoreboard:
+        if type(chat_id) is not int or chat_id == 0 or not -(2**63) <= chat_id < 2**63:
+            raise ValueError("Reaction statistics require a valid chat identifier")
+        if type(days) is not int or days not in {1, 7, 30} or type(limit) is not int or not 1 <= limit <= 10:
+            raise ValueError("Reaction statistics require a supported window and bounded limit")
+        return await self._rpc(
+            "reaction_scoreboard",
+            {"p_chat_id": chat_id, "p_days": days, "p_limit": limit},
+            lambda value: _record(ReactionScoreboard, value),
+        )
 
     async def list_directory(self) -> list[DirectoryRecord]:
         # The RPC returns one JSONB array, not SETOF rows subject to a REST row cap.

@@ -90,6 +90,7 @@ from msu_hub_bot.commands.sed import process_sed
 from msu_hub_bot.commands.settings import process_settings
 from msu_hub_bot.commands.song import process_song
 from msu_hub_bot.commands.stats import Stats
+from msu_hub_bot.commands.reactions import Reactions
 from msu_hub_bot.commands.sticker import (
     process_sticker,
     process_sticker_chat,
@@ -157,6 +158,18 @@ def build_router(*, wit: Wit, wolfram: WolframAPI, config: Settings) -> Router:
         HelpMessage.callback_data.filter(),
         StateFilter(None),
         flags={"handler_key": "HelpMessage.process_cb", "fsm_release": True},
+    )
+    group("reactions").message.register(
+        Reactions.process,
+        MetaCommand("reactions", "реакции"),
+        StateFilter(None),
+        flags={"handler_key": "Reactions.process", "fsm_release": True},
+    )
+    group("reactions").callback_query.register(
+        Reactions.process_cb,
+        Reactions.callback_data.filter(),
+        StateFilter(None),
+        flags={"handler_key": "Reactions.process_cb", "fsm_release": True},
     )
     group("control").message.register(
         process_cancel,

@@ -8,6 +8,7 @@ import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from itertools import permutations
 from pathlib import Path
 from uuid import UUID
 
@@ -191,6 +192,28 @@ def exercise_namespace_migration(db, migration):
     return {"failure_cases": set(cases), "populated_identity_preserved": True}
 
 
+def exercise_reaction_migration(db, migration):
+    """Keep the populated preceding schema compatible, including failed DDL."""
+    db.run("INSERT INTO msu_hub_private.schema_migrations(version) VALUES(99);")
+    rejected = db.run(migration, check=False)
+    assert rejected.returncode and "requires schema revision 3" in rejected.stderr
+    db.run("DELETE FROM msu_hub_private.schema_migrations WHERE version=99;")
+    before = namespace_snapshot(db, "msu_hub_private")
+    interrupted = migration.replace("INSERT INTO msu_hub_private.schema_migrations(version) VALUES(4);", "SELECT 1/0;")
+    assert db.run(interrupted, check=False).returncode
+    assert namespace_snapshot(db, "msu_hub_private") == before
+    db.run(migration)
+    after = namespace_snapshot(db, "msu_hub_private")
+    assert {key: value for key, value in before["rows"].items() if key != "schema_migrations"} == {
+        key: value for key, value in after["rows"].items() if key != "schema_migrations"
+    }
+    after_relations = {row[0]: row for row in after["relations"]}
+    assert all(after_relations.get(row[0]) == row for row in before["relations"])
+    assert db.rpc("health") == {"schema_version": 1, "bot_id": 999}
+    assert db.rpc("get_chat", "-101")["metadata"] == [1, 2, 3]
+    return True
+
+
 @pytest.fixture(scope="module")
 def postgres():
     dsn = os.environ.get("HUB_TEST_POSTGRES_DSN")
@@ -221,6 +244,8 @@ def postgres():
     for schema in SCHEMAS:
         if schema.name == "003_application_namespaces.sql":
             db.namespace_upgrade = exercise_namespace_migration(db, schema.read_text())
+        elif schema.name == "004_reactions.sql":
+            db.reaction_upgrade = exercise_reaction_migration(db, schema.read_text())
         else:
             db.run(schema.read_text())
     return db
@@ -249,11 +274,16 @@ def test_namespace_migration_preserves_populated_rows_and_object_identities(post
     assert postgres.namespace_upgrade["populated_identity_preserved"]
 
 
+def test_reaction_migration_is_additive_atomic_and_rejects_the_wrong_predecessor(postgres):
+    assert postgres.reaction_upgrade
+
+
 @pytest.fixture
 def db(postgres):
     # The module fixture refuses existing schemas before installing the test schema.
     postgres.run("""
         TRUNCATE msu_hub_private.chat_users,msu_hub_private.chat_topics,msu_hub_private.chat_settings,
+            msu_hub_private.reaction_actors,msu_hub_private.reaction_counts,
             msu_hub_private.messages,msu_hub_private.updates,msu_hub_private.users,msu_hub_private.chats,
             msu_hub_private.directory,msu_hub_private.vk_subscriptions,msu_hub_private.mutation_journal,msu_hub_private.principals;
         INSERT INTO msu_hub_private.principals(auth_user_id,bot_id) VALUES ('00000000-0000-0000-0000-000000000001',999);
@@ -513,7 +543,7 @@ def test_private_observation_helper_reuses_a_receipt_and_fixed_retention_instant
     assert db.value("SELECT data FROM msu_hub_private.updates;") == {"original": True}
     assert db.value("SELECT count(*) FROM msu_hub_private.messages;") == 1
     assert db.value("SELECT to_jsonb(source_update_id) FROM msu_hub_private.messages;") == receipt
-    assert db.value("SELECT jsonb_agg(version ORDER BY version) FROM msu_hub_private.schema_migrations;") == [1, 2, 3]
+    assert db.value("SELECT jsonb_agg(version ORDER BY version) FROM msu_hub_private.schema_migrations;") == [1, 2, 3, 4]
     assert db.rpc("health") == {"schema_version": 1, "bot_id": 999}
     assert db.run(f"SELECT msu_hub_private.observe_archive({args});", principal=PRINCIPAL, check=False).returncode
     assert db.run(f"SET ROLE anon; SELECT msu_hub_private.observe_archive({args});", check=False).returncode
@@ -536,6 +566,7 @@ def test_principal_gate_covers_every_api_and_private_tables(db):
         "upsert_vk_subscription": "1,1,'{}'",
         "advance_vk_cursor": "1,1,1",
         "archive_update": "'{}'",
+        "reaction_scoreboard": "1,30,10",
     }
     for name, args in arguments.items():
         result = db.run(f"SELECT msu_hub_api.{name}_v1({args});", principal=STRANGER, check=False)
@@ -781,3 +812,338 @@ def test_reply_does_not_extend_near_expiry_body_through_receipt_or_parent(db):
 @pytest.mark.parametrize("batch", ["NULL", "0", "10001"])
 def test_retention_rejects_unbounded_or_invalid_batch(db, batch):
     assert db.run(f"SELECT msu_hub_private.retain_messages({batch});", check=False).returncode
+
+
+def reaction(
+    update_id, *, actor=202, message=42, chat=-101, keys=("e:❤",), counts=None, stamp=None, actor_chat=False, previous_active=False
+):
+    event_at = stamp or datetime.now(UTC) - timedelta(seconds=10)
+    return archive(
+        update_id,
+        kind="message_reaction" if counts is None else "message_reaction_count",
+        users=[
+            {"user_id": identifier, "is_bot": identifier == 404, "first_name": f"Друг {identifier}"} for identifier in (101, 202, 303, 404)
+        ],
+        chats=[{"chat_id": chat, "type": "supergroup", "title": "Друзья"}],
+        reaction={
+            "kind": "actor" if counts is None else "counts",
+            "chat_id": chat,
+            "message_id": message,
+            "event_at": event_at.isoformat(),
+            "user_id": actor if counts is None and not actor_chat else None,
+            "actor_chat_id": actor if counts is None and actor_chat else None,
+            "previous_active": previous_active if counts is None else None,
+            "reactions": [
+                {"key": key, "count": count} for key, count in (counts.items() if counts is not None else ((k, 1) for k in keys))
+            ],
+        },
+    )
+
+
+def reaction_message(db, *, message=42, author=101, chat=-101, sender_chat=None, thread=7, stamp=None, business=""):
+    stamp = (stamp or datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    db.rpc(
+        "archive_update",
+        literal(
+            archive(
+                10000 + message,
+                messages=[
+                    {
+                        "chat_id": chat,
+                        "message_id": message,
+                        "sent_at": stamp,
+                        "sender_user_id": author,
+                        "sender_chat_id": sender_chat,
+                        "thread_id": thread,
+                        "business_connection_id": business,
+                        "data": {"text": "PRIVATE_MESSAGE_BODY_CANARY"},
+                    }
+                ],
+            )
+        ),
+    )
+
+
+def test_reaction_scores_count_people_not_emoji_and_exclude_self_and_bots(db):
+    reaction_message(db)
+    for identifier, actor, keys in (
+        (1, 202, ("e:❤", "e:🔥", "c:987654321012345678")),
+        (2, 303, ("e:❤",)),
+        (3, 101, ("e:🔥",)),
+        (4, 404, ("e:🔥",)),
+    ):
+        db.rpc("archive_update", literal(reaction(identifier, actor=actor, keys=keys)))
+    result = db.rpc("reaction_scoreboard", "-101,30,10")
+    assert result["summary"] == {
+        "points": 2,
+        "reactions": 4,
+        "givers": 2,
+        "getters": 1,
+        "messages": 1,
+        "anonymous": 0,
+        "paid": 0,
+        "unattributed": 0,
+        "channel_reactions": 0,
+    }
+    assert result["getters"][0] == {
+        "user_id": 101,
+        "first_name": "Друг 101",
+        "last_name": None,
+        "username": None,
+        "score": 2,
+        "people": 2,
+        "messages": 1,
+    }
+    assert [row["user_id"] for row in result["givers"]] == [202, 303]
+    assert result["emoji"][0] == {"key": "e:❤", "count": 2}
+    assert result["posts"] == [{"message_id": 42, "thread_id": 7, "author_id": 101, "score": 2, "people": 2}]
+    assert "PRIVATE_MESSAGE_BODY_CANARY" not in json.dumps(result)
+
+
+def test_reaction_switch_removal_replay_and_equal_second_ordering(db):
+    reaction_message(db)
+    stamp = datetime.now(UTC) - timedelta(hours=2)
+    initial = reaction(10, stamp=stamp)
+    db.rpc("archive_update", literal(initial))
+    initial_score_at = db.value("SELECT to_jsonb(score_at) FROM msu_hub_private.reaction_actors;")
+    db.rpc("archive_update", literal(initial))
+    switched = reaction(12, stamp=stamp, keys=("e:🔥", "e:👍"), previous_active=True)
+    db.rpc("archive_update", literal(switched))
+    db.rpc("archive_update", literal(reaction(9, stamp=stamp, keys=(), previous_active=True)))
+    db.rpc("archive_update", literal(reaction(999, stamp=stamp - timedelta(seconds=1), keys=())))
+    assert db.value("SELECT to_jsonb(score_at) FROM msu_hub_private.reaction_actors;") == initial_score_at
+    assert db.rpc("reaction_scoreboard", "-101")["summary"]["points"] == 1
+    assert db.rpc("reaction_scoreboard", "-101")["summary"]["reactions"] == 2
+    db.rpc("archive_update", literal(reaction(13, stamp=stamp + timedelta(seconds=1), keys=())))
+    assert db.rpc("reaction_scoreboard", "-101")["summary"]["points"] == 0
+    assert db.value("SELECT count(*) FROM msu_hub_private.reaction_actors WHERE cleared_at > score_at AND reactions='[]';") == 1
+    db.rpc("archive_update", literal(reaction(14, stamp=stamp, keys=("e:❤",))))
+    assert db.rpc("reaction_scoreboard", "-101")["summary"]["points"] == 0
+    # Date is authoritative even if Telegram restarts its update ID sequence.
+    db.rpc("archive_update", literal(reaction(1, stamp=stamp + timedelta(seconds=2))))
+    assert db.rpc("reaction_scoreboard", "-101")["summary"]["points"] == 1
+    assert db.value("SELECT to_jsonb(score_at > '" + initial_score_at + "'::timestamptz) FROM msu_hub_private.reaction_actors;") is True
+
+
+def test_reaction_unknown_authors_late_message_and_sender_chat_are_honest(db):
+    db.rpc("archive_update", literal(reaction(1)))
+    result = db.rpc("reaction_scoreboard", "-101")
+    assert result["summary"]["points"] == result["summary"]["unattributed"] == 1
+    assert result["givers"][0]["people"] == 0 and not result["getters"]
+    assert result["posts"][0]["author_id"] is None
+    reaction_message(db)
+    assert db.rpc("reaction_scoreboard", "-101")["getters"][0]["user_id"] == 101
+    # A compatibility from_user never identifies the person behind a sender_chat.
+    reaction_message(db, message=43, author=202, sender_chat=-800)
+    db.rpc("archive_update", literal(reaction(2, message=43)))
+    result = db.rpc("reaction_scoreboard", "-101")
+    assert result["summary"]["points"] == 2 and result["summary"]["unattributed"] == 1
+    assert len(result["getters"]) == 1 and result["getters"][0]["score"] == 1
+    assert next(post for post in result["posts"] if post["message_id"] == 43)["author_id"] is None
+    reaction_message(db, message=44, business="separate-business-connection")
+    db.rpc("archive_update", literal(reaction(3, message=44)))
+    assert db.rpc("reaction_scoreboard", "-101")["summary"]["unattributed"] == 2
+
+
+def test_reaction_anonymous_absolute_snapshots_paid_and_mode_changes(db):
+    reaction_message(db)
+    stamp = datetime.now(UTC) - timedelta(hours=1)
+    db.rpc("archive_update", literal(reaction(1, stamp=stamp)))
+    db.rpc("archive_update", literal(reaction(2, stamp=stamp, actor=303)))
+    counts = reaction(3, counts={"e:❤": 30, "c:123": 2, "paid": 5}, stamp=stamp + timedelta(seconds=1))
+    db.rpc("archive_update", literal(counts))
+    db.rpc("archive_update", literal(counts))
+    result = db.rpc("reaction_scoreboard", "-101")
+    assert result["summary"]["points"] == 0
+    assert result["summary"]["anonymous"] == 32 and result["summary"]["paid"] == 5
+    assert not result["getters"] and not result["givers"]
+    db.rpc("archive_update", literal(reaction(4, counts={"e:❤": 3}, stamp=stamp)))
+    assert db.rpc("reaction_scoreboard", "-101")["summary"]["anonymous"] == 32
+    # Identifiable mode resumes only with freshly observed actor snapshots.
+    db.rpc("archive_update", literal(reaction(5, stamp=stamp + timedelta(seconds=2))))
+    result = db.rpc("reaction_scoreboard", "-101")
+    assert result["summary"]["points"] == 1
+    assert result["summary"]["anonymous"] == result["summary"]["paid"] == 0
+    db.rpc("archive_update", literal(reaction(6, actor=-500, actor_chat=True, message=43, stamp=stamp)))
+    result = db.rpc("reaction_scoreboard", "-101")
+    assert result["summary"]["points"] == 1 and result["summary"]["channel_reactions"] == 1
+    # An empty absolute snapshot clears counts without losing its order watermark.
+    db.rpc("archive_update", literal(reaction(7, counts={}, stamp=stamp + timedelta(seconds=3))))
+    assert db.rpc("reaction_scoreboard", "-101")["summary"]["points"] == 0
+
+
+def test_reaction_windows_use_the_uninterrupted_point_time_and_hide_expired_rows(db):
+    reaction_message(db)
+    stamp = datetime.now(UTC)
+    db.rpc("archive_update", literal(reaction(1, stamp=stamp - timedelta(days=8))))
+    db.rpc("archive_update", literal(reaction(2, stamp=stamp - timedelta(days=2), keys=("e:🔥",), previous_active=True)))
+    assert db.rpc("reaction_scoreboard", "-101,30,10")["summary"]["points"] == 1
+    assert db.rpc("reaction_scoreboard", "-101,7,10")["summary"]["points"] == 0
+    db.rpc("archive_update", literal(reaction(3, stamp=stamp - timedelta(hours=2), keys=())))
+    db.rpc("archive_update", literal(reaction(4, stamp=stamp - timedelta(hours=1))))
+    assert db.rpc("reaction_scoreboard", "-101,1,10")["summary"]["points"] == 1
+    db.rpc("archive_update", literal(reaction(5, message=43, stamp=stamp - timedelta(days=31))))
+    assert db.value("SELECT count(*) FROM msu_hub_private.reaction_actors;") == 1
+    # Eligibility does not wait for scheduled physical deletion.
+    db.run("""UPDATE msu_hub_private.reaction_actors SET score_at=now()-interval '32 days',
+        cleared_at=now()-interval '33 days',event_at=now()-interval '31 days';""")
+    assert db.rpc("reaction_scoreboard", "-101")["summary"]["points"] == 0
+    assert db.value("SELECT count(*) FROM msu_hub_private.reaction_actors;") == 1
+
+
+def test_reaction_retention_batches_are_independent_and_preserve_tombstones_and_durable_rows(db):
+    stamp = datetime.now(UTC) - timedelta(hours=1)
+    for identifier in range(1, 4):
+        db.rpc("archive_update", literal(reaction(identifier, message=identifier, stamp=stamp, keys=() if identifier == 3 else ("e:❤",))))
+        db.rpc("archive_update", literal(reaction(identifier + 10, message=identifier, counts={"e:🔥": identifier}, stamp=stamp)))
+    db.run("""
+        UPDATE msu_hub_private.reaction_actors SET score_at=now()-interval '32 days',event_at=now()-interval '31 days' WHERE message_id<3;
+        UPDATE msu_hub_private.reaction_counts SET event_at=now()-interval '31 days' WHERE message_id<3;
+    """)
+    durable = db.value(
+        "SELECT jsonb_build_array((SELECT count(*) FROM msu_hub_private.users),(SELECT count(*) FROM msu_hub_private.mutation_journal));"
+    )
+    for expected in (1, 1, 0):
+        result = db.value("SELECT msu_hub_private.retain_messages(1);")
+        assert result["reaction_actors"] == result["reaction_counts"] == expected
+    assert db.value("SELECT count(*) FROM msu_hub_private.reaction_actors WHERE score_at IS NULL;") == 1
+    assert (
+        db.value(
+            "SELECT jsonb_build_array((SELECT count(*) FROM msu_hub_private.users),(SELECT count(*) FROM msu_hub_private.mutation_journal));"
+        )
+        == durable
+    )
+    assert db.value("SELECT count(*) FROM msu_hub_private.mutation_journal WHERE relation_name LIKE 'reaction%';") == 0
+
+
+def test_reaction_chat_and_bot_scope_and_disabled_principal(db):
+    stamp = datetime.now(UTC) - timedelta(hours=1)
+    db.rpc("archive_update", literal(reaction(1, stamp=stamp)))
+    db.rpc("archive_update", literal(reaction(2, chat=-102, stamp=stamp)))
+    db.run(f"INSERT INTO msu_hub_private.principals(auth_user_id,bot_id) VALUES('{STRANGER}',1000);")
+    assert db.rpc("reaction_scoreboard", "-101", principal=STRANGER)["summary"]["points"] == 0
+    second = reaction(1, stamp=stamp)
+    second["id"] = str(UUID(int=200000))
+    db.rpc("archive_update", literal(second), principal=STRANGER)
+    assert db.rpc("reaction_scoreboard", "-101", principal=STRANGER)["summary"]["points"] == 1
+    assert db.rpc("reaction_scoreboard", "-101")["summary"]["points"] == 1
+    assert db.rpc("reaction_scoreboard", "-102")["summary"]["points"] == 1
+    assert db.rpc("reaction_scoreboard", "-103")["summary"]["points"] == 0
+    for table in ("reaction_actors", "reaction_counts"):
+        assert db.run(f"SELECT * FROM msu_hub_private.{table};", principal=PRINCIPAL, check=False).returncode
+    assert db.run("SELECT msu_hub_private.observe_reaction('{}',999,1);", principal=PRINCIPAL, check=False).returncode
+    db.run(f"UPDATE msu_hub_private.principals SET enabled=false WHERE auth_user_id='{PRINCIPAL}';")
+    assert db.run("SELECT msu_hub_api.reaction_scoreboard_v1(-101);", principal=PRINCIPAL, check=False).returncode
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"kind": "other"},
+        {"kind": "counts", "user_id": 202},
+        {"user_id": None},
+        {"actor_chat_id": -600},
+        {"chat_id": 0},
+        {"message_id": 0},
+        {"message_id": True},
+        {"user_id": "202"},
+        {"event_at": "infinity"},
+        {"previous_active": None},
+        {"previous_active": 1},
+        {"kind": "counts", "user_id": None, "previous_active": False},
+        {"reactions": [{"key": "e:❤", "count": 0}]},
+        {"reactions": [{"key": "e:❤", "count": 2}]},
+        {"reactions": [{"key": "e:❤", "count": True}]},
+        {"reactions": [{"key": "c:", "count": 1}]},
+        {"reactions": [{"key": "text", "count": 1}]},
+        {"reactions": [{"key": "e:\n", "count": 1}]},
+        {"reactions": [{"key": "e:❤", "count": 1}, {"key": "e:❤", "count": 1}]},
+        {"reactions": [{"key": "c:" + "1" * 255, "count": 1}]},
+        {"reactions": [{"key": "c:" + str(i), "count": 1} for i in range(257)]},
+        {"unexpected": "private-canary"},
+    ],
+)
+def test_reaction_invalid_snapshots_roll_back_the_whole_archive(db, changes):
+    row = reaction(1)
+    row["reaction"].update(changes)
+    result = db.run(f"SELECT msu_hub_api.archive_update_v1({literal(row)});", principal=PRINCIPAL, check=False)
+    assert result.returncode
+    assert db.value("SELECT count(*) FROM msu_hub_private.updates;") == 0
+    assert db.value("SELECT count(*) FROM msu_hub_private.users;") == 0
+    assert db.value("SELECT count(*) FROM msu_hub_private.reaction_actors;") == 0
+
+
+@pytest.mark.parametrize("arguments", ["-101,0,10", "-101,2,10", "-101,31,10", "-101,30,0", "-101,30,11", "0,30,10", "-101,NULL,10"])
+def test_reaction_statistics_reject_invalid_scope_and_limits(db, arguments):
+    assert db.run(f"SELECT msu_hub_api.reaction_scoreboard_v1({arguments});", principal=PRINCIPAL, check=False).returncode
+
+
+def test_reaction_concurrent_updates_and_receipt_replay_choose_the_latest_snapshot(db):
+    reaction_message(db)
+    stamp = datetime.now(UTC) - timedelta(hours=1)
+    rows = [reaction(i, stamp=stamp, keys=("e:❤",) if i < 12 else ()) for i in range(1, 13)]
+    with ThreadPoolExecutor(max_workers=6) as workers:
+        list(workers.map(lambda row: db.rpc("archive_update", literal(row)), rows[::-1] + rows))
+    assert db.value("SELECT count(*) FROM msu_hub_private.updates;") == 13
+    assert db.value("SELECT to_jsonb(update_id) FROM msu_hub_private.reaction_actors;") == 12
+    assert db.rpc("reaction_scoreboard", "-101")["summary"]["points"] == 0
+
+
+@pytest.mark.parametrize("with_reentry", [False, True])
+def test_reaction_transition_watermarks_are_independent_of_archive_completion_order(db, with_reentry):
+    reaction_message(db)
+    stamp = datetime.now(UTC)
+    rows = [reaction(1, stamp=stamp - timedelta(days=8))]
+    if with_reentry:
+        rows.extend(
+            [
+                reaction(2, stamp=stamp - timedelta(hours=2), keys=(), previous_active=True),
+                reaction(3, stamp=stamp - timedelta(hours=1), previous_active=False),
+            ]
+        )
+    rows.append(reaction(4, stamp=stamp - timedelta(minutes=30), keys=("e:🔥", "e:👍"), previous_active=True))
+    outcomes = []
+    for ordered in permutations(rows):
+        calls = "\n".join(f"SELECT msu_hub_api.archive_update_v1({literal(row)});" for row in ordered)
+        result = db.value(f"""
+            BEGIN;
+            TRUNCATE msu_hub_private.updates,msu_hub_private.reaction_actors,msu_hub_private.reaction_counts;
+            SET LOCAL request.jwt.claim.sub = '{PRINCIPAL}';
+            {calls}
+            SELECT jsonb_build_object(
+                'week',msu_hub_api.reaction_scoreboard_v1(-101,7,10),
+                'month',msu_hub_api.reaction_scoreboard_v1(-101,30,10),
+                'state',(SELECT to_jsonb(r) FROM msu_hub_private.reaction_actors r));
+            COMMIT;
+        """)
+        outcomes.append(result)
+    assert all(outcome == outcomes[0] for outcome in outcomes)
+    assert outcomes[0]["week"]["summary"]["points"] == int(with_reentry)
+    assert outcomes[0]["month"]["summary"]["points"] == 1
+    assert outcomes[0]["state"]["score_update_id"] == (3 if with_reentry else 1)
+    assert outcomes[0]["state"]["update_id"] == 4
+    assert outcomes[0]["state"]["reactions"] == [{"key": "e:👍", "count": 1}, {"key": "e:🔥", "count": 1}]
+
+
+def test_reaction_unobserved_start_is_not_invented_and_stale_clear_cannot_cancel_newer_start(db):
+    stamp = datetime.now(UTC) - timedelta(hours=2)
+    db.rpc("archive_update", literal(reaction(4, stamp=stamp + timedelta(seconds=2), previous_active=True)))
+    assert db.rpc("reaction_scoreboard", "-101")["summary"]["points"] == 0
+    # A late observed start repairs attribution without replacing the latest choices.
+    db.rpc("archive_update", literal(reaction(3, stamp=stamp + timedelta(seconds=1))))
+    assert db.rpc("reaction_scoreboard", "-101")["summary"]["points"] == 1
+    db.rpc("archive_update", literal(reaction(2, stamp=stamp, keys=(), previous_active=True)))
+    assert db.rpc("reaction_scoreboard", "-101")["summary"]["points"] == 1
+    assert db.value("SELECT to_jsonb(update_id) FROM msu_hub_private.reaction_actors;") == 4
+
+
+@pytest.mark.parametrize("counts", [{}, {"e:❤": 5}])
+def test_reaction_anonymous_mode_fences_individual_continuity_until_an_observed_new_start(db, counts):
+    stamp = datetime.now(UTC) - timedelta(hours=1)
+    db.rpc("archive_update", literal(reaction(1, stamp=stamp)))
+    db.rpc("archive_update", literal(reaction(2, stamp=stamp + timedelta(seconds=1), counts=counts)))
+    db.rpc("archive_update", literal(reaction(4, stamp=stamp + timedelta(seconds=3), previous_active=True)))
+    assert db.rpc("reaction_scoreboard", "-101")["summary"]["points"] == 0
+    db.rpc("archive_update", literal(reaction(3, stamp=stamp + timedelta(seconds=2))))
+    assert db.rpc("reaction_scoreboard", "-101")["summary"]["points"] == 1
+    assert db.value("SELECT to_jsonb(update_id) FROM msu_hub_private.reaction_actors;") == 4

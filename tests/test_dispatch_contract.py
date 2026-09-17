@@ -14,6 +14,7 @@ from aiogram.types import CallbackQuery, Update, User
 
 from msu_hub_bot.commands.chess import ChessCallback
 from msu_hub_bot.commands.geoguess import GeoguessCallback
+from msu_hub_bot.commands.reactions import ReactionCallback
 from msu_hub_bot.telegram.filters import MetaCommand, SlashCommand
 from msu_hub_bot.telegram.middlewares.settings import SettingsMiddleware
 from msu_hub_bot.telegram.state import (
@@ -64,6 +65,8 @@ def is_added_route(handler):
         "Chess.top",
         "Chess.process_cb",
         "process_meme",
+        "Reactions.process",
+        "Reactions.process_cb",
     }
 
 
@@ -72,7 +75,7 @@ def test_every_route_preserves_order_and_aliases():
     counts = Counter(route["event"] for route in CONTRACT["routes"])
     for kind, count in counts.items():
         actual = routes(root, "error" if kind == "errors" else kind)
-        extra = {"message": 4, "edited_message": 1, "callback_query": 1}.get(kind, 0)
+        extra = {"message": 5, "edited_message": 1, "callback_query": 2}.get(kind, 0)
         assert len(actual) == count + extra
         retained = [handler for handler in actual if not is_added_route(handler)]
         expected = [route for route in CONTRACT["routes"] if route["event"] == kind]
@@ -171,6 +174,100 @@ async def test_chess_commands_select_real_routes_with_case_and_mentions(chess_se
         assert handler.flags["handler_key"] == expected
         assert meta is not None
     assert bot.session.methods == []
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("/reactions", "Reactions.process"),
+        ("/реакции", "Reactions.process"),
+        ("/REACTIONS@CONTRACT_BOT", "Reactions.process"),
+        ("/РЕАКЦИИ@contract_bot", "Reactions.process"),
+        ("Посмотрим #reactions", "Reactions.process"),
+        ("#реакции", "Reactions.process"),
+        ("/reactions@another_bot", None),
+        ("/реакции@another_bot", None),
+    ],
+)
+async def test_reaction_aliases_select_the_real_chat_scoreboard_route(chess_selection_dispatcher, text, expected):
+    bot, dispatcher = chess_selection_dispatcher
+    result = await asyncio.create_task(dispatcher.feed_update(bot, Update(update_id=1, message=make_message(bot, text=text))))
+    if expected is None:
+        assert result is UNHANDLED
+    else:
+        handler, meta = result
+        assert handler.callback.__qualname__ == expected and handler.flags["handler_key"] == expected
+        assert handler.flags["fsm_release"] is True and meta is not None
+    assert bot.session.methods == []
+
+
+@pytest.mark.parametrize("view", ["getters", "givers", "posts", "pulse"])
+@pytest.mark.parametrize("days", [1, 7, 30])
+async def test_reaction_buttons_select_real_typed_callback_routes(chess_selection_dispatcher, view, days):
+    bot, dispatcher = chess_selection_dispatcher
+    callback = CallbackQuery(
+        id="synthetic",
+        chat_instance="synthetic",
+        from_user=User(id=42, is_bot=False, first_name="Synthetic"),
+        message=make_message(bot),
+        data=ReactionCallback(view=view, days=days).pack(),
+    )
+    handler, _ = await asyncio.create_task(dispatcher.feed_update(bot, Update(update_id=1, callback_query=callback)))
+    assert handler.callback.__qualname__ == "Reactions.process_cb"
+    assert handler.flags["handler_key"] == "Reactions.process_cb" and handler.flags["fsm_release"] is True
+    assert bot.session.methods == []
+
+
+@pytest.mark.parametrize("payload", ["react:secret:30", "react:getters:31", "react:getters:30:-10099", "react:getters:030"])
+async def test_malformed_reaction_buttons_select_expired_fallback(chess_selection_dispatcher, payload):
+    bot, dispatcher = chess_selection_dispatcher
+    callback = CallbackQuery(
+        id="synthetic",
+        chat_instance="synthetic",
+        from_user=User(id=42, is_bot=False, first_name="Synthetic"),
+        message=make_message(bot),
+        data=payload,
+    )
+    handler, _ = await asyncio.create_task(dispatcher.feed_update(bot, Update(update_id=1, callback_query=callback)))
+    assert handler.callback.__qualname__ == "process_expired_callback"
+
+
+@pytest.mark.parametrize("callback", [False, True])
+async def test_reaction_navigation_preserves_active_cancel_based_conversations(callback):
+    bot = make_bot()
+    dispatcher = Dispatcher(disable_fsm=True)
+    dispatcher.update.outer_middleware(StateContextMiddleware())
+    fsm = TopicFSMContextMiddleware(MemoryStorage(), ReleasableEventIsolation())
+    dispatcher.update.outer_middleware(fsm)
+    for observer in (dispatcher.message, dispatcher.callback_query):
+        observer.middleware(SelectiveIsolationMiddleware())
+        observer.middleware(Selection())
+    dispatcher.include_router(router())
+    message = make_message(bot, text="/reactions", message_thread_id=17, is_topic_message=True)
+    state = fsm.resolve_context(bot, message.chat.id, 42, thread_id=17)
+    await state.set_state("ProgStates:stdin")
+    if callback:
+        event = Update(
+            update_id=1,
+            callback_query=CallbackQuery(
+                id="synthetic",
+                chat_instance="synthetic",
+                from_user=User(id=42, is_bot=False, first_name="Synthetic"),
+                message=message,
+                data=ReactionCallback(view="getters", days=30).pack(),
+            ),
+        )
+    else:
+        event = Update(update_id=1, message=message)
+    try:
+        handler, _ = await asyncio.create_task(dispatcher.feed_update(bot, event))
+        assert handler.callback.__qualname__ == ("process_expired_callback" if callback else "ProgCompiler.process_stdin_run")
+        assert await state.get_state() == "ProgStates:stdin"
+        assert bot.session.methods == []
+    finally:
+        await fsm.close()
+        await dispatcher.fsm.close()
+        await bot.session.close()
 
 
 @pytest.mark.parametrize(

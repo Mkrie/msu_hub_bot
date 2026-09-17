@@ -565,3 +565,91 @@ async def test_close_during_auth_cannot_restore_credentials(configured):
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         await repo.close()
+
+
+def reaction_scoreboard(**changes):
+    return {
+        "days": 30,
+        "getters": [],
+        "givers": [],
+        "emoji": [],
+        "posts": [],
+        "summary": {
+            "points": 0,
+            "reactions": 0,
+            "givers": 0,
+            "getters": 0,
+            "messages": 0,
+            "anonymous": 0,
+            "paid": 0,
+            "unattributed": 0,
+            "channel_reactions": 0,
+        },
+        **changes,
+    }
+
+
+async def test_reaction_scoreboard_sends_scoped_bounded_arguments_and_decodes(configured):
+    response = reaction_scoreboard(
+        days=7,
+        getters=[{"user_id": 101, "first_name": "Друг", "score": 3, "people": 2, "messages": 2}],
+        posts=[{"message_id": 42, "thread_id": 7, "author_id": 101, "score": 2, "people": 2}],
+        emoji=[{"key": "c:9876543210987654321", "count": 2}],
+    )
+    repo, session = configured([Response(token()), Response(response)])
+    try:
+        result = await repo.reaction_scoreboard(-100, days=7, limit=5)
+        assert result.days == 7 and result.getters[0].user_id == 101
+        assert result.posts[0].thread_id == 7
+        assert result.emoji[0].key == "c:9876543210987654321"
+        assert session.calls[-1][0].endswith("/rest/v1/rpc/reaction_scoreboard_v1")
+        assert session.calls[-1][1]["json"] == {"p_chat_id": -100, "p_days": 7, "p_limit": 5}
+    finally:
+        await repo.close()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"chat_id": 0},
+        {"chat_id": True},
+        {"chat_id": 2**63},
+        {"chat_id": "-100"},
+        {"days": 2},
+        {"days": True},
+        {"days": 31},
+        {"limit": 0},
+        {"limit": 11},
+        {"limit": True},
+    ],
+)
+async def test_reaction_scoreboard_rejects_invalid_arguments_before_auth(configured, arguments):
+    repo, session = configured([])
+    try:
+        with pytest.raises(ValueError):
+            await repo.reaction_scoreboard(**({"chat_id": -100} | arguments))
+        assert not session.calls
+    finally:
+        await repo.close()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"days": 2},
+        {"days": True},
+        {"days": 1.0},
+        {"getters": [{}]},
+        {"summary": {"points": -1}},
+        {"posts": [{"message_id": "42"}]},
+        {"emoji": [{"key": "e:❤", "count": True}]},
+        {"givers": [{"user_id": 1, "first_name": "Друг", "score": 1, "people": 1, "messages": 1}] * 11},
+    ],
+)
+async def test_reaction_scoreboard_rejects_malformed_or_unbounded_responses(configured, changes):
+    repo, _ = configured([Response(token()), Response(reaction_scoreboard(**changes))])
+    try:
+        with pytest.raises(module.RepositoryProtocolError):
+            await repo.reaction_scoreboard(-100)
+    finally:
+        await repo.close()

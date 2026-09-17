@@ -363,7 +363,7 @@ FROM pg_control_system();
         if result != {
             "database": self.config["expected_database"],
             "cluster": self.config["expected_system_identifier"],
-            "version": self.config.get("expected_schema_version", 3),
+            "version": self.config.get("expected_schema_version", 4),
             "principal": True,
         }:
             raise MigrationError("target_identity_mismatch")
