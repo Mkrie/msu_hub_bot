@@ -63,6 +63,7 @@ def is_added_route(handler):
         "Chess.process",
         "Chess.top",
         "Chess.process_cb",
+        "process_meme",
     }
 
 
@@ -71,7 +72,7 @@ def test_every_route_preserves_order_and_aliases():
     counts = Counter(route["event"] for route in CONTRACT["routes"])
     for kind, count in counts.items():
         actual = routes(root, "error" if kind == "errors" else kind)
-        extra = {"message": 3, "edited_message": 1, "callback_query": 1}.get(kind, 0)
+        extra = {"message": 4, "edited_message": 1, "callback_query": 1}.get(kind, 0)
         assert len(actual) == count + extra
         retained = [handler for handler in actual if not is_added_route(handler)]
         expected = [route for route in CONTRACT["routes"] if route["event"] == kind]
@@ -169,6 +170,42 @@ async def test_chess_commands_select_real_routes_with_case_and_mentions(chess_se
         assert handler.callback.__qualname__ == expected
         assert handler.flags["handler_key"] == expected
         assert meta is not None
+    assert bot.session.methods == []
+
+
+@pytest.mark.parametrize(
+    ("body", "expected", "expected_text"),
+    [
+        ("/meme кот", "process_meme", "кот"),
+        ("/MEME@CONTRACT_BOT кот", "process_meme", "кот"),
+        ("кот #meme", "process_meme", "кот"),
+        ("/meme@another_bot кот", None, None),
+        ("/lobster кот", "process_lobster", "кот"),
+        ("/л кот", "process_lobster", "кот"),
+        ("кот #l", "process_lobster", "кот"),
+        ("/demotivator кот", "process_demotivator", "кот"),
+        ("/де кот", "process_demotivator", "кот"),
+        ("кот #de", "process_demotivator", "кот"),
+    ],
+)
+@pytest.mark.parametrize("caption", [False, True])
+async def test_caption_styles_select_real_routes_in_text_and_media_captions(
+    chess_selection_dispatcher, body, expected, expected_text, caption
+):
+    bot, dispatcher = chess_selection_dispatcher
+    fields = (
+        {"caption": body, "video": {"file_id": "video", "file_unique_id": "v", "width": 320, "height": 240, "duration": 1}}
+        if caption
+        else {"text": body}
+    )
+    result = await asyncio.create_task(dispatcher.feed_update(bot, Update(update_id=1, message=make_message(bot, **fields))))
+    if expected is None:
+        assert result is UNHANDLED
+    else:
+        handler, meta = result
+        assert handler.flags["handler_key"] == expected
+        assert handler.callback.__qualname__ == expected
+        assert meta.text == expected_text
     assert bot.session.methods == []
 
 

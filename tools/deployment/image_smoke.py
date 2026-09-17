@@ -14,6 +14,7 @@ import struct
 import subprocess
 import tempfile
 import wave
+from contextlib import closing
 from pathlib import Path
 
 
@@ -87,8 +88,14 @@ def check_media(audio):
             "lavfi",
             "-i",
             "testsrc=size=160x96:rate=10:duration=0.4",
+            "-i",
+            str(wav),
+            "-t",
+            "0.4",
             "-c:v",
             "mjpeg",
+            "-c:a",
+            "pcm_s16le",
             "-threads",
             "1",
             str(video),
@@ -99,6 +106,65 @@ def check_media(audio):
             assert decoded.format == "JPEG" and decoded.size == (160, 96)
         converted = prepare_video(video.read_bytes())
         assert converted.kind == "video" and converted.payload and not converted.trimmed
+        check_captions(payload, video.read_bytes())
+
+
+def check_captions(image_payload, video_payload):
+    from PIL import Image, ImageFont
+
+    from msu_hub_bot.media.caption_layout import caption_image
+    from msu_hub_bot.media.caption_video import caption_video
+    from msu_hub_bot.resources import meme_font
+
+    assert ImageFont.truetype(str(meme_font), 24).getbbox("Привет, Ёж!"), "Meme font is missing from the image"
+    text = 'Ёж: "всё нормально" [100%] \\ путь.\n' * 48
+    with tempfile.TemporaryDirectory(prefix="hub-caption-smoke-") as directory:
+        for style in ("lobster", "demotivator", "meme"):
+            with io.BytesIO(image_payload) as source, closing(caption_image(source, text, style)) as image:
+                assert image.getbbox() is not None, f"{style} image is empty"
+                assert image.width >= 320 and image.height >= 240
+            with io.BytesIO(video_payload) as source:
+                converted = caption_video(source, text, style)
+            assert converted is not None, f"{style} video failed"
+            output = Path(directory) / f"{style}.mp4"
+            with converted:
+                output.write_bytes(converted.getvalue())
+            probe = json.loads(
+                subprocess.run(
+                    ["ffprobe", "-v", "error", "-count_frames", "-show_streams", "-of", "json", str(output)],
+                    check=True,
+                    capture_output=True,
+                    timeout=30,
+                ).stdout
+            )
+            video = next(stream for stream in probe["streams"] if stream["codec_type"] == "video")
+            assert video["codec_name"] == "h264" and int(video["nb_read_frames"]) == 4, f"{style} video lost frames"
+            assert any(stream["codec_name"] == "aac" for stream in probe["streams"]), f"{style} video lost audio"
+            assert video["width"] % 2 == video["height"] % 2 == 0
+            final_frame = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-nostdin",
+                    "-v",
+                    "error",
+                    "-ss",
+                    "0.3",
+                    "-i",
+                    str(output),
+                    "-frames:v",
+                    "1",
+                    "-f",
+                    "image2pipe",
+                    "-vcodec",
+                    "png",
+                    "pipe:1",
+                ],
+                check=True,
+                capture_output=True,
+                timeout=30,
+            ).stdout
+            with Image.open(io.BytesIO(final_frame)) as frame:
+                assert frame.size == (video["width"], video["height"]), f"{style} final frame failed to decode"
 
 
 def check_sticker_animation_formats():
@@ -270,7 +336,7 @@ async def main():
         def count(event):
             return sum(len(router.observers[event].handlers) for router in app.dispatcher.chain_tail)
 
-        assert count("message") == 264
+        assert count("message") == 265
         assert count("callback_query") == 20
         assert count("edited_message") == 149
         from PIL import ImageFont
@@ -291,7 +357,9 @@ async def main():
         assert await asyncio.to_thread(sed_calc, "Привет, кот!", ["s/кот/бот/"]) == "Привет, бот!"
     finally:
         await app.close()
-    print("Linux image: fingerprint, OCR, camera, Opus/VP9/WebP/TGS, chess PNG, Deno/EJS, resources, worker, handlers, and shutdown passed")
+    print(
+        "Linux image: fingerprint, OCR, camera, image/video captions, Opus/VP9/WebP/TGS, chess PNG, Deno/EJS, resources, worker, handlers, and shutdown passed"
+    )
 
 
 if __name__ == "__main__":

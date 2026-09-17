@@ -56,7 +56,7 @@ from msu_hub_bot.commands.infra import (
 from msu_hub_bot.commands.latex import Latex
 from msu_hub_bot.commands.likes import Like
 from msu_hub_bot.commands.lingvanex import process_langs, process_translate, process_en, process_ru
-from msu_hub_bot.commands.lobster import process_lobster, process_demotivator, process_atmta, process_atmta_v
+from msu_hub_bot.commands.lobster import process_lobster, process_demotivator, process_meme, process_atmta, process_atmta_v
 from msu_hub_bot.commands.location import process_location
 from msu_hub_bot.commands.minecraft import MinecraftStatus
 from msu_hub_bot.commands.other import (
@@ -376,6 +376,12 @@ def build_router(*, wit: Wit, wolfram: WolframAPI, config: Settings) -> Router:
         MetaCommand("demotivator", "de", "д", "де"),
         StateFilter(None),
         flags={"handler_key": "process_demotivator", "fsm_release": True},
+    )
+    group("lobster").message.register(
+        process_meme,
+        MetaCommand("meme"),
+        StateFilter(None),
+        flags={"handler_key": "process_meme", "fsm_release": True},
     )
     group("lobster").message.register(
         process_atmta,

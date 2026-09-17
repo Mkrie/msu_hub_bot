@@ -46,6 +46,29 @@ in [sticker delivery](sticker-delivery.md). Native tools and Pillow can allocate
 beyond simple input estimates, so [container resource limits](deployment.md#resource-budget)
 provide the final boundary.
 
+## Captions
+
+`/l` overlays Lobster lettering, `/de` puts a centered caption below a black
+demotivator frame, and `/meme` puts black sans-serif text in a white panel above
+the media. Supply text with the command and attach an image/video, or reply to
+one. Explicitly attached media takes precedence over media in the replied-to
+message; the existing profile-photo fallback remains available.
+
+The three styles share measured text layout for images and videos. Captions
+wrap and shrink to fit instead of imposing a separate character limit or
+truncating text. Paragraph breaks are retained; repeated blank lines are
+compacted. Panel captions grow within the canvas budget before shrinking, and
+visible glyph bounds determine centering. Very long text necessarily becomes
+small. Source images are oriented and scaled to at most 1600 pixels per side;
+extreme aspect ratios receive padding.
+
+Video captions use a rendered PNG overlay rather than interpolating text into
+FFmpeg syntax. Output uses H.264/AAC MP4 with even dimensions and fast-start
+metadata, retaining the source timeline, variable frame timestamps and optional
+audio. Source rotation and sample aspect ratio determine display geometry.
+The same download, native execution and output limits above apply; clips are
+never deliberately shortened to fit.
+
 Worker telemetry separates queue delay, preparation, awaited execution and
 actual completion. Late completion exports aggregate measurements without
 request content. Admission and input-limit rejections are expected outcomes,

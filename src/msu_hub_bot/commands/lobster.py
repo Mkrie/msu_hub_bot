@@ -1,155 +1,83 @@
+"""Image and video captions with shared media selection and delivery."""
+
 import io
+from collections.abc import Callable
 from contextlib import closing
-from pathlib import Path
-from tempfile import TemporaryDirectory
 
 from PIL import Image
 from aiogram.enums import ChatAction, ChatType
 from aiogram.types import Message
 
 from msu_hub_bot.execution.executor import TPExecutor
+from msu_hub_bot.media.caption_layout import CaptionLayoutError, CaptionStyle, caption_image
+from msu_hub_bot.media.caption_video import caption_video
 from msu_hub_bot.telegram.chat_actioner import ChatActioner
+from msu_hub_bot.telegram.extraction import Extractor, SimpleExtractor
 from msu_hub_bot.telegram.filters import MetaInfo
-from msu_hub_bot.telegram.files import input_file
+from msu_hub_bot.telegram.files import DownloadableMedia, input_file
 from msu_hub_bot.telegram.keyboards import rate_keyboard
 from msu_hub_bot.telegram.media_jobs import DownloadUnavailable, run_downloaded
-from msu_hub_bot.utils import image_bytes_io, megabytes
-from msu_hub_bot.media.caption_layout import (
-    CaptionLayoutError,
-    demotivator_caption,
-    demotivator_image,
-    frame_border,
-    lobster_image,
-    MAX_IMAGE_SIDE,
-)
-from msu_hub_bot.media.ffmpeg import ffmpeg
+from msu_hub_bot.utils import image_bytes_io
+
+
+async def _caption_media(meta: MetaInfo) -> tuple[Message, DownloadableMedia | None, bool]:
+    # Prefer explicitly attached media over a different media type in the reply.
+    for target in Extractor.targets(meta.message, Extractor.ReplyPolicy.prefer_origin):
+        if video := await SimpleExtractor.video(target):
+            return target, video, True
+        if target.document and (target.document.mime_type or "").startswith("video/"):
+            return target, target.document, True
+        if image := await SimpleExtractor.image(target):
+            return target, image, False
+    target, image = await meta.extract_image(with_profile_photo=True)
+    return target, image, False
+
+
+async def _process_caption(message: Message, meta: MetaInfo, cpu_executor: TPExecutor, style: CaptionStyle) -> Message | bool:
+    _, text = meta.extract_text()
+    if not text:
+        return True
+    target, file, is_video = await _caption_media(meta)
+    if file is None:
+        return True
+
+    renderer: Callable[[io.BytesIO, str, CaptionStyle], Image.Image | io.BytesIO | None]
+    renderer = caption_video if is_video else caption_image
+    action = ChatAction.UPLOAD_VIDEO if is_video else ChatAction.UPLOAD_PHOTO
+    async with ChatActioner(message, action):
+        try:
+            result, timeouted = await run_downloaded(cpu_executor, file, renderer, text, style, bot=message.bot)
+        except DownloadUnavailable:
+            return await message.reply("🤷🏻‍♂️ Не удалось скачать файл. Попробуй прислать его ещё раз.")
+        except CaptionLayoutError as exc:
+            return await message.reply(str(exc))
+        if timeouted:
+            if result is not None:
+                result.close()
+            return await message.reply("🤷🏻‍♂️ Обработка заняла слишком много времени. Попробуй файл поменьше.")
+        if result is None:
+            return await message.reply("🤷🏻‍♂️ Не удалось обработать видео" if is_video else "🤷🏻‍♂️ Не удалось обработать картинку")
+
+        keyboard = rate_keyboard() if message.chat.type != ChatType.PRIVATE else None
+        if isinstance(result, io.BytesIO):
+            with result:
+                video = input_file(result, f"{style}.mp4")
+            return await target.reply_video(video, reply_markup=keyboard, supports_streaming=True)
+        with closing(result), image_bytes_io(result, ext="png") as output:
+            photo = input_file(output, f"{style}.png")
+        return await target.reply_photo(photo, reply_markup=keyboard)
 
 
 async def process_lobster(message: Message, meta: MetaInfo, cpu_executor: TPExecutor) -> Message | bool:
-    target, file = await meta.extract_image(with_profile_photo=True)
-    if file is None:
-        return True
-
-    _, text = meta.extract_text()
-    if not text:
-        return True
-
-    async with ChatActioner(message, ChatAction.UPLOAD_PHOTO):
-        try:
-            image, timeouted = await run_downloaded(cpu_executor, file, lobster_image, text, bot=message.bot)
-        except DownloadUnavailable:
-            return True
-        except CaptionLayoutError as exc:
-            return await message.reply(str(exc))
-        if timeouted:
-            return await message.reply("🤷🏻‍♂️ Timeout")
-    if image is None:
-        return await message.reply("🤷🏻‍♂️ Не удалось обработать картинку")
-    with closing(image), image_bytes_io(image, ext="png") as output:
-        photo = input_file(output, "image.png")
-
-    return await target.reply_photo(
-        photo,
-        reply_markup=rate_keyboard() if message.chat.type != ChatType.PRIVATE else None,
-    )
+    return await _process_caption(message, meta, cpu_executor, "lobster")
 
 
 async def process_demotivator(message: Message, meta: MetaInfo, cpu_executor: TPExecutor) -> Message | bool:
-    _, video = await meta.extract_video()
-    if video:
-        return await process_demotivator_video(message, meta, cpu_executor)
-
-    target, file = await meta.extract_image(with_profile_photo=True)
-    if file is None:
-        return True
-
-    _, text = meta.extract_text()
-    if not text:
-        return True
-
-    async with ChatActioner(message, ChatAction.UPLOAD_PHOTO):
-        try:
-            image, timeouted = await run_downloaded(cpu_executor, file, demotivator_image, text, bot=message.bot)
-        except DownloadUnavailable:
-            return True
-        except CaptionLayoutError as exc:
-            return await message.reply(str(exc))
-        if timeouted:
-            return await message.reply("🤷🏻‍♂️ Timeout")
-    if image is None:
-        return await message.reply("🤷🏻‍♂️ Не удалось обработать картинку")
-    with closing(image), image_bytes_io(image, ext="png") as output:
-        photo = input_file(output, "image.png")
-
-    return await target.reply_photo(
-        photo,
-        reply_markup=rate_keyboard() if message.chat.type != ChatType.PRIVATE else None,
-    )
+    return await _process_caption(message, meta, cpu_executor, "demotivator")
 
 
-def demotivator_video(file: io.BytesIO, width: int, text: str) -> io.BytesIO | None:
-    width = max(320, min(MAX_IMAGE_SIDE, int(width or 384)))
-    width -= width % 2
-    border = frame_border(width)
-    frame_width = width + 12 + border * 2
-    caption = demotivator_caption(frame_width, text, border)
-    with TemporaryDirectory(prefix="hub-caption-") as directory:
-        path = Path(directory) / "caption.png"
-        caption.save(path)
-        filters = (
-            f"[0:v]scale=w='max(2,trunc(min({width},{MAX_IMAGE_SIDE}*dar)/2)*2)':"
-            f"h='max(2,trunc(min({MAX_IMAGE_SIDE},{width}/dar)/2)*2)',setsar=1,"
-            "pad=iw+6:ih+6:3:3:black,pad=iw+6:ih+6:3:3:white,"
-            f"pad={frame_width}:ih+{border * 2 + caption.height}:(ow-iw)/2:{border}:black[frame];"
-            "[frame][1:v]overlay=0:H-h:format=auto[out]"
-        )
-        parameters = [
-            "-i",
-            str(path),
-            "-filter_complex",
-            filters,
-            "-map",
-            "[out]",
-            "-map",
-            "0:a?",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-movflags",
-            "+faststart",
-            "-f",
-            "mp4",
-        ]
-        return ffmpeg(file, parameters=parameters, out_suffix=".mp4")
-
-
-async def process_demotivator_video(message: Message, meta: MetaInfo, cpu_executor: TPExecutor) -> Message | bool:
-    target, file = await meta.extract_video()
-    if file is None:
-        return True
-    if (getattr(file, "file_size", None) or 0) > megabytes(20):
-        return await message.reply("🤷🏻‍♂️ Файл больше 20 Мб, не смогу скачать")
-    _, text = meta.extract_text()
-    if not text:
-        return True
-
-    try:
-        video, timeouted = await run_downloaded(cpu_executor, file, demotivator_video, getattr(file, "width", 384), text, bot=message.bot)
-    except DownloadUnavailable:
-        return await message.reply("🤷🏻‍♂️ Что-то пошло не так")
-    except CaptionLayoutError as exc:
-        return await message.reply(str(exc))
-    if timeouted:
-        return await message.reply("🤷🏻‍♂️ Timeout")
-    if video is None:
-        return await message.reply("🤷🏻‍♂️ Что-то пошло не так")
-
-    return await target.reply_video(
-        input_file(video, "demotivator.mp4"), reply_markup=rate_keyboard() if message.chat.type != ChatType.PRIVATE else None
-    )
+async def process_meme(message: Message, meta: MetaInfo, cpu_executor: TPExecutor) -> Message | bool:
+    return await _process_caption(message, meta, cpu_executor, "meme")
 
 
 async def process_atmta(message: Message, meta: MetaInfo) -> Message | bool:
