@@ -172,6 +172,7 @@ files = [
     "src/msu_hub_bot/events.py",
     "src/msu_hub_bot/routing.py",
     "src/msu_hub_bot/media/caption_layout.py",
+    "src/msu_hub_bot/media/caption_video.py",
     "src/msu_hub_bot/media/ffmpeg.py",
     "src/msu_hub_bot/media/limits.py",
     "src/msu_hub_bot/providers/jdoodle.py",
