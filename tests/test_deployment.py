@@ -209,6 +209,16 @@ def test_compose_only_manages_the_bot_and_literal_configuration(tmp_path):
     assert document["services"]["bot"]["pull_policy"] == "never"
 
 
+def test_generated_release_bounds_cpu_memory_processes_and_temporary_storage(tmp_path):
+    bot = deployment.compose_document(payload()["image"], tmp_path / "runtime.env")["services"]["bot"]
+    assert bot["cpus"] == 3.0
+    assert bot["mem_limit"] == bot["memswap_limit"] == "4g"
+    assert bot["pids_limit"] == 128
+    assert bot["init"] is True
+    assert bot["read_only"] is True
+    assert set(bot["tmpfs"]) == {"/tmp:mode=1777,size=512m", "/work:mode=1777,size=512m"}
+
+
 def test_failed_supabase_cutover_never_resumes_a_retired_database_writer(tmp_path):
     class Fake(deployment.Deployer):
         def __init__(self):

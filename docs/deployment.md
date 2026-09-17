@@ -25,6 +25,61 @@ administrator SSH connection; the restricted CI key cannot upload executable
 scripts or run arbitrary commands. Keep the deployment directory and SSH files
 private to their owner.
 
+### Updating the host wrapper
+
+Actions transfers images and configuration; it does not update `deploy.py`.
+For a wrapper change, use the administrator connection and wait for deployment
+and rollback jobs to finish. Upload the reviewed file beside the installed
+wrapper with owner-only permissions, check its SHA-256 against the reviewed
+source, and check its syntax with the host's Python. Under an exclusive lock on
+`~/msu_hub_bot/deployment.lock`, retain a private copy of the installed wrapper
+and atomically replace it with the checked file. Verify the installed checksum
+before releasing the lock. Preserve the existing restricted SSH command.
+
+Installing a wrapper does not alter running containers or saved releases.
+Resource changes take effect when the wrapper generates a new release's Compose
+file; rollback continues to use the preceding release's saved configuration.
+Restore the saved wrapper under the same lock if the wrapper itself needs recovery.
+
+### Resource budget
+
+The generated service configuration bounds both preflight and the bot:
+
+| Resource | Ceiling |
+| --- | --- |
+| CPU | 3 CPU equivalents |
+| Memory | 4 GiB, including temporary files; swap disabled |
+| Processes and native threads | 128 |
+| `/tmp` | 512 MiB |
+| `/work` | 512 MiB |
+
+These ceilings leave capacity for other applications on a shared host with six
+CPUs and 16 GiB of RAM. Three concurrent media jobs must fit inside the bot's
+budget; input, decoded-media and admission limits provide the earlier user-facing
+rejections. Container limits are the final boundary, not a substitute for those
+checks. Docker's init process forwards shutdown signals and reaps orphaned
+children. Both temporary filesystems count toward the memory ceiling and disappear
+on container removal. Media intermediates, runtime caches and local logs use
+`/tmp`; the warning log retains a 10 MiB current file and two backups, preserving
+`/logs` within a 30 MiB total. The working directory remains independently bounded.
+
+Before changing ceilings, stage the reviewed image in a uniquely named disposable
+container with networking disabled, no runtime credentials, and an explicit
+Python entrypoint instead of the bot. Apply the generated service's limits and
+read-only filesystem. Exercise three concurrent representative conversions,
+near-limit images/video, OCR and animation, then bounded PID and temporary-storage
+saturation with cleanup. Record durations, cgroup `memory.peak`, `memory.events`,
+`pids.peak`, `pids.events` and CPU throttling privately. Normal conversions must
+succeed without OOM or PID-limit events; intentional saturation must reject work
+and recover. Repeat on the target architecture before rollout.
+
+Validate the normalized Compose configuration, then inspect the created
+container's `HostConfig.NanoCpus`, `Memory`, `MemorySwap`, `PidsLimit`, `Init` and
+`Tmpfs`. After deployment, verify those fields again alongside health, restart
+count and polling progress. See Docker's
+[service configuration](https://docs.docker.com/reference/compose-file/services/)
+and [tmpfs accounting](https://docs.docker.com/engine/storage/tmpfs/).
+
 ## GitHub configuration
 
 Create a `production` environment permitting deployments from `main` only.
