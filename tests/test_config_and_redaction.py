@@ -172,6 +172,40 @@ def test_local_logger_preserves_levels_and_redacts_both_outputs(monkeypatch, tmp
             handler.close()
 
 
+def test_cli_file_logs_rotate_without_losing_redaction(monkeypatch, tmp_path):
+    from logging.handlers import RotatingFileHandler
+
+    from msu_hub_bot.cli import configure_logging
+
+    secret = "synthetic-rotation-secret"
+    monkeypatch.setattr(settings, "redis_password", secret)
+    monkeypatch.setattr(settings, "logs_file", str(tmp_path / "bot.log"))
+    monkeypatch.setattr(LoggerBuilder, "default_filename", None)
+    monkeypatch.setattr("msu_hub_bot.redaction.install_redaction", lambda: None)
+    captured = {}
+    monkeypatch.setattr(logging, "basicConfig", lambda **kwargs: captured.update(kwargs))
+    loggers = [(logging.getLogger(name), logging.getLogger(name).level) for name in ("aiogram.event", "aiogram.dispatcher")]
+    try:
+        configure_logging()
+        handler = next(handler for handler in captured["handlers"] if isinstance(handler, RotatingFileHandler))
+        assert handler.maxBytes == 10 * 1024 * 1024 and handler.backupCount == 2
+        handler.maxBytes = 256
+        for index in range(20):
+            handler.handle(logging.LogRecord("rotation", logging.WARNING, __file__, 1, "%s %s", (index, secret), None))
+        handler.flush()
+        files = list(tmp_path.glob("bot.log*"))
+        assert len(files) == 3
+        for path in files:
+            text = path.read_text()
+            assert secret not in text and "[REDACTED]" in text
+        assert LoggerBuilder.default_filename == str(tmp_path / "bot.log")
+    finally:
+        for handler in captured.get("handlers", []):
+            handler.close()
+        for logger, level in loggers:
+            logger.setLevel(level)
+
+
 def test_example_and_deployment_cover_current_settings():
     root = Path(__file__).resolve().parents[1]
     configured = {"HUB_" + name.upper() for name in Settings.model_fields}

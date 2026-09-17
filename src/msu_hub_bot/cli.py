@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 
@@ -21,7 +22,7 @@ def configure_logging() -> None:
     handlers: list[logging.Handler] = [console]
     if filename:
         Path(filename).parent.mkdir(parents=True, exist_ok=True)
-        file = logging.FileHandler(filename, encoding="utf-8")
+        file = RotatingFileHandler(filename, maxBytes=10 * 1024 * 1024, backupCount=2, encoding="utf-8")
         file.setLevel(logging.WARNING)
         file.setFormatter(formatter)
         handlers.append(file)
