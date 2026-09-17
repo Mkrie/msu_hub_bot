@@ -22,6 +22,11 @@ in memory; navigation is available for up to 24 hours within a bounded cache
 and ends on restart. The displayed result and saved daily scores remain.
 Lichess access is anonymous and subject to its shared request limits.
 
+`/reactions` shows the chat's reaction receivers, givers, popular posts and emoji
+over 24 hours, seven days or thirty days. The bot needs administrator rights to
+collect new reactions; reaction state expires after thirty days. See
+[reaction scores and coverage](docs/reactions.md).
+
 ## Development
 
 Use Python 3.14 and uv 0.12.15 or newer. Native development works on macOS; the
