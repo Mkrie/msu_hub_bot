@@ -3,13 +3,17 @@ import json
 import logging
 import os
 import re
+import sys
+import traceback
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 from urllib.parse import quote
 
 import pytest
 
 from msu_hub_bot.logger import LoggerBuilder
-from msu_hub_bot.redaction import RedactingFormatter, RedactingStream, _strings, redact, redact_json
+from msu_hub_bot.redaction import RedactingFormatter, redact, redact_json
 from msu_hub_bot.settings import MissingIntegration, Settings, load_runtime_environment, settings
 
 
@@ -21,7 +25,8 @@ def test_required_configuration_and_optional_providers(monkeypatch):
         config.validate_core()
     with pytest.raises(MissingIntegration):
         config.require("wolfram_token")
-    assert "values='<redacted>'" in repr(config)
+    assert "name='hub'" in repr(config)
+    assert "bot_token=" not in repr(config)
 
 
 def supabase_settings(**changes):
@@ -70,15 +75,13 @@ def test_supabase_configuration_rejects_unsafe_endpoints_without_values(changes)
 
 
 def test_supabase_credentials_are_redacted(monkeypatch):
-    for field in ("supabase_key", "supabase_password", "supabase_email"):
+    for field in ("supabase_key", "supabase_password"):
         value = "supabase-private-" + field
         monkeypatch.setattr(settings, field, value)
         assert value not in redact(value)
 
 
 def test_repository_factory_passes_configuration_and_telemetry(monkeypatch):
-    from unittest.mock import Mock
-
     from msu_hub_bot.storage import factory
 
     repository = Mock()
@@ -117,18 +120,12 @@ def test_json_collections_and_deployment_roundtrip(monkeypatch):
         monkeypatch.delenv(key)
 
 
-def test_redacts_logs_tracebacks_and_streams(monkeypatch):
+def test_redacts_logs_and_tracebacks(monkeypatch):
     secret = 'canary-value-$"/with-newline\nsecond-canary-line'
     monkeypatch.setattr(settings, "supabase_password", secret)
     assert secret not in redact(secret)
     assert quote(secret, safe="") not in redact(quote(secret, safe=""))
     assert json.dumps(secret)[1:-1] not in redact(json.dumps(secret)[1:-1])
-    stream = io.StringIO()
-    writer = RedactingStream(stream)
-    writer.write(secret[:12])
-    writer.write(secret[12:] + "\n")
-    writer.flush()
-    assert "canary-value" not in stream.getvalue()
     error = RuntimeError(secret)
     record = logging.LogRecord("test", logging.ERROR, __file__, 1, "%s", (secret,), (RuntimeError, error, None))
     rendered = RedactingFormatter().format(record)
@@ -153,15 +150,78 @@ def test_configured_telegram_ids_remain_visible_in_logs_while_credentials_stay_h
     assert redact(value) == expected
     record = logging.LogRecord("test", logging.ERROR, __file__, 1, value, (), None)
     assert RedactingFormatter().format(record) == expected
-    stream = io.StringIO()
-    writer = RedactingStream(stream)
-    writer.write(value + "\n")
-    writer.flush()
-    assert stream.getvalue() == expected + "\n"
 
 
-def test_numeric_credentials_are_still_sensitive():
-    assert list(_strings({"owner_id": 123456789, "api_key": 123, "nested": {"password": 987654321}})) == ["123", "987654321"]
+def test_ordinary_configuration_is_visible_in_repr_and_diagnostics(monkeypatch):
+    public_values = {
+        "name": "friends-bot-name",
+        "supabase_url": "https://database.example.invalid",
+        "supabase_email": "bot@example.invalid",
+        "supabase_schema": "friends_bot_api",
+        "logs_file": "/runtime/bot-logs/{name}.log",
+        "cert": "/runtime/tls/public-cert.pem",
+        "web_app_url": "https://app.example.invalid",
+        "acrcloud_host": "identify.example.invalid",
+        "supporters_base": "contributors-base",
+        "supporters_table": "contributors-table",
+    }
+    for field, value in public_values.items():
+        monkeypatch.setattr(settings, field, value)
+    text = "\n".join(public_values.values())
+    assert redact(text) == text
+    config = Settings(**public_values, supabase_password="synthetic-password")
+    assert all(value in repr(config) for value in public_values.values())
+    assert "synthetic-password" not in repr(config)
+    assert "synthetic-password" not in str(config)
+    record = logging.LogRecord("test", logging.INFO, __file__, 1, "%s", (text,), None)
+    assert RedactingFormatter().format(record) == text
+    assert record.msg == "%s" and record.args == (text,)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "bot_token",
+        "supabase_key",
+        "supabase_password",
+        "proxy",
+        "pkey",
+        "health_check_url",
+        "vk_user_token",
+        "wolfram_token",
+        "lingvanex_authorization",
+        "lingvanex_image_authorization",
+        "imgur_authorization",
+        "owm_key",
+        "owm_map_key",
+        "mapbox_key",
+        "acrcloud_access_key",
+        "acrcloud_access_secret",
+        "supporters_api_key",
+    ],
+)
+def test_credential_fields_are_hidden_in_repr_and_diagnostics(monkeypatch, field):
+    value = "synthetic-value-for-" + field
+    monkeypatch.setattr(settings, field, value)
+    assert redact(value) == "[REDACTED]"
+    assert value not in repr(settings)
+    assert value not in str(settings)
+    assert settings.model_dump()[field] == value
+
+
+def test_nested_provider_credentials_and_proxy_password_are_protected(monkeypatch):
+    values = ["client-one", "secret-one", "token-one", "proxy-password"]
+    monkeypatch.setattr(settings, "jdoodle_tokens", [(values[0], values[1])])
+    monkeypatch.setattr(settings, "wit_tokens", [values[2]])
+    monkeypatch.setattr(settings, "proxy", f"socks5://proxy-user:{values[3]}@proxy.example.invalid:1080")
+    assert redact("\n".join(values)) == "\n".join(["[REDACTED]"] * len(values))
+    assert all(value not in repr(settings) for value in values)
+
+
+def test_recognized_unconfigured_credentials_are_still_protected():
+    token = "123456789:" + "a" * 35
+    assert token not in redact(f"https://api.telegram.org/bot{token}/getMe")
+    assert "secret-user:secret-password" not in redact("https://secret-user:secret-password@example.invalid/path")
 
 
 def test_structured_redaction_preserves_json_keys_numbers_and_credential_protection(monkeypatch):
@@ -216,12 +276,14 @@ def test_cli_file_logs_rotate_without_losing_redaction(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "supabase_password", secret)
     monkeypatch.setattr(settings, "logs_file", str(tmp_path / "bot.log"))
     monkeypatch.setattr(LoggerBuilder, "default_filename", None)
-    monkeypatch.setattr("msu_hub_bot.redaction.install_redaction", lambda: None)
     captured = {}
     monkeypatch.setattr(logging, "basicConfig", lambda **kwargs: captured.update(kwargs))
     loggers = [(logging.getLogger(name), logging.getLogger(name).level) for name in ("aiogram.event", "aiogram.dispatcher")]
+    stdout, stderr, factory = sys.stdout, sys.stderr, logging.getLogRecordFactory()
     try:
         configure_logging()
+        assert sys.stdout is stdout and sys.stderr is stderr
+        assert logging.getLogRecordFactory() is factory
         handler = next(handler for handler in captured["handlers"] if isinstance(handler, RotatingFileHandler))
         assert handler.maxBytes == 10 * 1024 * 1024 and handler.backupCount == 2
         handler.maxBytes = 256
@@ -241,6 +303,46 @@ def test_cli_file_logs_rotate_without_losing_redaction(monkeypatch, tmp_path):
             logger.setLevel(level)
 
 
+def test_cli_fatal_error_uses_credential_formatter_and_suppresses_raw_traceback(monkeypatch, tmp_path):
+    from msu_hub_bot import cli, health
+    from msu_hub_bot.telemetry import TelemetryConfig
+
+    secret = "synthetic-runtime-password"
+    token = "123456789:" + "a" * 35
+    monkeypatch.setattr(settings, "supabase_password", secret)
+    monkeypatch.setattr(settings, "bot_token", token)
+    monkeypatch.setattr(cli, "settings", supabase_settings())
+    monkeypatch.setattr(cli, "configure_logging", lambda: None)
+    monkeypatch.setattr(health, "heartbeat_path", lambda: tmp_path / "heartbeat")
+    monkeypatch.setattr(TelemetryConfig, "from_env", lambda environ: None)
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(RedactingFormatter())
+    logger = logging.Logger("cli-test")
+    logger.addHandler(handler)
+    shutdown = Mock()
+    monkeypatch.setattr(cli, "logging", SimpleNamespace(getLogger=lambda name: logger, shutdown=shutdown))
+
+    async def fail(*args, **kwargs):
+        try:
+            raise ValueError(f"https://api.telegram.org/bot{token}/getMe")
+        except ValueError as cause:
+            raise RuntimeError(secret) from cause
+
+    monkeypatch.setitem(sys.modules, "msu_hub_bot.app", SimpleNamespace(run=fail))
+    with pytest.raises(SystemExit) as caught:
+        cli.main()
+    assert caught.value.code == 1
+    assert caught.value.__suppress_context__
+    shutdown.assert_called_once_with()
+    output = stream.getvalue()
+    assert "Bot stopped unexpectedly" in output and "RuntimeError" in output and "ValueError" in output
+    assert secret not in output and token not in output and "[REDACTED]" in output
+    unhandled = "".join(traceback.format_exception(caught.value))
+    assert secret not in unhandled and token not in unhandled and "RuntimeError" not in unhandled
+    handler.close()
+
+
 def test_example_and_deployment_cover_current_settings():
     root = Path(__file__).resolve().parents[1]
     configured = {"HUB_" + name.upper() for name in Settings.model_fields}
@@ -256,13 +358,6 @@ def test_project_write_token_is_redacted_outside_application_settings(monkeypatc
     monkeypatch.setenv("LOGFIRE_TOKEN", token)
     for rendered in (token, quote(token, safe=""), json.dumps(token)[1:-1], repr(token)[1:-1]):
         assert rendered not in redact(rendered)
-    stream = io.StringIO()
-    writer = RedactingStream(stream)
-    writer.write(token[:15])
-    writer.write(token[15:] + "\n")
-    writer.flush()
-    assert "synthetic-project-write" not in stream.getvalue()
-    assert "second-write-canary" not in stream.getvalue()
     error = RuntimeError(token)
     record = logging.LogRecord("test", logging.ERROR, __file__, 1, "%s", (token,), (RuntimeError, error, None))
     assert "synthetic-project-write" not in RedactingFormatter().format(record)

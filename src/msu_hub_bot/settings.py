@@ -1,7 +1,7 @@
 """Environment configuration with the legacy attribute interface.
 
-Values are deliberately excluded from representations. Optional providers are
-checked when used; importing modules never requires production credentials.
+Credential fields are excluded from representations and selected for diagnostic
+redaction. Optional providers are checked when used; imports need no credentials.
 """
 
 import json
@@ -48,19 +48,19 @@ class MissingIntegration(Exception):
 
 class Settings(BaseSettings):
     name: str = "hub"
-    bot_token: str = ""
+    bot_token: str = Field(default="", repr=False)
     storage_backend: Literal["supabase"] = "supabase"
     supabase_url: str = ""
-    supabase_key: str = ""
+    supabase_key: str = Field(default="", repr=False)
     supabase_email: str = ""
-    supabase_password: str = ""
+    supabase_password: str = Field(default="", repr=False)
     supabase_schema: str = "msu_hub_api"
     storage_contract: Literal["feature-state-v1"] = "feature-state-v1"
-    proxy: str = ""
+    proxy: str = Field(default="", repr=False)
     cert: str = ""
-    pkey: str = ""
+    pkey: str = Field(default="", repr=False)
     logs_file: str = ".local/logs/{name}.log"
-    health_check_url: str = ""
+    health_check_url: str = Field(default="", repr=False)
     web_app_url: str = ""
     web_port: int = Field(default=8081, ge=1, le=65535)
     dumps_chat_id: int = 0
@@ -79,27 +79,24 @@ class Settings(BaseSettings):
     posting_main_chat_id: int = 0
     vk_default_chat_id: int = 0
     tenet_sticker_owner_id: int = 0
-    vk_user_token: str = ""
-    wolfram_token: str = ""
-    wit_tokens: list[str] = Field(default_factory=list)
-    jdoodle_tokens: list[tuple[str, str]] = Field(default_factory=list)
-    lingvanex_authorization: str = ""
-    lingvanex_image_authorization: str = ""
-    imgur_authorization: str = ""
-    owm_key: str = ""
-    owm_map_key: str = ""
-    mapbox_key: str = ""
+    vk_user_token: str = Field(default="", repr=False)
+    wolfram_token: str = Field(default="", repr=False)
+    wit_tokens: list[str] = Field(default_factory=list, repr=False)
+    jdoodle_tokens: list[tuple[str, str]] = Field(default_factory=list, repr=False)
+    lingvanex_authorization: str = Field(default="", repr=False)
+    lingvanex_image_authorization: str = Field(default="", repr=False)
+    imgur_authorization: str = Field(default="", repr=False)
+    owm_key: str = Field(default="", repr=False)
+    owm_map_key: str = Field(default="", repr=False)
+    mapbox_key: str = Field(default="", repr=False)
     acrcloud_host: str = ""
-    acrcloud_access_key: str = ""
-    acrcloud_access_secret: str = ""
+    acrcloud_access_key: str = Field(default="", repr=False)
+    acrcloud_access_secret: str = Field(default="", repr=False)
     supporters_base: str = ""
     supporters_table: str = ""
-    supporters_api_key: str = ""
+    supporters_api_key: str = Field(default="", repr=False)
 
     model_config = SettingsConfigDict(env_prefix="HUB_", case_sensitive=False, extra="forbid", hide_input_in_errors=True)
-
-    def __repr_args__(self) -> list[tuple[str, str]]:
-        return [("values", "<redacted>")]
 
     def validate_core(self) -> None:
         database_fields = ("supabase_url", "supabase_key", "supabase_email", "supabase_password")

@@ -62,8 +62,9 @@ IDs and hidden credentials. Dumps that exceed Telegram's text limit arrive as a
 JSON file, preserving the complete message and valid JSON. `/echo` uses the same
 diagnostic output before copying the message.
 
-The owner-only `/logs` command and local logs preserve numeric Telegram IDs for
-correlation while redacting configured credentials, sensitive strings and tokens.
+The owner-only `/logs` command and local logs preserve Telegram IDs and ordinary
+configuration values while hiding credentials. See the [credential filtering
+boundary](observability.md#logs-and-failures) before adding settings or diagnostics.
 
 ## Scheduled operational alerts
 

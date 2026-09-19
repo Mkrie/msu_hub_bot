@@ -30,9 +30,6 @@ async def check() -> None:
 
 
 if __name__ == "__main__":
-    from msu_hub_bot.redaction import install_redaction
-
-    install_redaction()
     try:
         asyncio.run(check())
     except Exception:

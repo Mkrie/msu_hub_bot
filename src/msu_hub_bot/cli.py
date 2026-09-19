@@ -11,9 +11,8 @@ from msu_hub_bot.settings import settings
 
 def configure_logging() -> None:
     from msu_hub_bot.logger import LoggerBuilder
-    from msu_hub_bot.redaction import RedactingFormatter, install_redaction
+    from msu_hub_bot.redaction import RedactingFormatter
 
-    install_redaction()
     filename = settings.logs_file.format(name=settings.name)
     LoggerBuilder.set_defaults(filename)
     formatter = RedactingFormatter("[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s")
@@ -43,6 +42,9 @@ def main() -> None:
     heartbeat_path().unlink(missing_ok=True)
     try:
         asyncio.run(run(settings, telemetry_config=TelemetryConfig.from_env(os.environ)))
+    except Exception:
+        logging.getLogger(__name__).exception("Bot stopped unexpectedly")
+        raise SystemExit(1) from None
     finally:
         logging.shutdown()
 
