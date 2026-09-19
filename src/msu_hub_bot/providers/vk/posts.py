@@ -106,7 +106,7 @@ class VkPost:
 
     @property
     def body_text(self) -> str:
-        return self.repost.text if self.repost else self.text
+        return "\n\n".join(post.text.strip() for post in [self.post, *self.history] if post.text.strip())
 
     @property
     def url(self) -> str:
@@ -318,6 +318,6 @@ class VkPost:
             except ValidationError, ValueError, TypeError:
                 unsupported = True
         result = "\n\n".join(f"— {title}:\n" + "\n".join(lines) for title, lines in groups.items())
-        if unsupported or len(photos) + len(videos) > 10:
+        if unsupported or len(set(photos)) + len(set(videos)) > 10:
             result += "\n\n" + href(self.url, "Все вложения — в VK →")
         return result, photos, videos, previews

@@ -163,6 +163,14 @@ def test_media_combined_count_and_repeated_publication_are_stable():
     assert "Все вложения" in first[0]
 
 
+def test_repeated_media_does_not_claim_unique_attachments_are_missing():
+    photo = attachment("photo", {"sizes": [{"url": "https://sun9.userapi.com/image.jpg"}]})
+    parsed = parse_post(text="One image", attachments=[photo] * 11)
+    text, _, photos, videos = parsed.for_publish(with_webpreview=False)
+    assert photos == ["https://sun9.userapi.com/image.jpg"] and not videos
+    assert "Все вложения" not in text
+
+
 async def test_caption_budget_uses_utf16_not_python_character_count(monkeypatch):
     monkeypatch.setattr(publish, "settings", SimpleNamespace(vk_default_chat_id=-10))
     bot = SimpleNamespace(send_super_message=AsyncMock(), send_super_message_prefer_album=AsyncMock())

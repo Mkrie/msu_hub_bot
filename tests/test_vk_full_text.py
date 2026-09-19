@@ -32,7 +32,7 @@ def checked_chunks(html, **limits):
     return chunks
 
 
-@pytest.mark.parametrize("text", ["😀" * 10_000, "<&>" * 10_000, "Привет, мир!\n" * 1000])
+@pytest.mark.parametrize("text", ["😀" * 10_000, "<&>" * 10_000, "Привет, мир!\n" * 1000], ids=["emoji", "escaping", "paragraphs"])
 def test_long_text_is_complete_after_html_splitting(text):
     chunks = checked_chunks(escape(text))
     assert len(chunks) > 1
@@ -101,7 +101,9 @@ def test_paragraph_boundary_is_preferred_when_recent():
     assert check_html(chunks[0]).text == first
 
 
-@pytest.mark.parametrize("html", ["", " " * 20_000, "\n" * 20_000, href("https://vk.ru/id20", " \n " * 10_000)])
+@pytest.mark.parametrize(
+    "html", ["", " " * 20_000, "\n" * 20_000, href("https://vk.ru/id20", " \n " * 10_000)], ids=["empty", "spaces", "lines", "link"]
+)
 def test_empty_and_whitespace_only_text_never_produces_a_message(html):
     assert checked_chunks(html) == []
 
@@ -209,7 +211,7 @@ async def test_short_url_crossing_a_text_boundary_keeps_its_complete_target(deli
     assert any(target in check_html(method.text).text for method in messages)
 
 
-@pytest.mark.parametrize("text", ["Текст " * 2000, "😀" * 600, "<&>" * 1000])
+@pytest.mark.parametrize("text", ["Текст " * 2000, "😀" * 600, "<&>" * 1000], ids=["words", "emoji", "escaping"])
 async def test_default_destination_uses_full_text_and_media_when_caption_would_overflow(delivery, text):
     bot, session = delivery
     parsed = parse_post(text=text, attachments=[photo(1), photo(2)])
