@@ -13,6 +13,7 @@ export interface Community {
 export interface ChatValues {
   auto_speech_recognition: boolean;
   auto_video_links: boolean;
+  auto_x_previews: boolean;
   with_nsfw: boolean;
 }
 export interface ChatSettings {

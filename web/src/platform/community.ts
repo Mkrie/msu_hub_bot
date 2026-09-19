@@ -30,6 +30,7 @@ function settings(data: unknown): ChatSettings {
     values: {
       auto_speech_recognition: boolean(values.auto_speech_recognition),
       auto_video_links: boolean(values.auto_video_links),
+      auto_x_previews: boolean(values.auto_x_previews),
       with_nsfw: boolean(values.with_nsfw),
     },
   };

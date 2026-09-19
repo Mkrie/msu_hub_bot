@@ -31,6 +31,8 @@ _ATTEMPTS = 8
 class ChatPreferences(Payload):
     auto_speech_recognition: bool = True
     auto_video_links: bool = True
+    # Inherit the automatic-video preference when the X setting is absent.
+    auto_x_previews: bool = Field(default_factory=lambda data: data["auto_video_links"])
     with_nsfw: bool = False
 
 

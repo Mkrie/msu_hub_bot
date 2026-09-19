@@ -32,6 +32,7 @@ class SettingsChange(BaseModel):
     etag: UUID | None
     auto_speech_recognition: bool | None = None
     auto_video_links: bool | None = None
+    auto_x_previews: bool | None = None
     with_nsfw: bool | None = None
 
 
@@ -115,6 +116,7 @@ class CommunityAPI:
             "values": {
                 "auto_speech_recognition": value.auto_speech_recognition,
                 "auto_video_links": value.auto_video_links,
+                "auto_x_previews": value.auto_x_previews,
                 "with_nsfw": value.with_nsfw,
             },
         }
@@ -130,7 +132,7 @@ class CommunityAPI:
         if (row.etag if row else None) != (str(body.etag) if body.etag else None):
             raise Conflict()
         value = value.model_copy(deep=True)
-        for name in ("auto_speech_recognition", "auto_video_links", "with_nsfw"):
+        for name in ("auto_speech_recognition", "auto_video_links", "auto_x_previews", "with_nsfw"):
             if name in body.model_fields_set:
                 if (changed := getattr(body, name)) is None:
                     raise ValueError("Settings cannot be cleared")

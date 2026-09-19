@@ -89,7 +89,13 @@ def writes(backend):
 
 async def test_settings_seed_once_with_defaults_extras_and_explicit_forever():
     backend, documents, observed = setup(metadata={"settings": {"with_nsfw": True, "future": {"note": None}}})
-    expected = {"auto_speech_recognition": True, "auto_video_links": True, "with_nsfw": True, "future": {"note": None}}
+    expected = {
+        "auto_speech_recognition": True,
+        "auto_video_links": True,
+        "auto_x_previews": True,
+        "with_nsfw": True,
+        "future": {"note": None},
+    }
     assert await documents.load_settings(observed) == expected
     observed.metadata = {"settings": {"with_nsfw": None}}
     assert await documents.load_settings(observed) == expected
@@ -117,11 +123,23 @@ async def test_concurrent_settings_patches_preserve_each_others_fields_and_nulls
     assert await documents.load_settings(observed) == {
         "auto_speech_recognition": True,
         "auto_video_links": False,
+        "auto_x_previews": True,
         "with_nsfw": True,
         "future": {"keep": [1, None]},
         "other": None,
     }
     assert len(writes(backend)) > 4
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_x_previews_inherit_existing_choice_then_remain_independent(enabled):
+    backend, documents, observed = setup(metadata={"settings": {"auto_video_links": enabled}})
+    values = await documents.load_settings(observed)
+    assert values["auto_x_previews"] is enabled
+    await documents.patch_settings(-100, {"auto_video_links": not enabled})
+    assert (await documents.load_settings(observed))["auto_x_previews"] is enabled
+    await documents.patch_settings(-100, {"auto_x_previews": not enabled})
+    assert (await documents.load_settings(observed))["auto_x_previews"] is not enabled
 
 
 async def test_settings_patch_requires_observed_chat():

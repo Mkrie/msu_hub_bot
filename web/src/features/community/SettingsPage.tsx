@@ -23,6 +23,11 @@ const options: { key: keyof ChatValues; title: string; hint: string }[] = [
     hint: "Загружать поддерживаемые видео прямо в чат.",
   },
   {
+    key: "auto_x_previews",
+    title: "Раскрывать посты из X / Twitter",
+    hint: "Показывать текст, фото, видео и цитаты прямо в чате.",
+  },
+  {
     key: "with_nsfw",
     title: "Контент для взрослых",
     hint: "Разрешить команды с контентом 18+ в этом чате.",

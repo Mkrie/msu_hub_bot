@@ -172,6 +172,41 @@ it("does not request or expose repost management for non-admin members", () => {
   expect(screen.getByText("Для администраторов чата")).toBeVisible();
 });
 
+it("saves X previews independently from video previews", async () => {
+  const api = new CommunityApi("init");
+  const initial = {
+    etag: "settings-one",
+    values: {
+      auto_speech_recognition: true,
+      auto_video_links: false,
+      auto_x_previews: false,
+      with_nsfw: false,
+    },
+  };
+  vi.spyOn(api, "chatSettings").mockResolvedValue(initial);
+  const save = vi.spyOn(api, "saveChatSettings").mockResolvedValue({
+    etag: "settings-two",
+    values: { ...initial.values, auto_x_previews: true },
+  });
+  const user = userEvent.setup();
+  render(<SettingsPage api={api} community={community} onTimezone={vi.fn()} />);
+  await user.click(
+    await screen.findByRole("checkbox", { name: /Раскрывать посты из X/ }),
+  );
+  await user.click(
+    screen.getByRole("button", { name: "Сохранить настройки чата" }),
+  );
+  await waitFor(() =>
+    expect(save).toHaveBeenCalledWith(community.context.chat_id, {
+      etag: initial.etag,
+      values: { ...initial.values, auto_x_previews: true },
+    }),
+  );
+  expect(
+    screen.getByRole("checkbox", { name: /Подхватывать ссылки на видео/ }),
+  ).not.toBeChecked();
+});
+
 it("requires comparison before saving timezone over a stale revision", async () => {
   const api = new CommunityApi("init");
   const save = vi

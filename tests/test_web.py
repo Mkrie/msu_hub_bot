@@ -688,6 +688,26 @@ async def test_chat_settings_preserve_unowned_fields_and_require_exact_revision(
     assert (await collection.get(APPLICATION, "-123")).value.model_extra == {"future_setting": {"keep": True}}
 
 
+async def test_x_preview_setting_can_be_changed_independently(rig, monkeypatch):
+    from msu_hub_bot.storage.application import APPLICATION, ChatPreferences
+
+    launch = await _community_access(rig, monkeypatch)
+    collection = rig.server.community.documents.settings
+    tx = rig.reminders.store.transaction("settings", APPLICATION, operation_id=uuid4().hex)
+    tx.expect_absent("chats", "-123")
+    tx.put(collection, "-123", ChatPreferences(auto_video_links=False))
+    await tx.commit()
+    path = f"/api/chats/-123/settings?launch={launch}"
+    initial = await (await rig.api("GET", path)).json()
+    assert initial["values"]["auto_x_previews"] is False
+    response = await rig.api("PATCH", path, body={"etag": initial["etag"], "auto_x_previews": True})
+    assert response.status == 200
+    updated = await response.json()
+    assert updated["values"]["auto_x_previews"] is True
+    assert updated["values"]["auto_video_links"] is False
+    assert (await collection.get(APPLICATION, "-123")).value.auto_x_previews is True
+
+
 async def test_game_views_hide_live_answers_other_topics_and_unrelated_chat_players(rig, monkeypatch):
     from msu_hub_bot.games.models import Question, RoundState, Score
     from msu_hub_bot.storage.features import Scope

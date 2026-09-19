@@ -536,7 +536,13 @@ async def test_application_listings_page_beyond_rest_default_row_cap(configured)
 
 
 async def test_settings_first_contact_is_atomic_without_refreshing_stale_chat_fields(configured):
-    values = {"auto_speech_recognition": True, "auto_video_links": True, "with_nsfw": False, "future": {"keep": None}}
+    values = {
+        "auto_speech_recognition": True,
+        "auto_video_links": True,
+        "auto_x_previews": True,
+        "with_nsfw": False,
+        "future": {"keep": None},
+    }
     repo, session = configured(
         [
             Response(token()),
