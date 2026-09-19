@@ -89,7 +89,11 @@ async def test_explicit_vk_post_routes_both_domains_to_requested_chat(runtime, u
     await dispatcher.feed_update(bot, Update(update_id=1, message=message), vk_api=api)
     api.request.assert_any_await("wall.getById", posts="-10_6", extended=1, copy_history_depth=2)
     sent = [method for method in session.methods if isinstance(method, SendMessage)]
-    assert len(sent) == 1 and sent[0].chat_id == -20 and sent[0].text == "Synthetic public post"
+    assert (
+        len(sent) == 1
+        and sent[0].chat_id == -20
+        and sent[0].text == '<tg-emoji emoji-id="5278229754099540071">💙</tg-emoji> Synthetic public post'
+    )
 
 
 @pytest.mark.parametrize("host", ["vk.com", "www.vk.com", "m.vk.com", "vk.ru", "www.vk.ru", "m.vk.ru"])

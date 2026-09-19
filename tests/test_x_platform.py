@@ -14,7 +14,7 @@ from msu_hub_bot.providers.exceptions import BadRequestError
 from msu_hub_bot.providers.fxembed import FxPost
 from msu_hub_bot.providers.vk.api import VkApi
 from msu_hub_bot.telegram.filters import MetaCommand
-from msu_hub_bot.telegram.middlewares import viewer as module
+from msu_hub_bot.telegram.links import service as module
 from msu_hub_bot.telegram.middlewares.settings import Settings
 from msu_hub_bot.telegram.middlewares.telemetry import DispatchTelemetryMiddleware
 from msu_hub_bot.telegram.middlewares.viewer import ViewerMiddleware, preview_policy
@@ -31,7 +31,7 @@ async def runtime(monkeypatch):
     api = VkApi("synthetic-token")
     executor = SimpleNamespace(run=AsyncMock(return_value=(None, False)))
     viewer = ViewerMiddleware(bot, api, executor)
-    viewer.fxembed.get_post = AsyncMock(
+    viewer.links.fxembed.get_post = AsyncMock(
         return_value=FxPost.model_validate(
             {"id": "123", "text": "SYNTHETIC_PRIVATE_TEXT", "author": {"name": "Author", "screen_name": "example"}}
         )
@@ -53,21 +53,31 @@ def source(runtime, url="https://x.com/example/status/123", *, prefix="", **fiel
 
 
 @pytest.mark.parametrize(
-    "url", ["https://x.com/example/status/123", "twitter.com/example/status/123/video/1", "https://mobile.twitter.com/i/web/status/123"]
+    "url",
+    [
+        "https://x.com/example/status/123",
+        "twitter.com/example/status/123/video/1",
+        "https://mobile.twitter.com/i/web/status/123",
+        "fixupx.com/example/status/123/video/1",
+        "https://fxtwitter.com/example/status/123",
+        "https://www.xfixup.com/example/status/123",
+        "https://twittpr.com/example/status/123",
+    ],
 )
 @pytest.mark.parametrize("topic", [False, True])
 async def test_native_preview_preserves_source_reply_topic_and_trigger(runtime, url, topic):
     message = source(runtime, url, message_id=501, message_thread_id=99, is_topic_message=topic)
     await runtime.viewer.view(message, Settings())
-    link = runtime.viewer.fxembed.get_post.call_args.args[0]
+    link = runtime.viewer.links.fxembed.get_post.call_args.args[0]
     assert link.id == "123"
     runtime.publish.assert_awaited_once_with(
-        runtime.viewer.fxembed.get_post.return_value,
+        runtime.viewer.links.fxembed.get_post.return_value,
         runtime.bot,
         message.chat.id,
         501,
         message_thread_id=99 if topic else None,
         link=link,
+        telemetry=runtime.viewer.telemetry,
     )
     runtime.executor.run.assert_not_awaited()
     assert not runtime.session.methods
@@ -76,12 +86,11 @@ async def test_native_preview_preserves_source_reply_topic_and_trigger(runtime, 
 @pytest.mark.parametrize(
     "url",
     [
-        "fixupx.com/c_valenzuelab/status/2101124472661069980/video/1",
-        "https://fxtwitter.com/example/status/123",
         "https://i.fixupx.com/example/status/123/photo/1",
         "https://d.fxtwitter.com/example/status/123/video/2",
-        "https://xfixup.com/example/status/123",
-        "https://twittpr.com/example/status/123",
+        "https://dl.fixupx.com/example/status/123",
+        "https://m.fxtwitter.com/example/status/123",
+        "https://o.fixupx.com/example/status/123",
         "https://x.com/example",
         "https://twitter.com/search?q=cat",
         "https://x.com/i/spaces/123",
@@ -89,9 +98,9 @@ async def test_native_preview_preserves_source_reply_topic_and_trigger(runtime, 
         "https://x.com/example/status/123/video/0",
     ],
 )
-async def test_fixed_previews_and_unsupported_x_routes_never_trigger_ydl(runtime, url):
+async def test_explicit_embed_modifiers_and_unsupported_x_routes_never_trigger_ydl(runtime, url):
     await runtime.viewer.view(source(runtime, url), Settings())
-    runtime.viewer.fxembed.get_post.assert_not_awaited()
+    runtime.viewer.links.fxembed.get_post.assert_not_awaited()
     runtime.publish.assert_not_awaited()
     runtime.executor.run.assert_not_awaited()
 
@@ -106,7 +115,7 @@ async def test_fixed_previews_and_unsupported_x_routes_never_trigger_ydl(runtime
 )
 async def test_domain_ownership_does_not_capture_unrelated_sites(runtime, url):
     await runtime.viewer.view(source(runtime, url), Settings())
-    runtime.viewer.fxembed.get_post.assert_not_awaited()
+    runtime.viewer.links.fxembed.get_post.assert_not_awaited()
     runtime.executor.run.assert_awaited_once()
 
 
@@ -114,6 +123,8 @@ async def test_link_labels_work_and_tracking_duplicates_do_not_consume_post_limi
     urls = [
         "https://x.com/example/status/123?s=20",
         "https://twitter.com/another/status/123",
+        "https://fixupx.com/example/status/123?s=20",
+        "https://www.fxtwitter.com/example/status/123",
         "https://x.com/second/status/124",
         "https://x.com/third/status/125",
     ]
@@ -123,7 +134,7 @@ async def test_link_labels_work_and_tracking_duplicates_do_not_consume_post_limi
         entities=[{"type": "text_link", "offset": index, "length": 1, "url": url} for index, url in enumerate(urls)],
     )
     await runtime.viewer.view(message, Settings())
-    assert [call.args[0].id for call in runtime.viewer.fxembed.get_post.call_args_list] == ["123", "124"]
+    assert [call.args[0].id for call in runtime.viewer.links.fxembed.get_post.call_args_list] == ["123", "124"]
     assert runtime.publish.await_count == 2
     runtime.executor.run.assert_not_awaited()
 
@@ -159,7 +170,7 @@ async def test_message_preview_policy(runtime, fields, prefix, expected):
 
 
 async def test_unavailable_provider_is_quiet_and_retains_single_owner(runtime):
-    runtime.viewer.fxembed.get_post.side_effect = BadRequestError()
+    runtime.viewer.links.fxembed.get_post.side_effect = BadRequestError()
     await runtime.viewer.view(source(runtime), Settings())
     runtime.publish.assert_not_awaited()
     runtime.executor.run.assert_not_awaited()
@@ -257,9 +268,10 @@ async def test_provider_telemetry_has_ids_and_outcomes_without_source_content(ru
     capture = Capture()
     telemetry = Telemetry(config(), transport=capture)
     runtime.viewer.telemetry = telemetry
+    runtime.viewer.links.telemetry = telemetry
     dp = dispatcher(runtime)
     dp.update.outer_middleware(DispatchTelemetryMiddleware(telemetry))
-    runtime.viewer.fxembed.get_post.side_effect = BadRequestError()
+    runtime.viewer.links.fxembed.get_post.side_effect = BadRequestError()
     await telemetry.start()
     try:
         await dp.feed_update(runtime.bot, Update(update_id=17, message=source(runtime)), settings=Settings())

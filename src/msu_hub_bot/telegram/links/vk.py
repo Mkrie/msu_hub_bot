@@ -13,12 +13,13 @@ from msu_hub_bot.providers.vk.posts import VkPost
 from msu_hub_bot.settings import settings
 from msu_hub_bot.telegram.wrapper import BotWrapper
 
-
-_HTML_ATOM = re.compile(r"</?a\b[^>]*>|&(?:#[0-9]+|#x[0-9a-fA-F]+|[a-zA-Z]+);|.", re.S)
+_HTML_ATOM = re.compile(r"<tg-emoji\b[^>]*>.*?</tg-emoji>|</?a\b[^>]*>|&(?:#[0-9]+|#x[0-9a-fA-F]+|[a-zA-Z]+);|.", re.S)
 # Preserve Telegram's bare-URL detection; don't absorb escaped surrounding quotes.
 _SHORT_URL = r"""https?://(?:(?!&(?:lt|gt|quot|#x27|#39);)[^\s<>\[\]"']){1,400}(?=$|[\s<>\[\]"']|&(?:lt|gt|quot|#x27|#39);)"""
 _HTML_TOKEN = re.compile(_SHORT_URL + "|" + _HTML_ATOM.pattern, re.S)
 _LINK_TAG = re.compile(r"</?a\b[^>]*>")
+_EMOJI_TAG = re.compile(r"</?tg-emoji\b[^>]*>")
+_VK_LOGO = '<tg-emoji emoji-id="5278229754099540071">💙</tg-emoji> '
 
 
 def utf16_length(text: str) -> int:
@@ -43,7 +44,7 @@ def split_html(text: str, *, limit: int = 4096, max_bytes: int = 32768, max_link
 
     def rendered(parts: list[str], link: str) -> str:
         value = "".join(parts) + ("</a>" if link else "")
-        return value if unescape(_LINK_TAG.sub("", value)).strip() else ""
+        return value if unescape(_EMOJI_TAG.sub("", _LINK_TAG.sub("", value))).strip() else ""
 
     while True:
         token = pending.popleft() if pending else next(source, None)
@@ -51,7 +52,7 @@ def split_html(text: str, *, limit: int = 4096, max_bytes: int = 32768, max_link
             break
         opening = token.startswith("<a ")
         closing = token == "</a>"
-        visible = "" if opening or closing else unescape(token)
+        visible = "" if opening or closing else unescape(_EMOJI_TAG.sub("", token))
         next_link = token if opening else "" if closing else active_link
         token_size = utf16_length(visible)
         token_bytes = len(token.encode())
@@ -98,16 +99,21 @@ async def publish_vk_post(
     with_header: bool = True,
     *,
     message_thread_id: int | None = None,
+    parsed_link: bool = False,
 ) -> Message | None:
     # The configured destination prefers a captioned album when it fits.
     if chat_id == settings.vk_default_chat_id:
         text, web_preview, photos_urls, gifs_urls = post.for_publish(False, False)
-        if utf16_length(text) <= 1024:
+        if parsed_link:
+            text = _VK_LOGO + text
+        if utf16_length(_EMOJI_TAG.sub("", text)) <= 1024:
             return await bot.send_super_message_prefer_album(
                 text, web_preview, photos_urls, gifs_urls, chat_id, reply_to, message_thread_id=message_thread_id
             )
     else:
         text, web_preview, photos_urls, gifs_urls = post.for_publish(with_header)
+        if parsed_link:
+            text = _VK_LOGO + text
     preview = hide_link(web_preview) if web_preview else ""
     return await bot.send_super_message(
         text,

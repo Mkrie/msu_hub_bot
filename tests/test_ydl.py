@@ -7,6 +7,7 @@ import requests
 from yt_dlp.utils import DownloadError
 
 from msu_hub_bot.providers.ydl import YDL
+from msu_hub_bot.telegram.links.video import text_with_preview
 
 
 def test_extractor_is_owned_and_failures_stay_quiet(monkeypatch):
@@ -165,7 +166,7 @@ def test_song_gets_url_and_viewer_gets_dimensions_with_escaped_text(monkeypatch)
     preview = (video, 640, 480)
     monkeypatch.setattr(YDL, "extract", lambda url: ("<clip & music>", [(video, "A&B", 640, 480)], preview))
     assert YDL.preview("https://example.test/page") == video
-    result = YDL.text_with_preview("https://example.test/page")
+    result = text_with_preview("https://example.test/page")
     assert result is not None
     text, returned = result
     assert returned == preview
@@ -174,19 +175,19 @@ def test_song_gets_url_and_viewer_gets_dimensions_with_escaped_text(monkeypatch)
 
 
 @pytest.mark.parametrize("enabled,timed_out", [(False, False), (True, False), (True, True)])
-async def test_tiktok_viewer_preserves_preference_timeout_topic_and_video_delivery(enabled, timed_out):
+async def test_generic_video_viewer_preserves_preference_timeout_topic_and_video_delivery(enabled, timed_out):
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
 
     from aiogram.methods import SendVideo
     from aiogram.types import URLInputFile
+    from telegram_helpers import make_bot, make_message
 
     from msu_hub_bot.telegram.middlewares.settings import Settings
     from msu_hub_bot.telegram.middlewares.viewer import ViewerMiddleware
-    from telegram_helpers import make_bot, make_message
 
     bot = make_bot()
-    url = "https://www.tiktok.com/@synthetic/video/1234"
+    url = "https://vimeo.com/1234"
     message = make_message(
         bot, text=url, entities=[dict(type="url", offset=0, length=len(url))], is_topic_message=True, message_thread_id=9
     )
@@ -197,7 +198,7 @@ async def test_tiktok_viewer_preserves_preference_timeout_topic_and_video_delive
     if not enabled:
         executor.run.assert_not_awaited()
     else:
-        executor.run.assert_awaited_once_with(YDL.text_with_preview, url, timeout=60)
+        executor.run.assert_awaited_once_with(text_with_preview, url, timeout=60)
     if enabled and not timed_out:
         method = bot.session.methods[-1]
         assert isinstance(method, SendVideo) and isinstance(method.video, URLInputFile)

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from contextvars import ContextVar
 
 import aiohttp
 import pytest
@@ -98,8 +99,6 @@ def test_attachment_selection_survives_tracking_removal(kind, index):
         "https://x.com/example/status/123\n",
         "https://x.com\\@attacker.example/example/status/123",
         "ftp://x.com/example/status/123",
-        "https://fixupx.com/example/status/123",
-        "https://fxtwitter.com/example/status/123",
         "https://x.com/example",
         "https://x.com/home",
     ],
@@ -108,11 +107,57 @@ def test_non_posts_and_host_confusion_are_rejected(url):
     assert parse_post_url(url) is None
 
 
-@pytest.mark.parametrize("host", ["fixupx.com", "fxtwitter.com", "i.fixupx.com", "d.fxtwitter.com", "twittpr.com", "xfixup.com"])
-def test_fixed_posts_have_separate_ownership(host):
-    url = f"https://{host}/example/status/123/photo/1"
-    assert is_x_url(url) and parse_post_url(url) is None
+@pytest.mark.parametrize("domain", ["fixupx.com", "fxtwitter.com", "twittpr.com", "xfixup.com"])
+@pytest.mark.parametrize("prefix", ["", "www."])
+@pytest.mark.parametrize("suffix", ["", "/photo/2", "/video/1"])
+def test_ordinary_fxembed_aliases_render_the_same_post_and_preserve_selection(domain, prefix, suffix):
+    host = prefix + domain
+    url = f"https://{host}/example/status/123{suffix}?s=46&t=tracking#ignored"
+    assert is_x_url(url)
+    assert parse_post_url(url) == parse_post_url(f"https://x.com/example/status/123{suffix}")
     assert not is_x_url(f"https://{host}.attacker.example/example/status/123")
+    assert parse_post_url(f"https://{host}.attacker.example/example/status/123") is None
+
+
+@pytest.mark.parametrize("prefix", ["i.", "d.", "dl.", "g.", "t.", "m.", "o."])
+@pytest.mark.parametrize("domain", ["fixupx.com", "fxtwitter.com", "twittpr.com", "xfixup.com"])
+def test_explicit_fxembed_layouts_are_owned_but_not_replaced(prefix, domain):
+    url = f"https://{prefix}{domain}/example/status/123/photo/1"
+    assert is_x_url(url) and parse_post_url(url) is None
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "example/status/123/ru",
+        "example/status/123/photo/2/en",
+        "example/status/123/pt-br",
+        "dir/example/status/123",
+        "dl/example/status/123",
+        "example/status/123.mp4",
+        "example/status/123.jpg",
+    ],
+)
+@pytest.mark.parametrize("host", ["fixupx.com", "www.fxtwitter.com"])
+def test_explicit_fxembed_route_modifiers_cannot_silently_become_an_untranslated_full_post(host, path):
+    url = f"https://{host}/{path}?s=46"
+    assert is_x_url(url) and parse_post_url(url) is None
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://attacker@fixupx.com/example/status/123",
+        "https://fixupx.com:443/example/status/123",
+        "https://fixupx.com./example/status/123",
+        "https://fixupx.com\\@attacker.example/example/status/123",
+        "https://fixupx.com/example/status/123\n",
+        "ftp://fixupx.com/example/status/123",
+        "https://www.www.fixupx.com/example/status/123",
+    ],
+)
+def test_native_fxembed_aliases_retain_strict_url_validation(url):
+    assert parse_post_url(url) is None
 
 
 @pytest.mark.parametrize(
@@ -560,3 +605,265 @@ async def test_transport_errors_never_include_provider_payload_in_public_excepti
     with pytest.raises(BadRequestError) as error:
         await FxEmbed().get_post(link())
     assert "sensitive" not in str(error.value) and session.closed
+
+
+async def test_concurrent_selectors_share_one_fetch_and_receive_independent_complete_models(monkeypatch):
+    client = FxEmbed()
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = []
+    original = FxPost.model_validate(post_payload(media={"all": [photo()]}, quote=post_payload(id="99")))
+
+    async def fetch(post_id):
+        calls.append(post_id)
+        entered.set()
+        await release.wait()
+        return original
+
+    monkeypatch.setattr(client, "_fetch_post", fetch)
+    first = asyncio.create_task(client.get_post(link()))
+    second = asyncio.create_task(client.get_post(parse_post_url(f"https://fixupx.com/other/status/{link().id}/video/1")))
+    await entered.wait()
+    assert calls == [link().id]
+    release.set()
+    left, right = await asyncio.gather(first, second)
+    assert left == right == original and left is not right and left is not original
+    left.author.name = "Different"
+    left.media.all[0].width = 1
+    left.quote.raw_text.text = "Changed nested quote"
+    assert right.author.name == original.author.name != left.author.name
+    assert right.media.all[0].width == original.media.all[0].width != 1
+    assert right.quote.raw_text.text == original.quote.raw_text.text != left.quote.raw_text.text
+    assert not client._inflight
+    fresh = await client.get_post(link())
+    assert calls == [link().id, link().id] and fresh == original
+
+
+async def test_different_post_ids_and_client_instances_do_not_share_reads(monkeypatch):
+    clients = [FxEmbed(), FxEmbed()]
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def fetch(post_id):
+        calls.append(post_id)
+        if len(calls) == 3:
+            entered.set()
+        await release.wait()
+        return FxPost.model_validate(post_payload(id=post_id))
+
+    for client in clients:
+        monkeypatch.setattr(client, "_fetch_post", fetch)
+    first = asyncio.create_task(clients[0].get_post(link()))
+    second = asyncio.create_task(clients[0].get_post(parse_post_url("https://x.com/example/status/99")))
+    third = asyncio.create_task(clients[1].get_post(link()))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    release.set()
+    results = await asyncio.gather(first, second, third)
+    assert [post.id for post in results] == [link().id, "99", link().id]
+    assert len(calls) == 3 and all(not client._inflight for client in clients)
+
+
+async def test_one_cancelled_waiter_does_not_cancel_the_remaining_reader(monkeypatch):
+    client = FxEmbed()
+    entered, release, cleaned = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def fetch(post_id):
+        entered.set()
+        try:
+            await release.wait()
+            return FxPost.model_validate(post_payload(id=post_id))
+        finally:
+            cleaned.set()
+
+    monkeypatch.setattr(client, "_fetch_post", fetch)
+    first = asyncio.create_task(client.get_post(link()))
+    second = asyncio.create_task(client.get_post(link()))
+    await entered.wait()
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert not cleaned.is_set() and not second.done()
+    release.set()
+    assert (await second).id == link().id
+    assert cleaned.is_set() and not client._inflight
+
+
+async def test_last_cancelled_waiter_waits_for_transport_cleanup_without_orphans(monkeypatch):
+    client = FxEmbed()
+    entered, cleaning, release_cleanup = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    transport = []
+
+    async def fetch(post_id):
+        transport.append(asyncio.current_task())
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaning.set()
+            await release_cleanup.wait()
+
+    monkeypatch.setattr(client, "_fetch_post", fetch)
+    first = asyncio.create_task(client.get_post(link()))
+    second = asyncio.create_task(client.get_post(link()))
+    await entered.wait()
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert not cleaning.is_set()
+    second.cancel()
+    await cleaning.wait()
+    assert not second.done() and not client._inflight
+    release_cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await second
+    assert len(transport) == 1 and transport[0].cancelled()
+
+
+async def test_shared_failure_after_waiter_cancellation_is_retrieved_and_later_call_retries(monkeypatch):
+    client = FxEmbed()
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = []
+    unexpected = []
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+
+    async def fetch(post_id):
+        calls.append(post_id)
+        entered.set()
+        await release.wait()
+        if len(calls) == 1:
+            raise BadRequestError()
+        return FxPost.model_validate(post_payload(id=post_id))
+
+    monkeypatch.setattr(client, "_fetch_post", fetch)
+    loop.set_exception_handler(lambda _loop, context: unexpected.append(context))
+    try:
+        first = asyncio.create_task(client.get_post(link()))
+        second = asyncio.create_task(client.get_post(link()))
+        await entered.wait()
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        release.set()
+        with pytest.raises(BadRequestError):
+            await second
+        assert not client._inflight
+        assert (await client.get_post(link())).id == link().id
+        await asyncio.sleep(0)
+        assert not unexpected and len(calls) == 2
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+
+async def test_failure_racing_with_all_waiter_cancellations_never_logs_an_unhandled_task(monkeypatch):
+    client = FxEmbed()
+    entered, release = asyncio.Event(), asyncio.Event()
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    unexpected = []
+    transport = []
+
+    async def fetch(post_id):
+        transport.append(asyncio.current_task())
+        entered.set()
+        await release.wait()
+        raise BadRequestError()
+
+    monkeypatch.setattr(client, "_fetch_post", fetch)
+    loop.set_exception_handler(lambda _loop, context: unexpected.append(context))
+    try:
+        first = asyncio.create_task(client.get_post(link()))
+        second = asyncio.create_task(client.get_post(link()))
+        await entered.wait()
+        release.set()
+        loop.call_soon(first.cancel)
+        loop.call_soon(second.cancel)
+        results = await asyncio.gather(first, second, return_exceptions=True)
+        assert all(isinstance(result, asyncio.CancelledError) for result in results)
+        assert transport[0].done() and not client._inflight
+        await asyncio.sleep(0)
+        assert not unexpected
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+
+async def test_shared_transport_does_not_inherit_a_waiters_request_context(monkeypatch):
+    client = FxEmbed()
+    request_context = ContextVar("synthetic_request_context", default=None)
+    entered, release = asyncio.Event(), asyncio.Event()
+    observed = []
+
+    async def fetch(post_id):
+        observed.append(request_context.get())
+        entered.set()
+        await release.wait()
+        return FxPost.model_validate(post_payload(id=post_id))
+
+    async def read(context):
+        request_context.set(context)
+        result = await client.get_post(link())
+        assert request_context.get() == context
+        return result
+
+    monkeypatch.setattr(client, "_fetch_post", fetch)
+    first = asyncio.create_task(read("first-request"))
+    second = asyncio.create_task(read("second-request"))
+    await entered.wait()
+    release.set()
+    await asyncio.gather(first, second)
+    assert observed == [None]
+
+
+async def test_cancelled_reads_cleanup_cannot_remove_a_replacement_inflight_read(monkeypatch):
+    client = FxEmbed()
+    first_started, first_cleaning, finish_cleanup = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    next_started, next_release = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def fetch(post_id):
+        calls.append(post_id)
+        if len(calls) == 1:
+            first_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                first_cleaning.set()
+                await finish_cleanup.wait()
+        next_started.set()
+        await next_release.wait()
+        return FxPost.model_validate(post_payload(id=post_id))
+
+    monkeypatch.setattr(client, "_fetch_post", fetch)
+    first = asyncio.create_task(client.get_post(link()))
+    await first_started.wait()
+    first.cancel()
+    await first_cleaning.wait()
+    second = asyncio.create_task(client.get_post(link()))
+    await next_started.wait()
+    finish_cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    third = asyncio.create_task(client.get_post(link()))
+    await asyncio.sleep(0)
+    next_release.set()
+    left, right = await asyncio.gather(second, third)
+    assert len(calls) == 2 and left == right and left is not right
+    assert not client._inflight
+
+
+def test_client_can_be_reused_across_event_loops_without_retaining_a_closed_loop(monkeypatch):
+    client = FxEmbed()
+    calls = []
+
+    async def fetch(post_id):
+        calls.append(post_id)
+        return FxPost.model_validate(post_payload(id=post_id))
+
+    async def concurrent_reads():
+        left, right = await asyncio.gather(client.get_post(link()), client.get_post(link()))
+        assert left == right and left is not right
+
+    monkeypatch.setattr(client, "_fetch_post", fetch)
+    for _ in range(2):
+        asyncio.run(concurrent_reads())
+        assert not client._inflight
+    assert calls == [link().id, link().id]

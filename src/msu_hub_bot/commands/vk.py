@@ -8,7 +8,7 @@ from msu_hub_bot.telegram.wrapper import BotWrapper
 from msu_hub_bot.utils import cut_long_text, one_liner
 from msu_hub_bot.providers.vk.api import VkApi
 from msu_hub_bot.providers.vk.posts import VkPost
-from msu_hub_bot.telegram.vk import publish_vk_post
+from msu_hub_bot.telegram.links.vk import publish_vk_post
 from msu_hub_bot.storage.models import VkPatch
 
 
@@ -61,5 +61,5 @@ async def process_vk_post(message: Message, bot: BotWrapper, vk_api: VkApi) -> M
         return True
     posts = await VkPost.from_api_by_id(vk_api, matches[0])
     if posts:
-        await publish_vk_post(posts[0], bot, chat_id, None, with_header)
+        await publish_vk_post(posts[0], bot, chat_id, None, with_header, parsed_link=True)
     return True

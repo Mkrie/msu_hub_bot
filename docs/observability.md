@@ -14,6 +14,10 @@ Trace head sampling defaults to 10%, configurable through `HUB_TELEMETRY_SAMPLE_
 
 The exporter is an owned asyncio task with asynchronous DNS, not a blocking exporter thread. Shutdown reserves part of a three-second budget for transport cleanup and drops unfinished batches. SDK shutdown only closes the local processors and metric reader; no SDK background exporter or exit hook is registered. Tests decode real trace and metric protobuf payloads using an explicit capture transport while networking is blocked. A successful offline capture does not establish delivery to a Logfire project; that remains a separate, explicitly enabled staging check.
 
+Native X media preparation owns one `media.operation` named `x.media.prepare`. Its operation handle accepts `media_asset(MediaKind, MediaReason, attempts=..., downloaded_bytes=..., duration=...)` once per selected unique asset. Reasons describe a ready upload, a ready reduced image, or a fixed omission category such as oversize, unsupported format, HTTP error, rejected redirect, empty response, timeout, network, I/O, exhausted budget or cancellation. Attempts count actual HTTP requests including redirects; bytes include streamed data from unsuccessful attempts. Never pass a URL, file ID, source ID, path, response body or exception to this accounting interface. Calls outside the owning active preparation are ignored.
+
+The preparation span summarizes asset counts, attempts, omission categories and a coarse aggregate size. Partial omissions set an unavailable outcome, or timeout/cancelled when applicable; an escaping exception retains its own classification. Accounting never changes delivery behavior. Successful preparation logs follow trace sampling; omissions produce one `media.preparation.omitted` record through the bounded log queue, including when the trace is unsampled. Empty preparations produce no media summary log or asset measurements.
+
 ## Trace ownership
 
 | Boundary | Responsibility |
@@ -56,7 +60,7 @@ Disable automatic argument/local-variable capture and baggage enrichment. Do not
 
 ## Logs and failures
 
-Keep existing redacted local logging. The telemetry adapter emits dedicated structured records with fixed bodies: `bot.operation.completed`, `bot.operation.failed` and `telegram.request.failed`. Records carry the same safe context as spans, their operation/outcome/duration and trace/span correlation. Do not forward the legacy update logger or root logger; arbitrary `extra` fields and formatted messages must never reach the exporter. Exporter diagnostics stay local to prevent recursive export failures.
+Keep existing redacted local logging. The telemetry adapter emits dedicated structured records with fixed bodies: `bot.operation.completed`, `bot.operation.failed`, `telegram.request.failed`, `media.preparation.completed` and `media.preparation.omitted`. Records carry the same safe context as spans, their operation/outcome/duration and trace/span correlation. Do not forward the legacy update logger or root logger; arbitrary `extra` fields and formatted messages must never reach the exporter. Exporter diagnostics stay local to prevent recursive export failures.
 
 One handler/job/dispatch boundary owns the incident report. Children may record outcomes; a failed outgoing Telegram request also records its method, destination and a fixed reason because handlers may intentionally catch it. Known provider outages, missing configuration, invalid input, cancellation and stale callbacks use their own outcomes; normal rejection is not an unexpected incident. Preserve friendly user replies and redacted error-chat notifications without turning either into additional exported copies.
 
@@ -67,6 +71,8 @@ Do not send raw exception objects, `repr`, messages, notes, causes or formatted 
 Use counters for handler outcomes, provider attempts/failures and job results; histograms for handler, provider, queue and execution duration; gauges for active workers, queue depth and age of the last successful poll. Metric attributes come from small enumerations. Never label metrics by trace, task, destination, exception text or personal identifier; IDs belong only to bounded trace/log records.
 
 Measure polling health through aggregate counters and outage/recovery transitions, not per-poll logs. Record metrics independently of trace sampling. Set an explicit trace budget; sample whole traces consistently. A retained failure log may refer to a trace that was not sampled. Bounded queues and failed exports still allow loss, so do not promise complete incident retention. A collector or service mesh is not required for this design.
+
+Media preparation adds `bot.media.assets`, `bot.media.download.attempts`, `bot.media.download.duration` and `bot.media.download.size`. Their only dimensions are fixed provider, media kind, reason and outcome values; reduced-image recovery counts as success. Download sizes are rounded up to 64 KiB, 1 MiB, 4 MiB, 16 MiB, 64 MiB or 128 MiB, with zero retained and a saturating 1 GiB bucket, before recording the histogram. Thus its sum, minimum and maximum also contain bucketed measurements. Exact byte counts remain local. Per-asset attempts and duration saturate at 1,000 requests and one hour; no user/chat identifiers or trace exemplars enter these metrics.
 
 ## Dashboards
 

@@ -730,7 +730,7 @@ async def test_mini_app_disabling_x_previews_updates_the_next_message_without_re
     preferences = SettingsMiddleware(database)
     rig.server.settings_changed = AsyncMock(side_effect=preferences.invalidate)
     viewer = ViewerMiddleware(rig.bot, None, SimpleNamespace(run=AsyncMock()))
-    viewer.handle_x_post = AsyncMock()
+    viewer.links.handle_x_post = AsyncMock()
     dispatcher = Dispatcher(disable_fsm=True)
     dispatcher.message.outer_middleware(preferences)
     dispatcher.message.outer_middleware(viewer)
@@ -742,7 +742,7 @@ async def test_mini_app_disabling_x_previews_updates_the_next_message_without_re
         entities=[{"type": "url", "offset": 0, "length": len(url)}],
     )
     await dispatcher.feed_update(rig.bot, Update(update_id=1, message=message))
-    viewer.handle_x_post.assert_awaited_once()
+    viewer.links.handle_x_post.assert_awaited_once()
     original = preferences.proxies[-123]
     assert original.auto_x_previews
 
@@ -757,8 +757,8 @@ async def test_mini_app_disabling_x_previews_updates_the_next_message_without_re
     rig.server.settings_changed.assert_awaited_once_with(-123)
 
     await dispatcher.feed_update(rig.bot, Update(update_id=2, message=message))
-    viewer.handle_x_post.assert_awaited_once()
-    viewer.executor.run.assert_not_awaited()
+    viewer.links.handle_x_post.assert_awaited_once()
+    viewer.links.executor.run.assert_not_awaited()
     assert preferences.proxies[-123] is original
     assert not original.auto_x_previews
     assert database.load_settings.await_count == 2

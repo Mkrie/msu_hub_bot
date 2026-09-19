@@ -72,4 +72,4 @@ async def test_vk_post_preserves_url_parser_and_header_flag(monkeypatch, replies
     api, bot = object(), object()
     assert await vk.process_vk_post(message("/vk_post https://vk.com/wall-10_6 -20 0"), bot, api)
     provider.assert_awaited_once_with(api, "-10_6")
-    publisher.assert_awaited_once_with(selected, bot, -20, None, False)
+    publisher.assert_awaited_once_with(selected, bot, -20, None, False, parsed_link=True)

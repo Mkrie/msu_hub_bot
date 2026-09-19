@@ -2,9 +2,11 @@
 
 import asyncio
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import aiohttp
 import pytest
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramServerError
 from aiogram.methods import SendRichMessage
@@ -14,17 +16,21 @@ from aiogram.types import (
     InputRichBlockBlockQuotation,
     InputRichBlockCollage,
     InputRichBlockFooter,
+    InputRichBlockParagraph,
     InputRichBlockPhoto,
     InputRichBlockVideo,
     RichTextBold,
     RichTextCustomEmoji,
     RichTextUrl,
 )
+from telegram_helpers import RecordingSession, make_message
+from telemetry_helpers import Capture, config
 
 from msu_hub_bot.providers.fxembed import FxMedia, FxMediaFormat, FxPost, FxText, parse_post_url
-from msu_hub_bot.telegram import x_posts
+from msu_hub_bot.telegram.links import rich
+from msu_hub_bot.telegram.links import x as x_posts
 from msu_hub_bot.telegram.wrapper import BotWrapper
-from telegram_helpers import RecordingSession, make_message
+from msu_hub_bot.telemetry import MediaReason, Telemetry
 
 
 def post(**changes):
@@ -69,18 +75,16 @@ def all_blocks(items):
 
 
 def text_of(items):
-    return "\n\n".join(
-        "".join(span.text for span in x_posts._rich_spans(block.text)) for block in all_blocks(items) if hasattr(block, "text")
-    )
+    return "\n\n".join("".join(span.text for span in rich._rich_spans(block.text)) for block in all_blocks(items) if hasattr(block, "text"))
 
 
 def links_of(items):
-    return [span.url for block in all_blocks(items) if hasattr(block, "text") for span in x_posts._rich_spans(block.text) if span.url]
+    return [span.url for block in all_blocks(items) if hasattr(block, "text") for span in rich._rich_spans(block.text) if span.url]
 
 
 def test_native_layout_keeps_compact_linked_header_quote_media_and_no_footer():
     items = [media(1), media(2, "video"), media(3)]
-    quoted = post(id="321", text="На Луну", media={"all": [items[2]]})
+    quoted = post(id="321", text="На Луну", author={"name": "Лунный кот", "screen_name": "mooncat"}, media={"all": [items[2]]})
     value = post(media={"all": items[:2]}, quote=quoted)
     messages = x_posts.render_x_post(value, uploads(items))
     assert len(messages) == 1
@@ -93,16 +97,37 @@ def test_native_layout_keeps_compact_linked_header_quote_media_and_no_footer():
     assert isinstance(header[2], RichTextBold) and header[2].text == "Космокот"
     assert isinstance(header[4], RichTextUrl) and header[4].text == "@cosmocat" and header[4].url == value.author.url
     assert isinstance(header[6], RichTextUrl) and header[6].text == "↗" and header[6].url == value.url
-    assert header[-1] == "\n"
-    assert text_of(result[:1]) == "💬 Космокот · @cosmocat · ↗\n"
-    assert text_of(result[1:2]) == value.text
-    assert isinstance(result[2], InputRichBlockCollage)
-    assert [item.type for item in result[2].blocks] == ["photo", "video"]
-    assert isinstance(result[3], InputRichBlockBlockQuotation)
-    assert any(isinstance(item, InputRichBlockPhoto) for item in result[3].blocks)
+    assert header[7] == "\n\n"
+    assert len(result) == 3 and isinstance(result[0], InputRichBlockParagraph)
+    assert text_of(result[:1]) == "💬 Космокот · @cosmocat · ↗\n\n" + value.text
+    assert isinstance(result[1], InputRichBlockCollage)
+    assert [item.type for item in result[1].blocks] == ["photo", "video"]
+    assert isinstance(result[2], InputRichBlockBlockQuotation)
+    assert text_of(result[2].blocks[:1]) == "💬 Лунный кот · @mooncat · ↗\n\nНа Луну"
+    assert any(isinstance(item, InputRichBlockPhoto) for item in result[2].blocks)
     assert not any(isinstance(item, InputRichBlockFooter) for item in all_blocks(result))
     assert links_of(result) == [value.author.url, value.url, quoted.author.url, quoted.url]
     assert "Статистика" not in text_of(result)
+
+
+def test_reply_attribution_and_body_have_internal_blank_lines_in_one_paragraph():
+    value = post(text="First line\nSecond line", replying_to={"screen_name": "cat", "status": "999"})
+    rendered = x_posts.render_x_post(value, {})
+    assert len(rendered) == 1 and len(rendered[0].blocks) == 1
+    assert isinstance(rendered[0].blocks[0], InputRichBlockParagraph)
+    assert text_of(rendered[0].blocks) == "💬 Космокот · @cosmocat · ↗\n\n↪ В ответ @cat\n\nFirst line\nSecond line"
+    assert links_of(rendered[0].blocks)[-1] == "https://x.com/cat/status/999"
+
+
+@pytest.mark.parametrize("has_media_link", [False, True], ids=["empty-body", "removed-media-link"])
+def test_media_only_post_has_no_empty_text_block_or_trailing_blank_lines(has_media_link):
+    item = media(1)
+    link = "https://t.co/media"
+    raw = {"text": link, "facets": [{"type": "media", "id": "1", "indices": [0, len(link)]}]} if has_media_link else None
+    rendered = x_posts.render_x_post(post(text="", raw_text=raw, media={"all": [item]}), uploads([item]))
+    assert len(rendered[0].blocks) == 2
+    assert text_of(rendered[0].blocks[:1]) == "💬 Космокот · @cosmocat · ↗"
+    assert isinstance(rendered[0].blocks[1], InputRichBlockPhoto)
 
 
 def test_utf16_facets_preserve_emoji_and_link_mentions_to_x():
@@ -189,7 +214,7 @@ def test_stale_media_facets_cannot_remove_or_replace_original_content(body, indi
         media={"all": [item]},
     )
     rendered = x_posts.render_x_post(value, uploads([item]) if uploaded else {})
-    assert text_of(rendered[0].blocks[1:2]) == body
+    assert text_of(rendered[0].blocks[:1]).partition("\n\n")[2] == body
     assert "https://x.com/wrong/status/999/photo/1" not in links_of(blocks(rendered))
 
 
@@ -205,7 +230,7 @@ def test_matching_media_original_removes_the_trailing_link_and_its_empty_spacing
         media={"all": [item]},
     )
     rendered = x_posts.render_x_post(value, uploads([item]))
-    assert text_of(rendered[0].blocks[1:2]) == "😀 Keep this"
+    assert text_of(rendered[0].blocks[:1]).partition("\n\n")[2] == "😀 Keep this"
     assert any(isinstance(block, InputRichBlockPhoto) for block in all_blocks(blocks(rendered)))
 
 
@@ -262,11 +287,11 @@ def test_overflow_preserves_custom_header_emoji_and_plain_fallback_glyph():
     value = post(text="😀" * 40000)
     rendered = x_posts.render_x_post(value, {})
     assert len(rendered) > 1
-    spans = [span for block in all_blocks(blocks(rendered)) if hasattr(block, "text") for span in x_posts._rich_spans(block.text)]
+    spans = [span for block in all_blocks(blocks(rendered)) if hasattr(block, "text") for span in rich._rich_spans(block.text)]
     custom = [span for span in spans if span.custom_emoji_id]
     assert len(custom) == 1
     assert custom[0].custom_emoji_id == "5422502846648039176" and custom[0].text == "💬"
-    first = x_posts._plain(rendered[0].blocks)
+    first = rich._plain(rendered[0].blocks)
     assert first.startswith("💬 Космокот · @cosmocat")
     assert value.author.url in first and value.url in first
 
@@ -303,12 +328,22 @@ def test_long_posts_preserve_every_character_and_all_message_limits(length, char
         for message in result
         for block in message.blocks
         if hasattr(block, "text")
-        for span in x_posts._rich_spans(block.text)
+        for span in rich._rich_spans(block.text)
         if span.text and all(char == character for char in span.text)
     )
     assert body == original
-    assert all(x_posts._fits(message.blocks) for message in result)
+    assert all(rich._fits(message.blocks) for message in result)
     assert links_of(blocks(result))[-1].endswith("/status/123")
+
+
+@pytest.mark.parametrize("suffix,expected_messages", [("", 1), ("😀", 2)], ids=["exact-limit", "astral-overflow"])
+def test_header_and_separator_count_toward_the_utf16_message_limit(suffix, expected_messages):
+    intro = "💬 Космокот · @cosmocat · ↗\n\n"
+    body = "я" * (32768 - len(intro.encode("utf-16-le")) // 2) + suffix
+    rendered = x_posts.render_x_post(post(text=body), {})
+    assert len(rendered) == expected_messages
+    assert "".join(text_of(message.blocks) for message in rendered) == intro + body
+    assert all(rich._fits(message.blocks) for message in rendered)
 
 
 def test_many_media_split_at_budget_without_losing_order():
@@ -317,7 +352,7 @@ def test_many_media_split_at_budget_without_losing_order():
     assert len(result) == 3
     attached = [block.photo.media.filename for block in all_blocks(blocks(result)) if isinstance(block, InputRichBlockPhoto)]
     assert attached == [str(index) for index in range(103)]
-    assert all(x_posts._cost(message.blocks)[2] <= 50 for message in result)
+    assert all(rich._cost(message.blocks)[2] <= 50 for message in result)
 
 
 def test_many_article_blocks_keep_all_text_within_block_limit():
@@ -325,7 +360,7 @@ def test_many_article_blocks_keep_all_text_within_block_limit():
     result = x_posts.render_x_post(post(article={"title": "Article", "content": {"blocks": [{"text": line} for line in texts]}}), {})
     rendered = text_of(blocks(result))
     assert all(line in rendered for line in texts)
-    assert all(x_posts._cost(message.blocks)[1] <= 500 for message in result)
+    assert all(rich._cost(message.blocks)[1] <= 500 for message in result)
 
 
 def test_deep_quotes_are_flattened_without_losing_attribution():
@@ -376,7 +411,7 @@ def test_raw_entities_are_decoded_after_utf16_facet_slicing_and_styles_overlap_l
         raw_text={
             "text": body,
             "facets": [
-                {"type": "bold", "indices": [0, x_posts._units(body)]},
+                {"type": "bold", "indices": [0, rich._units(body)]},
                 {"type": "italic", "indices": [9, 13]},
                 {"type": "mention", "indices": [9, 13]},
                 {"type": "hashtag", "indices": [14, 18], "original": "Кот"},
@@ -389,8 +424,9 @@ def test_raw_entities_are_decoded_after_utf16_facet_slicing_and_styles_overlap_l
     assert "https://x.com/cat" in links_of(blocks(result))
     assert "https://x.com/hashtag/%D0%9A%D0%BE%D1%82" in links_of(blocks(result))
     assert "https://x.com/search?q=%24CAT" in links_of(blocks(result))
-    spans = list(x_posts._rich_spans(result[0].blocks[1].text))
-    assert all("BOLD" in (span.style or "") for span in spans)
+    spans = list(rich._rich_spans(result[0].blocks[0].text))
+    body_start = next(index for index, span in enumerate(spans) if span.text == "\n\n") + 1
+    assert all("BOLD" in (span.style or "") for span in spans[body_start:])
     assert next(span for span in spans if span.text == "@cat").style == "BOLD,ITALIC"
 
 
@@ -410,7 +446,7 @@ def test_note_tweet_scalar_offsets_reach_renderer_as_utf16_without_losing_emoji_
     rendered = x_posts.render_x_post(value, {})
     assert body in text_of(blocks(rendered))
     assert "https://x.com/cat" in links_of(blocks(rendered))
-    spans = list(x_posts._rich_spans(rendered[0].blocks[1].text))
+    spans = list(rich._rich_spans(rendered[0].blocks[0].text))
     assert next(span for span in spans if span.text == "@cat").style == "BOLD"
 
 
@@ -537,7 +573,9 @@ def test_article_body_embedded_media_markdown_and_partial_styles_survive():
     assert "😀 bold plain" in output
     assert "**Keep all content**" in output
     assert "markup</a>" in output
-    paragraph = list(blocks(result))[3]
+    paragraph = next(
+        block for block in blocks(result) if isinstance(block, InputRichBlockParagraph) and text_of([block]) == "😀 bold plain"
+    )
     assert any(isinstance(piece, RichTextBold) for piece in paragraph.text)
     assert len([block for block in all_blocks(blocks(result)) if isinstance(block, InputRichBlockPhoto)]) == 1
     assert "Доступен фрагмент" not in output
@@ -610,8 +648,8 @@ async def test_custom_emoji_rejection_retries_once_with_plain_glyph_and_intact_r
     assert bot.send_rich_message.await_count == 2
     first, retry = [call.kwargs for call in bot.send_rich_message.await_args_list]
     original, retried = first["rich_message"], retry["rich_message"]
-    original_spans = [span for block in all_blocks(original.blocks) if hasattr(block, "text") for span in x_posts._rich_spans(block.text)]
-    retried_spans = [span for block in all_blocks(retried.blocks) if hasattr(block, "text") for span in x_posts._rich_spans(block.text)]
+    original_spans = [span for block in all_blocks(original.blocks) if hasattr(block, "text") for span in rich._rich_spans(block.text)]
+    retried_spans = [span for block in all_blocks(retried.blocks) if hasattr(block, "text") for span in rich._rich_spans(block.text)]
     assert sum(bool(span.custom_emoji_id) for span in original_spans) == 2
     assert not any(span.custom_emoji_id for span in retried_spans)
     assert text_of(retried.blocks) == text_of(original.blocks)
@@ -688,7 +726,7 @@ async def test_partial_send_fallback_does_not_repeat_already_delivered_chunks(mo
     )
     await x_posts.publish_x_post(original, bot, 1, 12)
     assert bot.send_rich_message.await_args_list[1].kwargs["reply_parameters"].message_id == 90
-    remaining = x_posts._plain(x_posts.render_x_post(original, {})[1].blocks)
+    remaining = rich._plain(x_posts.render_x_post(original, {})[1].blocks)
     assert "".join(item.text for item in session.methods) == remaining
 
 
@@ -708,7 +746,7 @@ async def test_concurrent_posts_share_the_existing_chat_delivery_lock(monkeypatc
         asyncio.create_task(x_posts.publish_x_post(value, bot, 1), name="first"),
         asyncio.create_task(x_posts.publish_x_post(value, bot, 1), name="second"),
     )
-    assert calls == ["first"] * 4 + ["second"] * 4
+    assert calls == ["first"] * 3 + ["second"] * 3
     assert not bot._chat_sends
 
 
@@ -877,3 +915,265 @@ def test_article_lists_keep_bullets_and_restart_numbering_after_paragraphs():
     )
     rendered = text_of(blocks(x_posts.render_x_post(value, {})))
     assert "1. One\n\n2. Two\n\nBreak\n\n1. Restart\n\n• Bullet" in rendered
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        ("https://pbs.twimg.com/media/image?format=jpg&name=orig", "https://pbs.twimg.com/media/image?format=jpg&name=large"),
+        ("https://pbs.twimg.com/media/image.jpg:orig", "https://pbs.twimg.com/media/image.jpg?name=large"),
+        ("https://pbs.twimg.com/media/image.png?name=orig", "https://pbs.twimg.com/media/image.png?name=large"),
+        ("https://pbs.twimg.com/media/image?format=webp&name=orig", "https://pbs.twimg.com/media/image?format=webp&name=large"),
+    ],
+)
+def test_smaller_photo_url_preserves_the_recognized_asset_and_format(url, expected):
+    assert x_posts._smaller_photo_url(media(1, url=url)) == expected
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://pbs.twimg.com/media/image.jpg?name=large",
+        "https://pbs.twimg.com/media/image.png",
+        "https://pbs.twimg.com/media/image?format=webp",
+        "https://pbs.twimg.com/media/image.jpg:small",
+        "https://pbs.twimg.com/media/image.jpg:large?name=orig",
+        "https://pbs.twimg.com/media/image.jpg?name=orig&name=large",
+        "https://pbs.twimg.com/media/image?format=jpg&format=png",
+        "https://pbs.twimg.com/media/image.jpg?token=secret",
+        "https://pbs.twimg.com/profile_images/image.jpg",
+        "https://pbs.twimg.com/media/image?format=gif",
+        "https://pbs.twimg.com/media/image",
+        "https://video.twimg.com/media/image.jpg",
+        "https://pbs.twimg.com.attacker.invalid/media/image.jpg",
+        "http://pbs.twimg.com/media/image.jpg",
+    ],
+)
+def test_smaller_photo_url_does_not_rewrite_smaller_unknown_or_unsafe_urls(url):
+    # The downloader still validates URLs if a typed object was copied incorrectly.
+    item = media(1).model_copy(update={"url": url})
+    assert x_posts._smaller_photo_url(item) is None
+
+
+async def test_photo_metadata_oversize_skips_original_and_attempts_only_large(tmp_path):
+    item = media(1, url="https://pbs.twimg.com/media/image.jpg:orig", filesize=10 * 1024 * 1024)
+    session = http_session(Response(chunks=[b"smaller-photo"]))
+    budget = x_posts._DownloadBudget()
+    path = tmp_path / "photo"
+
+    assert await x_posts._download(session, item, path, budget) is None
+
+    assert [url for url, _ in session.calls] == ["https://pbs.twimg.com/media/image.jpg?name=large"]
+    assert path.read_bytes() == b"smaller-photo"
+    assert budget.requests == budget.reduced_photos == 1
+
+
+@pytest.mark.parametrize("rejection", ["header", "stream", "status"])
+async def test_photo_oversize_recovers_once_without_reusing_partial_bytes(tmp_path, rejection):
+    limit = 9 * 1024 * 1024
+    original = {
+        "header": Response(content_length=limit + 1),
+        "stream": Response(chunks=[b"x" * 65536] * (limit // 65536) + [b"overflow"]),
+        "status": Response(status=413),
+    }[rejection]
+    item = media(1, url="https://pbs.twimg.com/media/image?format=jpg&name=orig")
+    session = http_session(original, Response(chunks=[b"small-photo"]))
+    path = tmp_path / "photo"
+    budget = x_posts._DownloadBudget()
+    available = budget.remaining
+
+    await x_posts._download(session, item, path, budget)
+
+    assert [url for url, _ in session.calls] == [item.url, "https://pbs.twimg.com/media/image?format=jpg&name=large"]
+    assert path.read_bytes() == b"small-photo"
+    consumed = limit + len(b"overflow") if rejection == "stream" else 0
+    assert budget.remaining == available - consumed - len(b"small-photo")
+    assert budget.requests == 2 and budget.reduced_photos == 1
+
+
+async def test_second_photo_size_rejection_has_no_third_request(tmp_path):
+    item = media(1, url="https://pbs.twimg.com/media/image.jpg?name=orig")
+    session = http_session(Response(status=413), Response(status=413))
+    budget = x_posts._DownloadBudget()
+
+    with pytest.raises(x_posts._DownloadRejected) as error:
+        await x_posts._download(session, item, tmp_path / "photo", budget)
+
+    assert error.value.reason is MediaReason.OVERSIZE
+    assert len(session.calls) == budget.requests == 2
+    assert budget.reduced_photos == 1
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://pbs.twimg.com/media/image.jpg?name=large",
+        "https://pbs.twimg.com/profile_images/image.jpg",
+        "https://pbs.twimg.com/media/image.jpg?signed=opaque",
+    ],
+)
+async def test_smaller_or_unknown_photo_size_failure_is_not_retried(tmp_path, url):
+    session = http_session(Response(status=413))
+    budget = x_posts._DownloadBudget()
+    with pytest.raises(x_posts._DownloadRejected):
+        await x_posts._download(session, media(1, url=url), tmp_path / "photo", budget)
+    assert len(session.calls) == 1 and budget.reduced_photos == 0
+
+
+@pytest.mark.parametrize(
+    "response,reason",
+    [
+        (Response(headers={"Content-Type": "text/html"}), MediaReason.UNSUPPORTED_FORMAT),
+        (Response(status=302, headers={"Location": "http://127.0.0.1/private"}), MediaReason.REDIRECT_REJECTED),
+        (Response(status=404), MediaReason.HTTP_ERROR),
+    ],
+)
+async def test_non_size_photo_failures_never_trigger_rendition_recovery(tmp_path, response, reason):
+    item = media(1, url="https://pbs.twimg.com/media/image.jpg?name=orig")
+    session = http_session(response)
+    budget = x_posts._DownloadBudget()
+    with pytest.raises(x_posts._DownloadRejected) as error:
+        await x_posts._download(session, item, tmp_path / "photo", budget)
+    assert error.value.reason is reason
+    assert len(session.calls) == 1 and budget.reduced_photos == 0
+
+
+async def test_exhausted_total_budget_prevents_photo_retry_and_subsequent_requests(tmp_path):
+    session = http_session(Response(chunks=[b"abcd", b"overflow"]))
+    budget = x_posts._DownloadBudget(4)
+    item = media(1, url="https://pbs.twimg.com/media/image.jpg?name=orig")
+    with pytest.raises(x_posts._DownloadRejected) as error:
+        await x_posts._download(session, item, tmp_path / "photo", budget)
+    assert error.value.reason is MediaReason.BUDGET_EXHAUSTED
+    with pytest.raises(x_posts._DownloadRejected):
+        await x_posts._download(session, item, tmp_path / "other", budget)
+    assert budget.remaining < 0
+    assert len(session.calls) == 1 and budget.reduced_photos == 0
+
+
+async def test_preparation_exports_real_ready_reduced_and_omitted_outcomes_without_content(monkeypatch, tmp_path):
+    monkeypatch.delenv("OTEL_SDK_DISABLED", raising=False)
+
+    class NetworkFailure(Response):
+        async def __aenter__(self):
+            raise aiohttp.ClientConnectionError("ERROR_CANARY https://example.invalid/?token=SECRET_CANARY")
+
+    items = [media(index, url=f"https://pbs.twimg.com/media/URL_CANARY_{index}.jpg?name=orig") for index in range(5)]
+    http = http_session(
+        Response(chunks=[b"BODY_CANARY"]),
+        Response(content_length=10 * 1024 * 1024),
+        Response(chunks=[b"reduced"]),
+        Response(headers={"Content-Type": "text/HEADER_CANARY"}),
+        Response(status=302, headers={"Location": "http://127.0.0.1/REDIRECT_CANARY"}),
+        NetworkFailure(),
+    )
+
+    @asynccontextmanager
+    async def client_session(**kwargs):
+        assert kwargs["trust_env"] is False
+        yield http
+
+    monkeypatch.setattr(x_posts.aiohttp, "ClientSession", client_session)
+    sink = Capture()
+    telemetry = Telemetry(config(), transport=sink)
+    await telemetry.start()
+    try:
+        with telemetry.context(user_id=42, chat_id=-10042, message_id=7):
+            prepared = await x_posts._prepare_uploads(
+                post(text="POST_CANARY", author={"name": "AUTHOR_CANARY", "screen_name": "usercanary"}, media={"all": items}),
+                None,
+                tmp_path,
+                telemetry,
+            )
+    finally:
+        await telemetry.close()
+
+    assert set(prepared) == {item.url for item in items[:2]}
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["0.jpg", "1.jpg"]
+    assert (tmp_path / "0.jpg").read_bytes() == b"BODY_CANARY"
+    assert (tmp_path / "1.jpg").read_bytes() == b"reduced"
+    assert len(http.calls) == 6
+    assert all(url.startswith("https://pbs.twimg.com/") for url, _ in http.calls)
+    assert len(sink.spans()) == len(sink.logs()) == 1
+    attributes = {item.key: item.value for item in sink.spans()[0].attributes}
+    assert attributes["operation"].string_value == "x.media.prepare"
+    assert attributes["outcome"].string_value == "unavailable"
+    assert attributes["media.assets.total"].int_value == 5
+    assert attributes["media.assets.ready"].int_value == 2
+    assert attributes["media.assets.reduced"].int_value == 1
+    assert attributes["media.assets.omitted"].int_value == 3
+    assert attributes["media.download.attempts"].int_value == 6
+    for reason in ("unsupported_format", "redirect_rejected", "network"):
+        assert attributes[f"media.omitted.{reason}"].int_value == 1
+    assert attributes["telegram.user_id"].int_value == 42
+    assert attributes["telegram.chat_id"].int_value == -10042
+    assert sink.logs()[0].body.string_value == "media.preparation.omitted"
+    exported = sink.serialized()
+    assert "bot.media.assets" in exported and "ready_reduced" in exported
+    for canary in ("CANARY", "usercanary", "127.0.0.1", "pbs.twimg.com", "example.invalid"):
+        assert canary not in exported
+
+
+@pytest.mark.parametrize("stop", ["timeout", "cancel"])
+async def test_preparation_interruption_accounts_for_unattempted_media_and_cleans_temporary_files(monkeypatch, tmp_path, stop):
+    monkeypatch.delenv("OTEL_SDK_DISABLED", raising=False)
+    started = asyncio.Event()
+    paths = []
+
+    class StalledResponse(Response):
+        async def iter_chunked(self, _):
+            yield b"unfinished image"
+            started.set()
+            await asyncio.Event().wait()
+
+    http = http_session(StalledResponse())
+
+    @asynccontextmanager
+    async def client_session(**kwargs):
+        yield http
+
+    temporary_directory = x_posts.TemporaryDirectory
+
+    def capture_directory(**kwargs):
+        result = temporary_directory(dir=tmp_path, **kwargs)
+        paths.append(Path(result.name))
+        return result
+
+    monkeypatch.setattr(x_posts.aiohttp, "ClientSession", client_session)
+    monkeypatch.setattr(x_posts, "TemporaryDirectory", capture_directory)
+    monkeypatch.setattr(x_posts, "_PREPARE_TIMEOUT", 0.02 if stop == "timeout" else 90)
+    sink = Capture()
+    telemetry = Telemetry(config(), transport=sink)
+    await telemetry.start()
+    session = RecordingSession()
+    bot = BotWrapper("123456789:" + "a" * 35, session=session)
+    task = asyncio.create_task(x_posts.publish_x_post(post(media={"all": [media(1), media(2)]}), bot, 1, telemetry=telemetry))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert paths[0].is_dir() and list(paths[0].iterdir())
+        if stop == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            await asyncio.wait_for(task, timeout=1)
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await telemetry.close()
+
+    reason = "timeout" if stop == "timeout" else "cancelled"
+    assert len(http.calls) == 1
+    assert paths and all(not path.exists() for path in paths)
+    assert not list(tmp_path.iterdir())
+    assert len(session.methods) == (1 if stop == "timeout" else 0)
+    if session.methods:
+        rendered = session.methods[0].rich_message.blocks
+        assert "Полный текст" in text_of(rendered)
+        assert not any(isinstance(block, InputRichBlockPhoto) for block in all_blocks(rendered))
+    attributes = {item.key: item.value for item in sink.spans()[0].attributes}
+    assert attributes["outcome"].string_value == reason
+    assert attributes["media.assets.total"].int_value == attributes["media.assets.omitted"].int_value == 2
+    assert attributes[f"media.omitted.{reason}"].int_value == 2
+    assert attributes["media.download.attempts"].int_value == 1

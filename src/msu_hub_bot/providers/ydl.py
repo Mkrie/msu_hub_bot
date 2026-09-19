@@ -9,7 +9,6 @@ from yt_dlp import YoutubeDL
 from yt_dlp.utils import YoutubeDLError
 
 from msu_hub_bot.utils import megabytes
-from msu_hub_bot.providers.vk.utils import href
 
 MediaLink = tuple[str, str, int | None, int | None]
 Preview = tuple[str, int | None, int | None]
@@ -151,14 +150,3 @@ class YDL:
             None,
         )
         return ordered, preview
-
-    @classmethod
-    def text_with_preview(cls, url: str) -> tuple[str, Preview | None] | None:
-        result = cls.extract(url)
-        if result is None:
-            return None
-        title, links, preview = result
-        text = href(preview[0], "📺") + " " if preview else "🎞 "
-        text += href(url, title) + "\n\n— "
-        text += ", ".join(href(link, label) for link, label, _, _ in links)
-        return text, preview

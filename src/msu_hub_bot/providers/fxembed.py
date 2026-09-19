@@ -4,6 +4,10 @@ import asyncio
 import ipaddress
 import json
 import re
+from contextlib import suppress
+from contextvars import Context
+from dataclasses import dataclass, field
+from functools import partial
 from typing import Annotated, Literal, TypeVar
 from urllib.parse import urlsplit
 
@@ -20,11 +24,9 @@ _POST_PATH = re.compile(
     r"/(?:[A-Za-z0-9_]{1,15}|i/web)/status/(?P<id>[1-9][0-9]{0,19})(?:/(?P<kind>photo|video)/(?P<index>[1-9][0-9]?))?/?$"
 )
 _ORIGINAL_HOSTS = {"x.com", "www.x.com", "mobile.x.com", "m.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com", "m.twitter.com"}
-_FIXED_HOSTS = {
-    f"{prefix}{domain}"
-    for domain in ("fixupx.com", "fxtwitter.com", "twittpr.com", "xfixup.com")
-    for prefix in ("", "www.", "i.", "d.", "g.", "t.")
-}
+_FIXED_DOMAINS = {"fixupx.com", "fxtwitter.com", "twittpr.com", "xfixup.com"}
+_FIXED_BASE_HOSTS = {f"{prefix}{domain}" for domain in _FIXED_DOMAINS for prefix in ("", "www.")}
+_FIXED_HOSTS = {f"{prefix}{domain}" for domain in _FIXED_DOMAINS for prefix in ("", "www.", "i.", "d.", "dl.", "g.", "t.", "m.", "o.")}
 _MEDIA_HOSTS = {"pbs.twimg.com", "video.twimg.com"}
 _SNOWFLAKE = re.compile(r"[1-9][0-9]{0,19}$")
 ModelT = TypeVar("ModelT", bound=BaseModel)
@@ -104,7 +106,8 @@ def _parse_post_url(value: str, hosts: set[str]) -> PostLink | None:
 
 
 def parse_post_url(value: str) -> PostLink | None:
-    return _parse_post_url(value, _ORIGINAL_HOSTS)
+    """Render ordinary post aliases; preserve explicit FxEmbed layouts/translations."""
+    return _parse_post_url(value, _ORIGINAL_HOSTS | _FIXED_BASE_HOSTS)
 
 
 def is_x_url(value: str) -> bool:
@@ -607,10 +610,51 @@ class FxPost(FxModel):
         return FxTombstone()
 
 
+@dataclass(slots=True)
+class _PostFetch:
+    task: asyncio.Task[FxPost]
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+    waiters: int = 0
+
+
 class FxEmbed:
-    """One bounded, credential-free request; no background sessions or retries."""
+    """Share concurrent public reads; completed posts are never cached."""
+
+    def __init__(self) -> None:
+        self._inflight: dict[tuple[asyncio.AbstractEventLoop, str], _PostFetch] = {}
 
     async def get_post(self, link: PostLink) -> FxPost:
+        key = asyncio.get_running_loop(), link.id
+        fetch = self._inflight.get(key)
+        if fetch is None:
+            # Shared transport must not inherit the first chat's request/telemetry context.
+            task = asyncio.create_task(self._fetch_post(link.id), name="fxembed.fetch", context=Context())
+            fetch = _PostFetch(task)
+            self._inflight[key] = fetch
+            task.add_done_callback(partial(self._finished, key, fetch), context=Context())
+        fetch.waiters += 1
+        try:
+            # Each Event waiter can be cancelled without cancelling the shared transport.
+            await fetch.done.wait()
+            return fetch.task.result().model_copy(deep=True)
+        finally:
+            fetch.waiters -= 1
+            if not fetch.waiters and not fetch.task.done():
+                if self._inflight.get(key) is fetch:
+                    del self._inflight[key]
+                fetch.task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await fetch.task
+
+    def _finished(self, key: tuple[asyncio.AbstractEventLoop, str], fetch: _PostFetch, task: asyncio.Task[FxPost]) -> None:
+        if self._inflight.get(key) is fetch:
+            del self._inflight[key]
+        if not task.cancelled():
+            # Retrieve failures even when every waiter was cancelled just as the read ended.
+            task.exception()
+        fetch.done.set()
+
+    async def _fetch_post(self, post_id: str) -> FxPost:
         try:
             async with (
                 asyncio.timeout(REQUEST_TIMEOUT),
@@ -620,7 +664,7 @@ class FxEmbed:
                     trust_env=False,
                 ) as session,
             ):
-                async with session.get(f"{API_ROOT}/status/{link.id}", allow_redirects=False) as response:
+                async with session.get(f"{API_ROOT}/status/{post_id}", allow_redirects=False) as response:
                     if response.status in {401, 403, 404}:
                         raise NotFoundError()
                     raw = await read_limited(response, MAX_RESPONSE_BYTES)
@@ -635,7 +679,7 @@ class FxEmbed:
                     or not isinstance(status, dict)
                     or status.get("type") != "status"
                     or status.get("provider") != "twitter"
-                    or status.get("id") != link.id
+                    or status.get("id") != post_id
                 ):
                     raise BadRequestError()
                 return FxPost.model_validate(status)

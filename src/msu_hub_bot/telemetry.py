@@ -72,7 +72,31 @@ class Provider(StrEnum):
     WIT = "wit"
     WOLFRAM = "wolfram"
     FXEMBED = "fxembed"
+    YOUTUBE = "youtube"
+    INSTAGRAM = "instagram"
+    TIKTOK = "tiktok"
     OTHER = "other"
+
+
+class MediaKind(StrEnum):
+    PHOTO = "photo"
+    VIDEO = "video"
+    GIF = "gif"
+
+
+class MediaReason(StrEnum):
+    READY = "ready"
+    READY_REDUCED = "ready_reduced"
+    OVERSIZE = "oversize"
+    UNSUPPORTED_FORMAT = "unsupported_format"
+    HTTP_ERROR = "http_error"
+    REDIRECT_REJECTED = "redirect_rejected"
+    EMPTY = "empty"
+    TIMEOUT = "timeout"
+    NETWORK = "network"
+    IO_ERROR = "io_error"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    CANCELLED = "cancelled"
 
 
 class Backend(StrEnum):
@@ -109,6 +133,9 @@ OPERATIONS = frozenset(
         "wit.recognize",
         "wolfram.query",
         "fxembed.fetch",
+        "links.extract",
+        "links.publish",
+        "x.media.prepare",
         "worker.queue",
         "worker.prepare",
         "worker.execute",
@@ -152,6 +179,51 @@ UPDATE_KINDS = frozenset(
     }
 )
 METRIC_KEYS = {"boundary", "operation", "outcome", "provider", "backend", "update.kind", *JOB_METRIC_KEYS}
+MEDIA_METRIC_KEYS = {"provider", "media.kind", "media.reason", "outcome"}
+_MEDIA_SIZE_BUCKETS = (0, 65536, 1048576, 4194304, 16777216, 67108864, 134217728, 1073741824)
+_MEDIA_READY = frozenset({MediaReason.READY, MediaReason.READY_REDUCED})
+
+
+def _media_size_bucket(size: int) -> int:
+    return next((bound for bound in _MEDIA_SIZE_BUCKETS if size <= bound), _MEDIA_SIZE_BUCKETS[-1])
+
+
+def _media_outcome(reason: MediaReason) -> Outcome:
+    if reason in _MEDIA_READY:
+        return Outcome.SUCCESS
+    if reason is MediaReason.CANCELLED:
+        return Outcome.CANCELLED
+    if reason is MediaReason.TIMEOUT:
+        return Outcome.TIMEOUT
+    if reason in {MediaReason.OVERSIZE, MediaReason.UNSUPPORTED_FORMAT, MediaReason.REDIRECT_REJECTED, MediaReason.BUDGET_EXHAUSTED}:
+        return Outcome.REJECTED
+    return Outcome.UNAVAILABLE
+
+
+@dataclass(slots=True)
+class _MediaSummary:
+    reasons: dict[MediaReason, int] = field(default_factory=dict)
+    attempts: int = 0
+    downloaded_bytes: int = 0
+
+    @property
+    def total(self) -> int:
+        return sum(self.reasons.values())
+
+    @property
+    def omitted(self) -> int:
+        return sum(count for reason, count in self.reasons.items() if reason not in _MEDIA_READY)
+
+    def attributes(self) -> dict[str, int]:
+        return {
+            "media.assets.total": self.total,
+            "media.assets.ready": self.total - self.omitted,
+            "media.assets.reduced": self.reasons.get(MediaReason.READY_REDUCED, 0),
+            "media.assets.omitted": self.omitted,
+            "media.download.attempts": self.attempts,
+            "media.download.size_bucket": _media_size_bucket(self.downloaded_bytes),
+            **{f"media.omitted.{reason.value}": count for reason, count in self.reasons.items() if reason not in _MEDIA_READY},
+        }
 
 
 @dataclass(frozen=True)
@@ -454,12 +526,20 @@ def failure_outcome(error: BaseException) -> Outcome:
 
 
 class Operation:
-    def __init__(self, owner: asyncio.Task[Any] | None, span: Span | None = None) -> None:
+    def __init__(
+        self,
+        owner: asyncio.Task[Any] | None,
+        span: Span | None = None,
+        *,
+        media_record: Callable[[MediaKind, MediaReason, int, int, float], None] | None = None,
+    ) -> None:
         self.owner, self._span = owner, span
         self.outcome = Outcome.SUCCESS
         self.active = True
         self.failure: dict[str, str | int] = {}
         self.details: dict[str, int] = {}
+        self._media_record = media_record
+        self._media = _MediaSummary() if media_record is not None else None
 
     def set_outcome(self, outcome: Outcome) -> None:
         if isinstance(outcome, Outcome):
@@ -476,6 +556,47 @@ class Operation:
             self.details["attempt"] = min(10, max(1, attempt))
             if self._span is not None:
                 self._span.set_attribute("attempt", self.details["attempt"])
+
+    def media_asset(
+        self,
+        kind: MediaKind,
+        reason: MediaReason,
+        *,
+        attempts: int = 0,
+        downloaded_bytes: int = 0,
+        duration: float = 0,
+    ) -> None:
+        """Account for one asset using only fixed categories and bounded measurements."""
+        if not self.active or self._media is None or self._media_record is None:
+            return
+        if (
+            not isinstance(kind, MediaKind)
+            or not isinstance(reason, MediaReason)
+            or type(attempts) is not int
+            or attempts < 0
+            or type(downloaded_bytes) is not int
+            or downloaded_bytes < 0
+            or type(duration) not in {int, float}
+            or (type(duration) is float and not math.isfinite(duration))
+            or duration < 0
+        ):
+            return
+        try:
+            if self.owner is not asyncio.current_task():
+                return
+        except RuntimeError:
+            return
+        try:
+            attempts, size, duration = min(attempts, 1000), min(downloaded_bytes, 1073741824), min(duration, 3600)
+            self._media.reasons[reason] = self._media.reasons.get(reason, 0) + 1
+            self._media.attempts += attempts
+            self._media.downloaded_bytes += size
+            self.details.update(self._media.attributes())
+            if self._span is not None:
+                self._span.set_attributes(self.details)
+            self._media_record(kind, reason, attempts, _media_size_bucket(size), duration)
+        except Exception:
+            logger.warning("Telemetry media diagnostics failed")
 
 
 class _QueueProcessor(SpanProcessor):
@@ -663,6 +784,22 @@ class Telemetry:
         """A late thread completion contributes metrics, never another task's trace."""
         self._measure(Boundary.MEDIA, "worker.execute", outcome, duration, backend=Backend.NATIVE.value)
 
+    def _record_media_asset(
+        self, kind: MediaKind, reason: MediaReason, attempts: int, size_bucket: int, duration: float, *, provider: Provider | None
+    ) -> None:
+        if not self._available():
+            return
+        attributes = {
+            "provider": provider.value if isinstance(provider, Provider) else Provider.OTHER.value,
+            "media.kind": kind.value,
+            "media.reason": reason.value,
+            "outcome": _media_outcome(reason).value,
+        }
+        self._media_assets.add(1, attributes)
+        self._media_attempts.add(attempts, attributes)
+        self._media_duration.record(duration, attributes)
+        self._media_size.record(size_bucket, attributes)
+
     async def start(self) -> None:
         if self._worker is not None or self._closed or not self.config.export:
             return
@@ -697,6 +834,22 @@ class Telemetry:
                     View(instrument_name="bot.telemetry.dropped_spans", meter_name="msu_hub_bot.telemetry", attribute_keys=set()),
                     View(instrument_name="bot.telemetry.dropped_logs", meter_name="msu_hub_bot.telemetry", attribute_keys=set()),
                     View(instrument_name="bot.poll.requests", meter_name="msu_hub_bot.telemetry", attribute_keys={"outcome"}),
+                    View(instrument_name="bot.media.assets", meter_name="msu_hub_bot.telemetry", attribute_keys=MEDIA_METRIC_KEYS),
+                    View(
+                        instrument_name="bot.media.download.attempts", meter_name="msu_hub_bot.telemetry", attribute_keys=MEDIA_METRIC_KEYS
+                    ),
+                    View(
+                        instrument_name="bot.media.download.duration",
+                        meter_name="msu_hub_bot.telemetry",
+                        attribute_keys=MEDIA_METRIC_KEYS,
+                        aggregation=ExplicitBucketHistogramAggregation([0.01, 0.1, 0.5, 1, 5, 10, 30, 90, 180]),
+                    ),
+                    View(
+                        instrument_name="bot.media.download.size",
+                        meter_name="msu_hub_bot.telemetry",
+                        attribute_keys=MEDIA_METRIC_KEYS,
+                        aggregation=ExplicitBucketHistogramAggregation(_MEDIA_SIZE_BUCKETS),
+                    ),
                     View(
                         instrument_name="bot.feature_jobs.transitions",
                         meter_name="msu_hub_bot.telemetry",
@@ -716,6 +869,10 @@ class Telemetry:
             self._drops = meter.create_counter("bot.telemetry.dropped_spans", unit="1")
             self._log_drops = meter.create_counter("bot.telemetry.dropped_logs", unit="1")
             self._poll_count = meter.create_counter("bot.poll.requests", unit="1")
+            self._media_assets = meter.create_counter("bot.media.assets", unit="1")
+            self._media_attempts = meter.create_counter("bot.media.download.attempts", unit="1")
+            self._media_duration = meter.create_histogram("bot.media.download.duration", unit="s")
+            self._media_size = meter.create_histogram("bot.media.download.size", unit="By")
             self._job_transitions = meter.create_counter("bot.feature_jobs.transitions", unit="1")
             meter.create_observable_gauge("bot.feature_jobs.snapshot_age", callbacks=[self._job_gauge_callback(None)], unit="s")
             for job_gauge in JobGaugeName:
@@ -793,6 +950,12 @@ class Telemetry:
             if not failed and (span is None or not span.is_recording()):
                 return
             event = "bot.operation.failed" if failed else "bot.operation.completed"
+        elif boundary is Boundary.MEDIA and handle._media is not None:
+            if not handle._media.total:
+                return
+            if not handle._media.omitted and not failed and (span is None or not span.is_recording()):
+                return
+            event = "media.preparation.omitted" if handle._media.omitted else "media.preparation.completed"
         else:
             return
         # An explicit empty context prevents ambient baggage or unrelated traces.
@@ -906,7 +1069,11 @@ class Telemetry:
             )
 
         span = start_span() if trace else None
-        handle = Operation(owner, span)
+
+        def record_asset(kind: MediaKind, reason: MediaReason, attempts: int, size_bucket: int, duration: float) -> None:
+            self._record_media_asset(kind, reason, attempts, size_bucket, duration, provider=provider)
+
+        handle = Operation(owner, span, media_record=record_asset if boundary is Boundary.MEDIA and key == "x.media.prepare" else None)
         token = _current.set(handle)
         start = time.monotonic()
         try:
@@ -936,6 +1103,15 @@ class Telemetry:
         finally:
             try:
                 duration = time.monotonic() - start
+                if handle.outcome is Outcome.SUCCESS and handle._media is not None and handle._media.omitted:
+                    reasons = handle._media.reasons
+                    handle.set_outcome(
+                        Outcome.CANCELLED
+                        if MediaReason.CANCELLED in reasons
+                        else Outcome.TIMEOUT
+                        if MediaReason.TIMEOUT in reasons
+                        else Outcome.UNAVAILABLE
+                    )
                 if span is not None:
                     span.set_attribute("outcome", handle.outcome.value)
                     if handle.outcome is Outcome.UNEXPECTED:

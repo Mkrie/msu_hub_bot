@@ -2,7 +2,7 @@ from html.parser import HTMLParser
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from msu_hub_bot.telegram import vk as publish
+from msu_hub_bot.telegram.links import vk as publish
 from msu_hub_bot.providers.vk.posts import best_photo
 from msu_hub_bot.providers.vk.models import Photo
 from msu_hub_bot.providers.vk.utils import href, prepare_vk_text, safe_url
@@ -39,14 +39,17 @@ class TelegramHTML(HTMLParser):
         self.links = []
 
     def handle_starttag(self, tag, attrs):
-        assert tag == "a" and not self.open
-        assert len(attrs) == 1 and attrs[0][0] == "href"
-        assert safe_url(attrs[0][1])
-        self.open = True
-        self.links.append(attrs[0][1])
+        assert tag in {"a", "tg-emoji"} and not self.open
+        assert len(attrs) == 1
+        if tag == "a":
+            assert attrs[0][0] == "href" and safe_url(attrs[0][1])
+            self.links.append(attrs[0][1])
+        else:
+            assert attrs[0][0] == "emoji-id" and attrs[0][1].isdigit()
+        self.open = tag
 
     def handle_endtag(self, tag):
-        assert tag == "a" and self.open
+        assert tag == self.open
         self.open = False
 
     def handle_data(self, text):

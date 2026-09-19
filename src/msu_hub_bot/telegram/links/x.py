@@ -2,15 +2,15 @@
 
 import asyncio
 import re
+import time
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from urllib.parse import quote, urljoin
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
 
 import aiohttp
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
     FSInputFile,
     InputFile,
@@ -18,35 +18,26 @@ from aiogram.types import (
     InputMediaVideo,
     InputRichBlockBlockQuotation,
     InputRichBlockCollage,
-    InputRichBlockFooter,
     InputRichBlockParagraph,
     InputRichBlockPhoto,
     InputRichBlockSectionHeading,
     InputRichBlockUnion,
     InputRichBlockVideo,
     InputRichMessage,
-    LinkPreviewOptions,
     Message,
-    ReplyParameters,
     RichTextBold,
-    RichTextCode,
-    RichTextCustomEmoji,
-    RichTextItalic,
-    RichTextStrikethrough,
-    RichTextUnderline,
-    RichTextUnion,
     RichTextUrl,
 )
 
 from msu_hub_bot.providers.fxembed import FxMedia, FxMediaFormat, FxPost, FxStyleRange, FxText, PostLink, safe_media_url, safe_public_url
 from msu_hub_bot.providers.http import USER_AGENT
+from msu_hub_bot.telegram.links.rich import _paragraphs, _Span, _units, publish_messages, split_messages
 from msu_hub_bot.telegram.wrapper import BotWrapper
+from msu_hub_bot.telemetry import Boundary, MediaKind, MediaReason, Provider, Telemetry
 
-_MAX_TEXT = 32768
-_MAX_BLOCKS = 500
-_MAX_MEDIA = 50
 _MAX_VIDEO_SIDE = 10000
 _MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+_PREPARE_TIMEOUT = 90
 _X_EMOJI_ID = "5422502846648039176"
 _X_EMOJI_FALLBACK = "💬"
 _DOWNLOADS = asyncio.Semaphore(2)
@@ -55,50 +46,6 @@ _MEDIA_LINK = re.compile(r"(?:https?://)?(?:t\.co|(?:pic\.)?(?:x\.com|twitter\.c
 _STYLES = {"BOLD", "ITALIC", "CODE", "STRIKETHROUGH", "UNDERLINE"}
 
 type _Upload = InputFile | InputMediaVideo
-
-
-@dataclass(frozen=True, slots=True)
-class _Span:
-    text: str
-    url: str | None = None
-    style: str | None = None
-    custom_emoji_id: str | None = None
-
-    def rich(self) -> RichTextUnion:
-        text: RichTextUnion = (
-            RichTextCustomEmoji(custom_emoji_id=self.custom_emoji_id, alternative_text=self.text) if self.custom_emoji_id else self.text
-        )
-        if self.url:
-            text = RichTextUrl(text=text, url=self.url)
-        for style in (self.style or "").split(","):
-            if style == "BOLD":
-                text = RichTextBold(text=text)
-            elif style == "ITALIC":
-                text = RichTextItalic(text=text)
-            elif style == "CODE":
-                text = RichTextCode(text=text)
-            elif style == "STRIKETHROUGH":
-                text = RichTextStrikethrough(text=text)
-            elif style == "UNDERLINE":
-                text = RichTextUnderline(text=text)
-        return text
-
-
-def _units(text: str) -> int:
-    return len(text.encode("utf-16-le")) // 2
-
-
-def _pieces(text: str, limit: int) -> Iterator[str]:
-    """Split on code points; never cut a surrogate pair or discard whitespace."""
-    start = size = 0
-    for index, char in enumerate(text):
-        width = 2 if ord(char) > 0xFFFF else 1
-        if size + width > limit:
-            yield text[start:index]
-            start, size = index, 0
-        size += width
-    if start < len(text):
-        yield text[start:]
 
 
 def _autolinks(text: str) -> list[_Span]:
@@ -207,40 +154,16 @@ def _spans(
     return result
 
 
-def _paragraphs(spans: Sequence[_Span], *, limit: int = _MAX_TEXT) -> list[InputRichBlockUnion]:
-    parts: list[InputRichBlockUnion] = []
-    current: list[RichTextUnion] = []
-    size = 0
-    for span in spans:
-        remaining = span.text
-        while remaining:
-            available = limit - size
-            if available < (2 if ord(remaining[0]) > 0xFFFF else 1):
-                parts.append(InputRichBlockParagraph(text=current))
-                current, size = [], 0
-                continue
-            piece = next(_pieces(remaining, available))
-            current.append(replace(span, text=piece).rich())
-            size += _units(piece)
-            remaining = remaining[len(piece) :]
-    if current:
-        parts.append(InputRichBlockParagraph(text=current))
-    return parts
-
-
-def _author(post: FxPost) -> InputRichBlockParagraph:
-    return InputRichBlockParagraph(
-        text=[
-            RichTextCustomEmoji(custom_emoji_id=_X_EMOJI_ID, alternative_text=_X_EMOJI_FALLBACK),
-            " ",
-            RichTextBold(text=post.author.name),
-            " · ",
-            RichTextUrl(text="@" + post.author.screen_name, url=post.author.url),
-            " · ",
-            RichTextUrl(text="↗", url=post.url),
-            "\n",
-        ]
-    )
+def _author(post: FxPost) -> list[_Span]:
+    return [
+        _Span(_X_EMOJI_FALLBACK, custom_emoji_id=_X_EMOJI_ID),
+        _Span(" "),
+        _Span(post.author.name, style="BOLD"),
+        _Span(" · "),
+        _Span("@" + post.author.screen_name, post.author.url),
+        _Span(" · "),
+        _Span("↗", post.url),
+    ]
 
 
 def _selected(post: FxPost, link: PostLink | None) -> list[FxMedia]:
@@ -297,14 +220,16 @@ def _gallery(media: Sequence[FxMedia], uploads: Mapping[str, _Upload], post: FxP
 
 
 def _post_blocks(post: FxPost, uploads: Mapping[str, _Upload], link: PostLink | None = None, depth: int = 0) -> list[InputRichBlockUnion]:
-    blocks: list[InputRichBlockUnion] = [_author(post)]
+    intro = _author(post)
     if post.replying_to:
-        blocks.append(
-            InputRichBlockParagraph(text=RichTextUrl(text=f"↪ В ответ @{post.replying_to.screen_name}", url=post.replying_to.url))
-        )
+        intro.extend([_Span("\n\n"), _Span(f"↪ В ответ @{post.replying_to.screen_name}", post.replying_to.url)])
     media = _selected(post, link)
     shown = frozenset(item.id for item in media if item.id and item.url in uploads)
-    blocks.extend(_paragraphs(_spans(post.text, post.raw_text, unescape=True, shown_media_ids=shown)))
+    body = _spans(post.text, post.raw_text, unescape=True, shown_media_ids=shown)
+    if body:
+        # Clients trim paragraph edges; keep the visible separator inside the text.
+        intro.extend([_Span("\n\n"), *body])
+    blocks = _paragraphs(intro)
     blocks.extend(_gallery(media, uploads, post))
     if post.media.unsupported_count:
         blocks.append(
@@ -415,69 +340,10 @@ def _article_blocks(post: FxPost, uploads: Mapping[str, _Upload]) -> list[InputR
     return blocks
 
 
-def _rich_spans(text: RichTextUnion, *, url: str | None = None, style: str | None = None) -> Iterator[_Span]:
-    if isinstance(text, str):
-        yield _Span(text, url, style)
-    elif isinstance(text, list):
-        for child in text:
-            yield from _rich_spans(child, url=url, style=style)
-    elif isinstance(text, RichTextUrl):
-        yield from _rich_spans(text.text, url=text.url, style=style)
-    elif isinstance(text, RichTextCustomEmoji):
-        yield _Span(text.alternative_text, url, style, text.custom_emoji_id)
-    elif isinstance(text, RichTextBold | RichTextItalic | RichTextCode | RichTextStrikethrough | RichTextUnderline):
-        combined = ",".join(sorted({*(style or "").split(","), text.type.upper()} - {""}))
-        yield from _rich_spans(text.text, url=url, style=combined)
-    else:
-        raise TypeError("Unsupported X rich text")
-
-
-def _cost(blocks: Sequence[InputRichBlockUnion]) -> tuple[int, int, int]:
-    text = media = 0
-    count = len(blocks)
-    for block in blocks:
-        if isinstance(block, InputRichBlockBlockQuotation | InputRichBlockCollage):
-            nested = _cost(block.blocks)
-            text, count, media = text + nested[0], count + nested[1], media + nested[2]
-        elif isinstance(block, InputRichBlockPhoto | InputRichBlockVideo):
-            media += 1
-        elif isinstance(block, InputRichBlockParagraph | InputRichBlockFooter | InputRichBlockSectionHeading):
-            text += sum(_units(span.text) for span in _rich_spans(block.text))
-    return text, count, media
-
-
-def _fits(blocks: Sequence[InputRichBlockUnion]) -> bool:
-    return all(value <= maximum for value, maximum in zip(_cost(blocks), (_MAX_TEXT, _MAX_BLOCKS, _MAX_MEDIA), strict=True))
-
-
-def _flat_blocks(blocks: Sequence[InputRichBlockUnion]) -> Iterator[InputRichBlockUnion]:
-    for block in blocks:
-        if isinstance(block, InputRichBlockBlockQuotation):
-            yield InputRichBlockParagraph(text=RichTextBold(text="Цитата"))
-            yield from _flat_blocks(block.blocks)
-        elif isinstance(block, InputRichBlockCollage):
-            yield from _flat_blocks(block.blocks)
-        elif isinstance(block, InputRichBlockParagraph | InputRichBlockFooter | InputRichBlockSectionHeading):
-            yield from _paragraphs(list(_rich_spans(block.text)))
-        else:
-            yield block
-
-
 def render_x_post(post: FxPost, uploads: Mapping[str, _Upload], *, link: PostLink | None = None) -> list[InputRichMessage]:
     """Keep ordinary posts together; flatten and split only genuine overflows."""
     blocks = _post_blocks(post, uploads, link)
-    if _fits(blocks):
-        return [InputRichMessage(blocks=blocks, skip_entity_detection=True)]
-    result: list[InputRichMessage] = []
-    part: list[InputRichBlockUnion] = []
-    for block in _flat_blocks(blocks):
-        if part and not _fits([*part, block]):
-            result.append(InputRichMessage(blocks=part, skip_entity_detection=True))
-            part = []
-        part.append(block)
-    if part:
-        result.append(InputRichMessage(blocks=part, skip_entity_detection=True))
-    return result
+    return split_messages(blocks)
 
 
 def _all_media(post: FxPost, link: PostLink | None = None) -> Iterator[FxMedia]:
@@ -493,6 +359,41 @@ def _all_media(post: FxPost, link: PostLink | None = None) -> Iterator[FxMedia]:
 @dataclass(slots=True)
 class _DownloadBudget:
     remaining: int = _MAX_UPLOAD_BYTES
+    requests: int = 0
+    reduced_photos: int = 0
+
+
+class _DownloadRejected(ValueError):
+    def __init__(self, reason: MediaReason) -> None:
+        self.reason = reason
+        message = "X media is outside upload limits" if reason in {MediaReason.OVERSIZE, MediaReason.BUDGET_EXHAUSTED} else reason.value
+        super().__init__(message)
+
+
+def _smaller_photo_url(media: FxMedia) -> str | None:
+    """Change only recognized original X photo URLs to the CDN's large rendition."""
+    if media.type != "photo" or not safe_media_url(media.url):
+        return None
+    parsed = urlsplit(media.url)
+    if parsed.hostname != "pbs.twimg.com":
+        return None
+    match = re.fullmatch(
+        r"/media/[A-Za-z0-9_-]+(?:\.(?P<format>jpg|jpeg|png|webp))?(?::(?P<size>orig|large|medium|small|thumb))?", parsed.path
+    )
+    if match is None:
+        return None
+    pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    params = dict(pairs)
+    if len(params) != len(pairs) or params.keys() - {"format", "name"}:
+        return None
+    # An unspecified CDN size may already be smaller than large.
+    if params.get("name", match["size"]) != "orig" or match["size"] not in {None, "orig"}:
+        return None
+    if params.get("format", match["format"]) not in {"jpg", "jpeg", "png", "webp"}:
+        return None
+    path = parsed.path.removesuffix(":" + match["size"]) if match["size"] else parsed.path
+    params["name"] = "large"
+    return urlunsplit((parsed.scheme, parsed.netloc, path, urlencode(params), ""))
 
 
 def _variant_size(variant: FxMediaFormat, media: FxMedia) -> float | None:
@@ -521,71 +422,125 @@ def _download_url(media: FxMedia, limit: int) -> str:
         and estimated <= limit
     ]
     if not candidates:
-        raise ValueError("X media is outside upload limits")
+        raise _DownloadRejected(MediaReason.OVERSIZE)
     return max(candidates, key=lambda variant: (variant.bitrate or 0, (variant.width or 0) * (variant.height or 0))).url
 
 
-async def _download(session: aiohttp.ClientSession, media: FxMedia, destination: Path, budget: _DownloadBudget) -> FxMediaFormat | None:
+async def _download_once(session: aiohttp.ClientSession, media: FxMedia, url: str, destination: Path, budget: _DownloadBudget) -> None:
     limit = min(9 * 1024 * 1024 if media.type == "photo" else 49 * 1024 * 1024, budget.remaining)
-    if limit <= 0 or not safe_media_url(media.url):
-        raise ValueError("X media is outside upload limits")
-    url = _download_url(media, limit)
-    variant = next((item for item in media.formats if item.url == url), None)
+    if limit <= 0:
+        raise _DownloadRejected(MediaReason.BUDGET_EXHAUSTED)
+    for _ in range(4):
+        budget.requests += 1
+        async with session.get(url, allow_redirects=False) as response:
+            if response.status in (301, 302, 303, 307, 308):
+                url = urljoin(url, response.headers.get("Location", ""))
+                if not safe_media_url(url):
+                    raise _DownloadRejected(MediaReason.REDIRECT_REJECTED)
+                continue
+            if response.status == 413:
+                raise _DownloadRejected(MediaReason.OVERSIZE)
+            if response.status != 200:
+                raise _DownloadRejected(MediaReason.HTTP_ERROR)
+            if response.content_length is not None and response.content_length > limit:
+                raise _DownloadRejected(MediaReason.OVERSIZE)
+            content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+            allowed = {"image/jpeg", "image/png", "image/webp"} if media.type == "photo" else {"video/mp4"}
+            if content_type not in allowed:
+                raise _DownloadRejected(MediaReason.UNSUPPORTED_FORMAT)
+            size = 0
+            with destination.open("wb") as stream:
+                async for chunk in response.content.iter_chunked(65536):
+                    size += len(chunk)
+                    budget.remaining -= len(chunk)
+                    if size > limit:
+                        reason = MediaReason.BUDGET_EXHAUSTED if budget.remaining <= 0 else MediaReason.OVERSIZE
+                        raise _DownloadRejected(reason)
+                    stream.write(chunk)
+            if not size:
+                raise _DownloadRejected(MediaReason.EMPTY)
+            return
+    raise _DownloadRejected(MediaReason.REDIRECT_REJECTED)
+
+
+async def _download(session: aiohttp.ClientSession, media: FxMedia, destination: Path, budget: _DownloadBudget) -> FxMediaFormat | None:
+    if budget.remaining <= 0:
+        raise _DownloadRejected(MediaReason.BUDGET_EXHAUSTED)
+    if not safe_media_url(media.url):
+        raise _DownloadRejected(MediaReason.REDIRECT_REJECTED)
     async with _DOWNLOADS:
-        for _ in range(4):
-            async with session.get(url, allow_redirects=False) as response:
-                if response.status in (301, 302, 303, 307, 308):
-                    url = urljoin(url, response.headers.get("Location", ""))
-                    if not safe_media_url(url):
-                        raise ValueError("Unsupported media redirect")
-                    continue
-                if response.status != 200 or (response.content_length is not None and response.content_length > limit):
-                    raise ValueError("X media is unavailable or too large")
-                content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
-                allowed = {"image/jpeg", "image/png", "image/webp"} if media.type == "photo" else {"video/mp4"}
-                if content_type not in allowed:
-                    raise ValueError("Unsupported X media format")
-                size = 0
-                with destination.open("wb") as stream:
-                    async for chunk in response.content.iter_chunked(65536):
-                        size += len(chunk)
-                        budget.remaining -= len(chunk)
-                        if size > limit:
-                            raise ValueError("X media exceeds upload limits")
-                        stream.write(chunk)
-                if not size:
-                    raise ValueError("Empty X media")
-                return variant
-    raise ValueError("Too many media redirects")
+        try:
+            limit = min(9 * 1024 * 1024 if media.type == "photo" else 49 * 1024 * 1024, budget.remaining)
+            url = _download_url(media, limit)
+            await _download_once(session, media, url, destination, budget)
+        except _DownloadRejected as error:
+            fallback = _smaller_photo_url(media) if error.reason is MediaReason.OVERSIZE else None
+            if fallback is None or budget.remaining <= 0:
+                raise
+            destination.unlink(missing_ok=True)
+            budget.reduced_photos += 1
+            await _download_once(session, media, fallback, destination, budget)
+            return None
+    return next((item for item in media.formats if item.url == url), None)
 
 
-def _plain(blocks: Sequence[InputRichBlockUnion]) -> str:
-    text: list[str] = []
-    for block in _flat_blocks(blocks):
-        if isinstance(block, InputRichBlockParagraph | InputRichBlockFooter | InputRichBlockSectionHeading):
-            text.append(
-                "".join(span.text + (f" ({span.url})" if span.url and span.url != span.text else "") for span in _rich_spans(block.text))
-            )
-        elif isinstance(block, InputRichBlockPhoto | InputRichBlockVideo):
-            text.append("Медиа — в оригинале.")
-    return "\n\n".join(text)
-
-
-def _can_fallback(error: TelegramBadRequest) -> bool:
-    reason = error.message.lower()
-    return any(word in reason for word in ("rich", "media", "photo", "video", "file", "entity", "text is too long"))
-
-
-def _without_custom_emoji(blocks: Sequence[InputRichBlockUnion]) -> list[InputRichBlockUnion]:
-    result: list[InputRichBlockUnion] = []
-    for block in blocks:
-        if isinstance(block, InputRichBlockBlockQuotation | InputRichBlockCollage):
-            block = block.model_copy(update={"blocks": _without_custom_emoji(block.blocks)})
-        elif isinstance(block, InputRichBlockParagraph | InputRichBlockFooter | InputRichBlockSectionHeading):
-            text = [replace(span, custom_emoji_id=None).rich() for span in _rich_spans(block.text)]
-            block = block.model_copy(update={"text": text})
-        result.append(block)
-    return result
+async def _prepare_uploads(post: FxPost, link: PostLink | None, directory: Path, telemetry: Telemetry) -> dict[str, _Upload]:
+    items: dict[str, FxMedia] = {}
+    for media in _all_media(post, link):
+        items.setdefault(media.url, media)
+    if not items:
+        return {}
+    uploads: dict[str, _Upload] = {}
+    with telemetry.operation(Boundary.MEDIA, "x.media.prepare", provider=Provider.FXEMBED) as preparation:
+        async with aiohttp.ClientSession(
+            headers={"User-Agent": USER_AGENT}, timeout=aiohttp.ClientTimeout(total=40, connect=10), trust_env=False
+        ) as session:
+            budget = _DownloadBudget()
+            deadline = asyncio.timeout(_PREPARE_TIMEOUT)
+            pending = iter(enumerate(items.values()))
+            try:
+                async with deadline:
+                    for index, media in pending:
+                        path = directory / f"{index}{'.jpg' if media.type == 'photo' else '.mp4'}"
+                        started = time.monotonic()
+                        before = budget.remaining, budget.requests, budget.reduced_photos
+                        reason = MediaReason.READY
+                        try:
+                            variant = await _download(session, media, path, budget)
+                            file = FSInputFile(path)
+                            uploads[media.url] = file if media.type == "photo" else _video_upload(file, media, variant)
+                            if budget.reduced_photos > before[2]:
+                                reason = MediaReason.READY_REDUCED
+                        except _DownloadRejected as error:
+                            reason = error.reason
+                        except TimeoutError:
+                            reason = MediaReason.TIMEOUT
+                        except aiohttp.ClientError:
+                            reason = MediaReason.NETWORK
+                        except OSError:
+                            reason = MediaReason.IO_ERROR
+                        except ValueError:
+                            reason = MediaReason.UNSUPPORTED_FORMAT
+                        except asyncio.CancelledError:
+                            reason = MediaReason.TIMEOUT if deadline.expired() else MediaReason.CANCELLED
+                            raise
+                        finally:
+                            preparation.media_asset(
+                                MediaKind(media.type),
+                                reason,
+                                attempts=budget.requests - before[1],
+                                downloaded_bytes=before[0] - budget.remaining,
+                                duration=time.monotonic() - started,
+                            )
+                            if reason not in {MediaReason.READY, MediaReason.READY_REDUCED}:
+                                path.unlink(missing_ok=True)
+            except (TimeoutError, asyncio.CancelledError) as error:
+                reason = MediaReason.TIMEOUT if isinstance(error, TimeoutError) else MediaReason.CANCELLED
+                for _, media in pending:
+                    preparation.media_asset(MediaKind(media.type), reason, attempts=0, downloaded_bytes=0, duration=0)
+                if isinstance(error, asyncio.CancelledError):
+                    raise
+    return uploads
 
 
 async def publish_x_post(
@@ -596,61 +551,15 @@ async def publish_x_post(
     *,
     message_thread_id: int | None = None,
     link: PostLink | None = None,
+    telemetry: Telemetry | None = None,
 ) -> Message | None:
     """Download only public X CDN media; never repeat an ambiguous Telegram send."""
-    uploads: dict[str, _Upload] = {}
     with TemporaryDirectory(prefix="msu-x-") as directory:
-        async with aiohttp.ClientSession(
-            headers={"User-Agent": USER_AGENT}, timeout=aiohttp.ClientTimeout(total=40, connect=10)
-        ) as session:
-            budget = _DownloadBudget()
-            seen: set[str] = set()
-            try:
-                async with asyncio.timeout(90):
-                    for index, media in enumerate(_all_media(post, link)):
-                        if media.url in seen:
-                            continue
-                        seen.add(media.url)
-                        suffix = ".jpg" if media.type == "photo" else ".mp4"
-                        path = Path(directory) / f"{index}{suffix}"
-                        try:
-                            variant = await _download(session, media, path, budget)
-                        except aiohttp.ClientError, TimeoutError, OSError, ValueError:
-                            path.unlink(missing_ok=True)
-                            continue
-                        file = FSInputFile(path)
-                        uploads[media.url] = file if media.type == "photo" else _video_upload(file, media, variant)
-            except TimeoutError:
-                pass
-        result = None
-        async with bot.serial_send(chat_id):
-            for message in render_x_post(post, uploads, link=link):
-                reply = ReplyParameters(message_id=reply_to, allow_sending_without_reply=True) if reply_to is not None else None
-                for custom_emoji in (True, False):
-                    try:
-                        result = await bot.send_rich_message(
-                            chat_id=chat_id, rich_message=message, reply_parameters=reply, message_thread_id=message_thread_id
-                        )
-                    except TelegramBadRequest as error:
-                        if custom_emoji and any(word in error.message.lower() for word in ("custom emoji", "custom_emoji")):
-                            # A definite rejection permits one retry if the bot loses emoji eligibility.
-                            message = message.model_copy(update={"blocks": _without_custom_emoji(message.blocks or [])})
-                            continue
-                        if not _can_fallback(error):
-                            raise
-                        for text in _pieces(_plain(message.blocks or []), 4096):
-                            if not text.strip():
-                                continue
-                            result = await bot.send_message(
-                                chat_id=chat_id,
-                                text=text,
-                                parse_mode=None,
-                                link_preview_options=LinkPreviewOptions(is_disabled=True),
-                                reply_parameters=reply,
-                                message_thread_id=message_thread_id,
-                            )
-                            reply = ReplyParameters(message_id=result.message_id, allow_sending_without_reply=True)
-                    break
-                if result:
-                    reply_to = result.message_id
-        return result
+        uploads = await _prepare_uploads(post, link, Path(directory), telemetry or Telemetry())
+        return await publish_messages(
+            render_x_post(post, uploads, link=link),
+            bot,
+            chat_id,
+            reply_to,
+            message_thread_id=message_thread_id,
+        )

@@ -11,7 +11,7 @@ from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import ExportM
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
 
 from msu_hub_bot.telegram.middlewares.telemetry import DispatchTelemetryMiddleware, HandlerTelemetryMiddleware
-from msu_hub_bot.telemetry import Boundary, GaugeName, JobGaugeName, Outcome, Provider, Telemetry, TelemetryConfig
+from msu_hub_bot.telemetry import Boundary, GaugeName, JobGaugeName, MediaKind, MediaReason, Outcome, Provider, Telemetry, TelemetryConfig
 from telegram_helpers import make_message
 from telemetry_helpers import Capture, config
 
@@ -48,6 +48,162 @@ async def test_disabled_default_ignores_ambient_tokens_and_resources(monkeypatch
     await telemetry.close()
     assert sink.started == 0 and sink.payloads == []
     assert trace.get_tracer_provider() is not telemetry._provider
+
+
+def media_metrics(sink):
+    return {
+        metric.name: metric
+        for message in sink.messages()
+        if isinstance(message, ExportMetricsServiceRequest)
+        for resource in message.resource_metrics
+        for scope in resource.scope_metrics
+        for metric in scope.metrics
+        if metric.name.startswith("bot.media.")
+    }
+
+
+async def test_media_preparation_aggregates_assets_without_exporting_raw_sizes_or_identity_labels():
+    sink = Capture()
+    telemetry = Telemetry(config(), transport=sink)
+    await telemetry.start()
+    with telemetry.context(user_id=42, chat_id=-10042, message_id=7, thread_id=3):
+        with telemetry.operation(Boundary.MEDIA, "x.media.prepare", provider=Provider.FXEMBED) as preparation:
+            preparation.media_asset(MediaKind.PHOTO, MediaReason.READY_REDUCED, attempts=3, downloaded_bytes=123456, duration=1.25)
+            preparation.media_asset(MediaKind.VIDEO, MediaReason.HTTP_ERROR, attempts=2, downloaded_bytes=9876543, duration=2.5)
+            preparation.media_asset(MediaKind.GIF, MediaReason.TIMEOUT, attempts=1, downloaded_bytes=71, duration=4)
+    await telemetry.close()
+
+    assert len(sink.spans()) == len(sink.logs()) == 1
+    span = sink.spans()[0]
+    attributes = {item.key: item.value for item in span.attributes}
+    assert span.name == "media.operation" and not span.events
+    assert attributes["outcome"].string_value == "timeout"
+    assert attributes["media.assets.total"].int_value == 3
+    assert attributes["media.assets.ready"].int_value == 1
+    assert attributes["media.assets.reduced"].int_value == 1
+    assert attributes["media.assets.omitted"].int_value == 2
+    assert attributes["media.download.attempts"].int_value == 6
+    assert attributes["media.download.size_bucket"].int_value == 16777216
+    assert attributes["media.omitted.http_error"].int_value == attributes["media.omitted.timeout"].int_value == 1
+    assert attributes["telegram.user_id"].int_value == 42 and attributes["telegram.chat_id"].int_value == -10042
+    record = sink.logs()[0]
+    assert record.body.string_value == "media.preparation.omitted"
+    assert record.trace_id == span.trace_id and record.span_id == span.span_id
+    assert {item.key for item in record.attributes} == set(attributes) | {"boundary", "duration_ms"}
+
+    metrics = media_metrics(sink)
+    assert set(metrics) == {"bot.media.assets", "bot.media.download.attempts", "bot.media.download.duration", "bot.media.download.size"}
+    assert sum(point.as_int for point in metrics["bot.media.assets"].sum.data_points) == 3
+    assert sum(point.as_int for point in metrics["bot.media.download.attempts"].sum.data_points) == 6
+    assert sum(point.sum for point in metrics["bot.media.download.duration"].histogram.data_points) == 7.75
+    points = metrics["bot.media.download.size"].histogram.data_points
+    assert {point.sum for point in points} == {65536, 1048576, 16777216}
+    assert all(point.min == point.max == point.sum for point in points)
+    for metric in metrics.values():
+        for point in getattr(metric, metric.WhichOneof("data")).data_points:
+            labels = {item.key: item.value.string_value for item in point.attributes}
+            assert set(labels) == {"provider", "media.kind", "media.reason", "outcome"}
+            assert labels["provider"] == "fxembed"
+            assert not point.exemplars
+
+
+@pytest.mark.parametrize("reason,expected_logs", [(MediaReason.READY, 0), (MediaReason.READY_REDUCED, 0), (MediaReason.OVERSIZE, 1)])
+async def test_unsampled_media_keeps_metrics_and_only_logs_omissions(reason, expected_logs):
+    sink = Capture()
+    telemetry = Telemetry(config(sample_rate=0), transport=sink)
+    await telemetry.start()
+    with telemetry.operation(Boundary.MEDIA, "x.media.prepare", provider=Provider.FXEMBED) as preparation:
+        preparation.media_asset(MediaKind.PHOTO, reason, attempts=1, duration=0.5)
+    await telemetry.close()
+    assert sink.spans() == []
+    assert len(sink.logs()) == expected_logs
+    assert media_metrics(sink)["bot.media.assets"].sum.data_points[0].as_int == 1
+    if expected_logs:
+        assert sink.logs()[0].body.string_value == "media.preparation.omitted"
+        attributes = {item.key: item.value for item in sink.logs()[0].attributes}
+        assert attributes["outcome"].string_value == "unavailable"
+        assert attributes["media.omitted.oversize"].int_value == 1
+
+
+async def test_media_summary_success_is_sampled_and_empty_or_unrelated_operations_do_not_claim_assets():
+    sink = Capture()
+    telemetry = Telemetry(config(), transport=sink)
+    await telemetry.start()
+    with telemetry.operation(Boundary.MEDIA, "x.media.prepare"):
+        pass
+    with telemetry.operation(Boundary.MEDIA, "worker.prepare") as other:
+        other.media_asset(MediaKind.PHOTO, MediaReason.READY)
+    assert not telemetry._log_queue
+    with telemetry.operation(Boundary.MEDIA, "x.media.prepare") as preparation:
+        preparation.media_asset(MediaKind.PHOTO, MediaReason.READY, downloaded_bytes=1)
+    await telemetry.close()
+    assert len(sink.logs()) == 1 and sink.logs()[0].body.string_value == "media.preparation.completed"
+    assert media_metrics(sink)["bot.media.assets"].sum.data_points[0].as_int == 1
+
+
+async def test_media_diagnostics_reject_arbitrary_categories_and_malformed_measurements():
+    sink = Capture()
+    telemetry = Telemetry(config(), transport=sink)
+    await telemetry.start()
+    token = context.attach(baggage.set_baggage("media.url", f"https://example.org/{CANARY}"))
+    try:
+        with pytest.raises(RuntimeError):
+            with telemetry.operation(Boundary.MEDIA, "x.media.prepare", provider=CANARY) as preparation:
+                preparation.media_asset(CANARY, MediaReason.NETWORK)
+                preparation.media_asset(MediaKind.PHOTO, CANARY)
+                for invalid in (
+                    {"attempts": CANARY},
+                    {"attempts": True},
+                    {"downloaded_bytes": CANARY},
+                    {"downloaded_bytes": -1},
+                    {"duration": CANARY},
+                    {"duration": float("nan")},
+                    {"duration": float("inf")},
+                ):
+                    preparation.media_asset(MediaKind.PHOTO, MediaReason.READY, **invalid)
+                preparation.media_asset(MediaKind.PHOTO, MediaReason.NETWORK, attempts=10**400, downloaded_bytes=10**400, duration=10**400)
+                error = RuntimeError(f"{CANARY} /private/media/file.jpg https://example.org/{CANARY}")
+                error.add_note(CANARY)
+                raise error
+    finally:
+        context.detach(token)
+        await telemetry.close()
+    assert CANARY not in sink.serialized()
+    assert "/private/media" not in sink.serialized() and "https://example.org" not in sink.serialized()
+    metrics = media_metrics(sink)
+    assert metrics["bot.media.assets"].sum.data_points[0].as_int == 1
+    assert metrics["bot.media.download.attempts"].sum.data_points[0].as_int == 1000
+    assert metrics["bot.media.download.duration"].histogram.data_points[0].sum == 3600
+    assert metrics["bot.media.download.size"].histogram.data_points[0].sum == 1073741824
+    assert not any(span.events for span in sink.spans())
+    attributes = {item.key: item.value for item in sink.spans()[0].attributes}
+    assert attributes["outcome"].string_value == "unexpected"
+
+
+async def test_media_accounting_is_owned_by_the_live_preparation_task_and_disabled_by_default():
+    sink = Capture()
+    telemetry = Telemetry(config(), transport=sink)
+    await telemetry.start()
+    with telemetry.operation(Boundary.MEDIA, "x.media.prepare") as preparation:
+
+        async def detached():
+            preparation.media_asset(MediaKind.PHOTO, MediaReason.READY)
+
+        await asyncio.create_task(detached())
+        await asyncio.to_thread(preparation.media_asset, MediaKind.PHOTO, MediaReason.READY)
+        preparation.media_asset(MediaKind.PHOTO, MediaReason.CANCELLED, attempts=1, duration=0.1)
+    preparation.media_asset(MediaKind.PHOTO, MediaReason.READY)
+    await telemetry.close()
+    assert media_metrics(sink)["bot.media.assets"].sum.data_points[0].as_int == 1
+    assert {item.key: item.value for item in sink.spans()[0].attributes}["outcome"].string_value == "cancelled"
+
+    disabled = Capture()
+    telemetry = Telemetry(transport=disabled)
+    await telemetry.start()
+    with telemetry.operation(Boundary.MEDIA, "x.media.prepare") as preparation:
+        preparation.media_asset(MediaKind.PHOTO, MediaReason.READY)
+    await telemetry.close()
+    assert not disabled.started and not disabled.payloads
 
 
 async def test_job_dimensions_are_registered_and_stale_queue_snapshots_disappear(monkeypatch):

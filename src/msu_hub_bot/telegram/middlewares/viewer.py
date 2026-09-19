@@ -2,39 +2,25 @@
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any
 
 from aiogram import BaseMiddleware
 from aiogram.dispatcher.event.bases import UNHANDLED
 from aiogram.dispatcher.flags import get_flag
-from aiogram.enums import MessageEntityType
-from aiogram.types import InputMediaDocument, InputMediaVideo, Message, TelegramObject, URLInputFile
-from yarl import URL
+from aiogram.types import Message, TelegramObject
 
-from msu_hub_bot.execution.executor import ExecutorBusy
 from msu_hub_bot.media.limits import MAX_DOWNLOAD_BYTES
 from msu_hub_bot.providers.exceptions import ExternalServiceError
-from msu_hub_bot.providers.fxembed import FxEmbed, PostLink, is_x_url, parse_post_url
-from msu_hub_bot.providers.instagram import InstagramViewer
 from msu_hub_bot.providers.pdf import convert_to_pdf
-from msu_hub_bot.providers.ydl import YDL
+from msu_hub_bot.providers.vk.api import VkApi
 from msu_hub_bot.telegram.context import bot_for
-from msu_hub_bot.telegram.delivery import AlbumMedia, reply_album
 from msu_hub_bot.telegram.files import DownloadTooLarge, download, input_file
+from msu_hub_bot.telegram.links.service import LinkService, PreviewExecutor
 from msu_hub_bot.telegram.middlewares.settings import Settings
 from msu_hub_bot.telegram.state import UpdateStateContext, release_state_isolation
-from msu_hub_bot.telegram.utils import extract_urls
 from msu_hub_bot.telegram.wrapper import BotWrapper
-from msu_hub_bot.telegram.x_posts import publish_x_post
-from msu_hub_bot.telemetry import Boundary, Provider, Telemetry
-from msu_hub_bot.utils import megabytes, valid_filename
-from msu_hub_bot.providers.vk.api import VkApi
-from msu_hub_bot.providers.vk.posts import VkPost
-from msu_hub_bot.telegram.vk import publish_vk_post
-
-
-class PreviewExecutor(Protocol):
-    async def run(self, func: Callable[..., Any], *args: Any, timeout: float | None = 180) -> tuple[Any, bool]: ...
+from msu_hub_bot.telemetry import Telemetry
+from msu_hub_bot.utils import megabytes
 
 
 @dataclass(slots=True)
@@ -57,115 +43,11 @@ async def preview_policy(
 
 class ViewerMiddleware(BaseMiddleware):
     def __init__(self, bot: BotWrapper, vk_api: VkApi, executor: PreviewExecutor, *, telemetry: Telemetry | None = None) -> None:
-        self.bot = bot
-        self.vk_api = vk_api
-        self.executor = executor
-        self.fxembed = FxEmbed()
         self.telemetry = telemetry or Telemetry()
-
-    async def handle_x_post(self, message: Message, link: PostLink) -> None:
-        try:
-            with self.telemetry.operation(Boundary.PROVIDER, "fxembed.fetch", provider=Provider.FXEMBED):
-                post = await self.fxembed.get_post(link)
-        except ExternalServiceError:
-            return
-        await publish_x_post(
-            post,
-            self.bot,
-            message.chat.id,
-            message.message_id,
-            message_thread_id=message.message_thread_id if message.is_topic_message else None,
-            link=link,
-        )
-
-    @staticmethod
-    def x_preview_allowed(message: Message) -> bool:
-        return not (
-            (message.from_user and message.from_user.is_bot)
-            or message.is_automatic_forward
-            or (message.link_preview_options and message.link_preview_options.is_disabled is True)
-            or (message.text or message.caption or "").lstrip().startswith("/")
-            or any(entity.type == MessageEntityType.BOT_COMMAND for entity in message.entities or message.caption_entities or [])
-        )
-
-    async def handle_vk_posts(self, message: Message, url: URL) -> bool:
-        matches = VkPost.pattern_vk_post.findall(str(url))[:2]
-        paths = ",".join(dict.fromkeys(matches))
-        if not paths:
-            return False
-        for post in await VkPost.from_api_by_id(self.vk_api, paths):
-            await publish_vk_post(
-                post,
-                self.bot,
-                message.chat.id,
-                message.message_id,
-                message_thread_id=message.message_thread_id if message.is_topic_message else None,
-            )
-        return True
-
-    @staticmethod
-    async def handle_instagram(message: Message, url: URL) -> None:
-        result = await InstagramViewer.links(url)
-        if result is None:
-            return
-        links, prefix = result
-        documents: list[AlbumMedia] = []
-        videos: list[AlbumMedia] = []
-        for link, caption in links:
-            extension = URL(link).name.rpartition(".")[2]
-            file = URLInputFile(link, filename=valid_filename(f"{prefix}.{extension}"))
-            if extension == "mp4":
-                videos.append(InputMediaVideo(media=file, caption=caption))
-            else:
-                documents.append(InputMediaDocument(media=file, caption=caption))
-        if documents:
-            await reply_album(message, documents)
-        if videos:
-            await reply_album(message, videos)
-
-    async def handle_video(self, message: Message, url: URL) -> None:
-        try:
-            result, timed_out = await self.executor.run(YDL.text_with_preview, str(url), timeout=60)
-        except ExecutorBusy:
-            return
-        if timed_out or result is None:
-            return
-        text, preview = result
-        if preview:
-            video_url, width, height = preview
-            await message.reply_video(URLInputFile(video_url, filename="video.mp4"), caption=text, width=width, height=height)
-        else:
-            await message.reply(text, disable_web_page_preview=True)
+        self.links = LinkService(bot, vk_api, executor, telemetry=self.telemetry)
 
     async def view(self, message: Message, preferences: Settings, *, x_previews: bool = True) -> None:
-        seen_x: set[tuple[str, str | None, int | None]] = set()
-        considered = 0
-        for url, entity_type in extract_urls(message):
-            if considered >= 2:
-                break
-            if is_x_url(str(url)):
-                link = parse_post_url(str(url))
-                if link is None:
-                    # Fixed embeds already have a preview; other X routes are not posts.
-                    considered += 1
-                    continue
-                identity = (link.id, link.media_kind, link.media_index)
-                if identity in seen_x:
-                    continue
-                seen_x.add(identity)
-                considered += 1
-                if x_previews and preferences.auto_x_previews and self.x_preview_allowed(message):
-                    await self.handle_x_post(message, link)
-                continue
-            considered += 1
-            if entity_type == MessageEntityType.URL and await self.handle_vk_posts(message, url):
-                continue
-            if url.host:
-                if url.host.endswith("instagram.com"):
-                    await self.handle_instagram(message, url)
-                elif preferences.auto_video_links:
-                    await self.handle_video(message, url)
-
+        await self.links.view(message, preferences, x_previews=x_previews)
         destination = message.document
         extensions = tuple(
             f".{extension}"
