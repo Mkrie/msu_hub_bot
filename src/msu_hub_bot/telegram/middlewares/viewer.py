@@ -42,7 +42,13 @@ class ViewerMiddleware(BaseMiddleware):
         paths = ",".join(dict.fromkeys(matches))
         if paths:
             for post in await VkPost.from_api_by_id(self.vk_api, paths):
-                await publish_vk_post(post, self.bot, message.chat.id, message.message_id)
+                await publish_vk_post(
+                    post,
+                    self.bot,
+                    message.chat.id,
+                    message.message_id,
+                    message_thread_id=message.message_thread_id if message.is_topic_message else None,
+                )
 
     @staticmethod
     async def handle_instagram(message: Message, url: URL) -> None:

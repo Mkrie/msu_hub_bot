@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 from msu_hub_bot.providers.vk import publish
 from msu_hub_bot.providers.vk.posts import best_photo
 from msu_hub_bot.providers.vk.models import Photo
-from msu_hub_bot.providers.vk.utils import href, prepare_vk_text, safe_url, utf16_length
+from msu_hub_bot.providers.vk.utils import href, prepare_vk_text, safe_url
 
 
 import pytest
@@ -144,13 +144,11 @@ def test_attachment_rendering_escapes_all_user_fields_and_retains_source_fallbac
 
 
 @pytest.mark.parametrize("text", ["😀" * 10_000, "<&>" * 10_000, "[id20|" + "x" * 50_000 + "]"])
-def test_long_posts_are_intact_bounded_excerpts_with_source(text):
-    rendered = parse_post(text=text).render()
+def test_long_posts_keep_the_complete_rendered_text(text):
+    rendered = parse_post(text=text).render(with_header=False)
     parsed = check_html(rendered)
-    assert utf16_length(rendered) <= 3500
-    assert utf16_length(parsed.text) <= 3500
-    assert parsed.links[-1] == "https://vk.com/wall-10_1"
-    assert parsed.text.endswith("Читать целиком в VK →")
+    assert parsed.text == check_html(prepare_vk_text(text)).text
+    assert "Читать целиком" not in rendered
 
 
 def test_media_combined_count_and_repeated_publication_are_stable():
@@ -359,7 +357,7 @@ def test_branching_history_and_media_stay_bounded_with_original_source_link():
     rendered, _, photos, videos = parsed.for_publish(with_webpreview=False)
     assert len(parsed.history) == 10
     assert len(photos) + len(videos) <= 10
-    assert utf16_length(rendered) <= 3500
+    assert check_html(rendered).text.count("Nested") == 9
     assert "Все вложения — в VK" in check_html(rendered).text
 
 

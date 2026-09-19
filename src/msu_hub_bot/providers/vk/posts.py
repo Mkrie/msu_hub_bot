@@ -29,7 +29,7 @@ from msu_hub_bot.providers.vk.models import (
     VideoPlaylist,
     Wall,
 )
-from msu_hub_bot.providers.vk.utils import bounded_html, href, prepare_vk_text, safe_url
+from msu_hub_bot.providers.vk.utils import href, prepare_vk_text, safe_url
 from msu_hub_bot.utils import prettify_bytes, prettify_duration
 
 
@@ -165,7 +165,7 @@ class VkPost:
             parts.extend([f"↪ {href(url, self._get_name(copied.owner_id))}:", prepare_vk_text(copied.text), self._details(copied)])
         parts.append(self.attachments)
         text = "\n\n".join(part.strip() for part in parts if part.strip())
-        return bounded_html(text or href(self.url, "Открыть запись в VK"), self.url)
+        return text or href(self.url, "Открыть запись в VK")
 
     def _details(self, post: Post) -> str:
         parts = []

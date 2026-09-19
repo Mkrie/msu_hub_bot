@@ -1,7 +1,7 @@
 """Bot presentation helpers and method-aware Telegram request policy."""
 
 import asyncio
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
@@ -132,6 +132,7 @@ class BotWrapper(Bot):
         reply_to: int | None = None,
         *,
         message_thread_id: int | None = None,
+        text_splitter: Callable[[str], Iterable[str]] | None = None,
     ) -> Message | None:
         async with self.serial_send(chat_id):
             return await send_super_message(
@@ -143,6 +144,7 @@ class BotWrapper(Bot):
                 chat_id,
                 reply_to,
                 message_thread_id=message_thread_id,
+                text_splitter=text_splitter,
             )
 
     async def send_super_message_prefer_album(

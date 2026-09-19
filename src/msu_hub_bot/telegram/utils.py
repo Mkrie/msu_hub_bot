@@ -56,10 +56,12 @@ async def send_super_message(
     text_postprocess: Callable[[str], str] | None = None,
     *,
     message_thread_id: int | None = None,
+    text_splitter: Callable[[str], Iterable[str]] | None = None,
 ) -> Message | None:
     message = None
     process_text = text_postprocess or (lambda value: value)
-    texts = [process_text(part) for part in cut_long_text(text)] if text else []
+    split = text_splitter or cut_long_text
+    texts = [process_text(part) for part in split(text)] if text else []
     for index, part in enumerate(texts):
         last = index == len(texts) - 1
         preview = web_preview if last else None
