@@ -53,13 +53,29 @@ def run_process(command: Sequence[str], *, timeout: float, max_output_bytes: int
             raise subprocess.CalledProcessError(process.returncode, command)
         return bytes(output)
     finally:
+        cleanup_denied = False
         try:
             # Also remove descendants after a launcher exits successfully.
             with suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except PermissionError as error:
+                    # Darwin can report EPERM while a leader is exiting. Reap it
+                    # within a fixed grace period, then still stop descendants.
+                    try:
+                        process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        raise error from None
+                    os.killpg(process.pid, signal.SIGKILL)
+        except PermissionError:
+            cleanup_denied = True
+            raise
         finally:
             try:
-                process.wait()
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                if not cleanup_denied:
+                    raise
             finally:
                 if process.stdout is not None:
                     process.stdout.close()
