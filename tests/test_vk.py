@@ -95,6 +95,68 @@ def test_current_photo_chooses_largest_telegram_compatible_size():
     assert best_photo(photo).endswith("original.jpg")
 
 
+@pytest.mark.parametrize("original", [{"url": 123}, {"width": -1}, "changed optional image"])
+def test_bad_optional_original_preserves_usable_photo_sizes(original):
+    parsed = parse_post(
+        attachments=[
+            attachment(
+                "photo",
+                {
+                    "sizes": [{"url": "https://sun9.userapi.com/usable.jpg", "width": 200, "height": 150}],
+                    "orig_photo": original,
+                },
+            )
+        ]
+    )
+    text, _, photos, _ = parsed.for_publish(with_webpreview=False)
+    assert photos == ["https://sun9.userapi.com/usable.jpg"]
+    assert "Все вложения" not in text
+
+
+def test_current_graffiti_url_keeps_the_image():
+    parsed = parse_post(
+        attachments=[
+            attachment("graffiti", {"id": 1, "owner_id": -10, "url": "https://sun9.userapi.com/graffiti.png", "width": 640, "height": 480})
+        ]
+    )
+    text, _, photos, _ = parsed.for_publish(with_webpreview=False)
+    assert photos == ["https://sun9.userapi.com/graffiti.png"]
+    assert "Все вложения" not in text
+
+
+@pytest.mark.parametrize(
+    "original",
+    [
+        {"url": "http://127.0.0.1/graffiti.png"},
+        {"url": "https://example.org/graffiti.png"},
+        {"url": "https://sun9.userapi.com/original.png", "width": 6000, "height": 6000},
+        {"url": "https://sun9.userapi.com/original.png", "width": 9000, "height": 100},
+        {"url": "https://sun9.userapi.com/original.png", "width": "bad"},
+    ],
+)
+def test_unusable_graffiti_original_keeps_a_safe_legacy_preview(original):
+    parsed = parse_post(attachments=[attachment("graffiti", original | {"photo_586": "https://sun9.userapi.com/preview.jpg"})])
+    assert parsed.for_publish(with_webpreview=False)[2] == ["https://sun9.userapi.com/preview.jpg"]
+
+
+@pytest.mark.parametrize("album_id", [-6, -7, 1])
+def test_system_photo_albums_keep_their_title_count_and_link(album_id):
+    parsed = parse_post(attachments=[attachment("album", {"id": album_id, "owner_id": -10, "title": "Wall photos", "size": 4})])
+    visible = check_html(parsed.render())
+    assert "Wall photos, 4 фото" in visible.text
+    assert f"https://vk.com/album-10_{album_id}" in visible.links
+    assert "Все вложения" not in visible.text
+
+
+@pytest.mark.parametrize("field", ["image", "first_frame"])
+def test_unused_video_previews_cannot_hide_a_public_video_link(field):
+    parsed = parse_post(attachments=[attachment("video", {"id": 2, "owner_id": -10, "title": "Public video", field: [{"url": 123}]})])
+    visible = check_html(parsed.render())
+    assert "Public video" in visible.text
+    assert "https://vk.com/video-10_2" in visible.links
+    assert "Все вложения" not in visible.text
+
+
 @pytest.mark.parametrize(
     "url",
     [
@@ -296,6 +358,23 @@ def test_malformed_optional_author_does_not_hide_public_text_or_media(field, val
     rendered, _, photos, _ = parsed.for_publish(with_webpreview=False)
     assert "Keep the post" in check_html(rendered).text
     assert "— Автор:" not in rendered
+    assert photos == ["https://sun9.userapi.com/public.jpg"]
+
+
+@pytest.mark.parametrize("copyright", [{"link": 123, "name": "Source"}, {"name": []}, "changed optional copyright"])
+@pytest.mark.parametrize("copied", [False, True])
+def test_malformed_optional_copyright_does_not_hide_public_text_or_media(copyright, copied):
+    post = {
+        "id": 2,
+        "owner_id": -20,
+        "text": "Keep this public post",
+        "copyright": copyright,
+        "attachments": [attachment("photo", {"sizes": [{"url": "https://sun9.userapi.com/public.jpg"}]})],
+    }
+    parsed = parse_post(**({"copy_history": [post]} if copied else post))
+    rendered, _, photos, _ = parsed.for_publish(with_webpreview=False)
+    assert "Keep this public post" in check_html(rendered).text
+    assert "— Источник:" not in rendered
     assert photos == ["https://sun9.userapi.com/public.jpg"]
 
 

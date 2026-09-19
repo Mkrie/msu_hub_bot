@@ -33,6 +33,14 @@ class Photo(VkModel):
     images: list[Image] = Field(default_factory=list, max_length=100)
     orig_photo: Image | None = None
 
+    @field_validator("orig_photo", mode="before")
+    @classmethod
+    def usable_original(cls, value: object) -> Image | None:
+        try:
+            return Image.model_validate(value) if value is not None else None
+        except ValidationError:
+            return None
+
 
 class Video(VkModel):
     id: PositiveID
@@ -40,8 +48,6 @@ class Video(VkModel):
     title: str = "Видео"
     duration: int = Field(default=0, ge=0)
     is_private: StrictInt | StrictBool = False
-    image: list[Image] = Field(default_factory=list, max_length=100)
-    first_frame: list[Image] = Field(default_factory=list, max_length=100)
 
 
 class VideoPlaylist(VkModel):
@@ -136,7 +142,7 @@ class Poll(VkModel):
 
 
 class Album(VkModel):
-    id: PositiveID
+    id: int = Field(strict=True)
     owner_id: OwnerID
     title: str = "Альбом"
     size: int = Field(default=0, ge=0)
@@ -227,6 +233,14 @@ class Post(VkModel):
     @classmethod
     def usable_author(cls, value: object) -> int | None:
         return value if type(value) is int and value != 0 else None
+
+    @field_validator("copyright", mode="before")
+    @classmethod
+    def usable_copyright(cls, value: object) -> Copyright | None:
+        try:
+            return Copyright.model_validate(value) if value is not None else None
+        except ValidationError:
+            return None
 
     @field_validator("geo", mode="before")
     @classmethod

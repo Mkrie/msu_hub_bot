@@ -228,6 +228,9 @@ class VkPost:
                         if not isinstance(data, dict):
                             unsupported = True
                             continue
+                        if kind == "graffiti" and (url := best_photo(Photo.model_validate({"orig_photo": data}))):
+                            photos.append(url)
+                            continue
                         candidates = [
                             (int(k.removeprefix("photo_")), v)
                             for k, v in data.items()
