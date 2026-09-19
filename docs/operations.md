@@ -35,6 +35,26 @@ blocks a job or changes its state.
    all held jobs, edit leases, delete receipts, or replace uncertain records with
    defaults. Queue inspection deliberately offers no generic replay switch.
 
+## Investigating link previews
+
+[Link workshop](../tools/observability/dashboards/links.json) is the reproducible
+dashboard for native previews. `bot.links.attempts` records one terminal outcome
+per considered link, up to two candidates per message. Delivery percentage compares
+successful, failed and declined previews; disabled/policy skips, unsupported generic
+yt-dlp links and cancellations stay separate. It does not measure every URL shared
+in a chat. `bot.links.steps` counts concrete extraction attempts separately: an
+earlier failed download can recover without making the final preview a failure.
+
+Start with provider totals and terminal failure reasons, then inspect the bounded
+recent-failures table for the sanitized source URL, chat/user/message/topic IDs,
+HTTP status and trace. `bot.link.completed` and `bot.link.step.failed` logs are
+emitted independently of trace sampling, but bounded export can lose records;
+check Pulse freshness before interpreting missing evidence. Source URLs and
+identities are private diagnostic context, never metric labels or public reports.
+Use the [observability contract](observability.md) for the export allowlist and
+dashboard management. A failed step alone does not justify retrying a Telegram
+send whose result is uncertain.
+
 ## Scheduled operational alerts
 
 `tools/operations/monitor.py` checks successful maintenance receipts and free space:

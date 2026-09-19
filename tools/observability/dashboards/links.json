@@ -1,0 +1,346 @@
+{
+  "name": "Hub · Link workshop",
+  "slug": "bot-links",
+  "definition": {
+    "kind": "Dashboard",
+    "metadata": {
+      "name": "Hub · Link workshop",
+      "project": "PROJECT_NAME"
+    },
+    "spec": {
+      "display": {
+        "name": "Hub · Link workshop",
+        "description": "From shared URL to native preview: unsampled delivery outcomes, provider trouble spots and private source context. Failed download steps stay separate from final results."
+      },
+      "datasources": {},
+      "variables": [],
+      "panels": {
+        "outcomes": {
+          "kind": "Panel",
+          "spec": {
+            "display": {
+              "name": "Preview outcomes per minute",
+              "description": "Unsampled terminal counters: one result per considered link, including disabled/policy skips. At most two candidates per message; this is not a count of all shared URLs."
+            },
+            "plugin": {
+              "kind": "TimeSeriesChart",
+              "spec": {
+                "legend": {
+                  "position": "bottom",
+                  "mode": "list",
+                  "size": "small"
+                },
+                "yAxis": {
+                  "show": true,
+                  "min": 0,
+                  "format": {
+                    "unit": "decimal",
+                    "shortValues": true
+                  }
+                },
+                "visual": {
+                  "display": "bar",
+                  "lineWidth": 1.5,
+                  "areaOpacity": 0,
+                  "pointRadius": 2,
+                  "connectNulls": false,
+                  "stack": "all"
+                }
+              }
+            },
+            "queries": [
+              {
+                "kind": "TimeSeriesQuery",
+                "spec": {
+                  "plugin": {
+                    "kind": "LogfireTimeSeriesQuery",
+                    "spec": {
+                      "query": "WITH streams AS (\n    SELECT time_bucket($resolution, recorded_timestamp) AS x,\n        service_version, service_instance_id, process_pid,\n        attributes->>'provider' AS provider,\n        attributes->>'link.stage' AS stage,\n        attributes->>'link.reason' AS reason,\n        attributes->>'outcome' AS outcome,\n        metric_rate(value, recorded_timestamp) AS n\n    FROM metrics\n    WHERE service_name = 'msu-hub-bot' AND deployment_environment = 'production'\n      AND metric_name = 'bot.links.attempts'\n    GROUP BY x, service_version, service_instance_id, process_pid, provider, stage, reason, outcome\n)\nSELECT x, outcome, 60 * SUM(n) AS previews_per_minute FROM streams GROUP BY x, outcome ORDER BY x, outcome",
+                      "groupBy": "outcome",
+                      "metrics": [
+                        "previews_per_minute"
+                      ]
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "deliveries": {
+          "kind": "Panel",
+          "spec": {
+            "display": {
+              "name": "Delivered previews per minute",
+              "description": "Successful terminal previews by provider. Retries and individual assets cannot inflate deliveries. Empty or stale telemetry is not evidence of zero traffic."
+            },
+            "plugin": {
+              "kind": "TimeSeriesChart",
+              "spec": {
+                "legend": {
+                  "position": "bottom",
+                  "mode": "list",
+                  "size": "small"
+                },
+                "yAxis": {
+                  "show": true,
+                  "min": 0,
+                  "format": {
+                    "unit": "decimal",
+                    "shortValues": true
+                  }
+                },
+                "visual": {
+                  "display": "bar",
+                  "lineWidth": 1.5,
+                  "areaOpacity": 0,
+                  "pointRadius": 2,
+                  "connectNulls": false,
+                  "stack": "all"
+                }
+              }
+            },
+            "queries": [
+              {
+                "kind": "TimeSeriesQuery",
+                "spec": {
+                  "plugin": {
+                    "kind": "LogfireTimeSeriesQuery",
+                    "spec": {
+                      "query": "WITH streams AS (\n    SELECT time_bucket($resolution, recorded_timestamp) AS x,\n        service_version, service_instance_id, process_pid,\n        attributes->>'provider' AS provider,\n        attributes->>'link.stage' AS stage,\n        attributes->>'link.reason' AS reason,\n        attributes->>'outcome' AS outcome,\n        metric_rate(value, recorded_timestamp) AS n\n    FROM metrics\n    WHERE service_name = 'msu-hub-bot' AND deployment_environment = 'production'\n      AND metric_name = 'bot.links.attempts'\n    GROUP BY x, service_version, service_instance_id, process_pid, provider, stage, reason, outcome\n)\nSELECT x, provider, 60 * SUM(n) AS delivered_per_minute FROM streams WHERE outcome = 'success' GROUP BY x, provider ORDER BY x, provider",
+                      "groupBy": "provider",
+                      "metrics": [
+                        "delivered_per_minute"
+                      ]
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "providers": {
+          "kind": "Panel",
+          "spec": {
+            "display": {
+              "name": "How each provider is doing",
+              "description": "Delivery % = delivered / (delivered + failed + declined). Ignored and cancelled previews are separate: unsupported generic yt-dlp links and disabled settings do not reduce delivery %. Counts are unsampled; export loss is still possible."
+            },
+            "plugin": {
+              "kind": "Table",
+              "spec": {}
+            },
+            "queries": [
+              {
+                "kind": "NonTimeSeriesQuery",
+                "spec": {
+                  "plugin": {
+                    "kind": "LogfireNonTimeSeriesQuery",
+                    "spec": {
+                      "query": "WITH streams AS (\n    SELECT \n        service_version, service_instance_id, process_pid,\n        attributes->>'provider' AS provider,\n        attributes->>'link.stage' AS stage,\n        attributes->>'link.reason' AS reason,\n        attributes->>'outcome' AS outcome,\n        metric_increase(value, recorded_timestamp) AS n\n    FROM metrics\n    WHERE service_name = 'msu-hub-bot' AND deployment_environment = 'production'\n      AND metric_name = 'bot.links.attempts'\n    GROUP BY service_version, service_instance_id, process_pid, provider, stage, reason, outcome\n)\nSELECT provider, SUM(n) AS previews,\n    SUM(CASE WHEN outcome = 'success' THEN n ELSE 0 END) AS delivered,\n    SUM(CASE WHEN outcome IN ('unavailable', 'timeout', 'unexpected') THEN n ELSE 0 END) AS failed,\n    SUM(CASE WHEN outcome = 'rejected' THEN n ELSE 0 END) AS declined,\n    SUM(CASE WHEN outcome = 'ignored' THEN n ELSE 0 END) AS skipped,\n    SUM(CASE WHEN outcome = 'cancelled' THEN n ELSE 0 END) AS cancelled,\n    100.0 * SUM(CASE WHEN outcome = 'success' THEN n ELSE 0 END)\n      / NULLIF(SUM(CASE WHEN outcome IN ('success', 'rejected', 'unavailable', 'timeout', 'unexpected') THEN n ELSE 0 END), 0) AS delivered_percent\nFROM streams GROUP BY provider HAVING SUM(n) > 0\nORDER BY failed DESC, declined DESC, previews DESC, provider\n"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "terminal-causes": {
+          "kind": "Panel",
+          "spec": {
+            "display": {
+              "name": "Why previews were not delivered",
+              "description": "Terminal failures and declined previews, grouped by provider, last stage and reason. Earlier failed attempts that recovered appear only in the step panels."
+            },
+            "plugin": {
+              "kind": "BarChart",
+              "spec": {
+                "orientation": "horizontal",
+                "showValues": true,
+                "calculation": "last-number",
+                "format": {
+                  "unit": "decimal",
+                  "shortValues": true
+                },
+                "sort": "desc",
+                "orderBy": "value",
+                "mode": "value"
+              }
+            },
+            "queries": [
+              {
+                "kind": "NonTimeSeriesQuery",
+                "spec": {
+                  "plugin": {
+                    "kind": "LogfireNonTimeSeriesQuery",
+                    "spec": {
+                      "query": "WITH streams AS (\n    SELECT \n        service_version, service_instance_id, process_pid,\n        attributes->>'provider' AS provider,\n        attributes->>'link.stage' AS stage,\n        attributes->>'link.reason' AS reason,\n        attributes->>'outcome' AS outcome,\n        metric_increase(value, recorded_timestamp) AS n\n    FROM metrics\n    WHERE service_name = 'msu-hub-bot' AND deployment_environment = 'production'\n      AND metric_name = 'bot.links.attempts'\n    GROUP BY service_version, service_instance_id, process_pid, provider, stage, reason, outcome\n)\nSELECT provider || ' · ' || stage || ' · ' || reason AS cause, SUM(n) AS previews FROM streams WHERE outcome IN ('rejected', 'unavailable', 'timeout', 'unexpected') GROUP BY provider, stage, reason HAVING SUM(n) > 0 ORDER BY previews DESC, cause LIMIT 15"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "step-causes": {
+          "kind": "Panel",
+          "spec": {
+            "display": {
+              "name": "Failed steps · may recover",
+              "description": "Unsampled concrete request/image/video/adapter attempts. One preview can have several failed steps and still succeed; these counts are never added to terminal failures."
+            },
+            "plugin": {
+              "kind": "Table",
+              "spec": {}
+            },
+            "queries": [
+              {
+                "kind": "NonTimeSeriesQuery",
+                "spec": {
+                  "plugin": {
+                    "kind": "LogfireNonTimeSeriesQuery",
+                    "spec": {
+                      "query": "WITH streams AS (\n    SELECT \n        service_version, service_instance_id, process_pid,\n        attributes->>'provider' AS provider,\n        attributes->>'link.stage' AS stage,\n        attributes->>'link.reason' AS reason,\n        attributes->>'outcome' AS outcome,\n        metric_increase(value, recorded_timestamp) AS n\n    FROM metrics\n    WHERE service_name = 'msu-hub-bot' AND deployment_environment = 'production'\n      AND metric_name = 'bot.links.steps'\n    GROUP BY service_version, service_instance_id, process_pid, provider, stage, reason, outcome\n)\nSELECT provider, stage, reason, outcome, SUM(n) AS steps FROM streams WHERE outcome IN ('rejected', 'unavailable', 'timeout', 'unexpected') GROUP BY provider, stage, reason, outcome HAVING SUM(n) > 0 ORDER BY steps DESC, provider, stage, reason LIMIT 30"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "recent-failures": {
+          "kind": "Panel",
+          "spec": {
+            "display": {
+              "name": "Recent undelivered links · private context",
+              "description": "Terminal logs are emitted independently of trace sampling. Sanitized source links and Telegram identities are private incident context; retain trace/span links when available. Export loss can still hide a record."
+            },
+            "plugin": {
+              "kind": "Table",
+              "spec": {}
+            },
+            "queries": [
+              {
+                "kind": "NonTimeSeriesQuery",
+                "spec": {
+                  "plugin": {
+                    "kind": "LogfireNonTimeSeriesQuery",
+                    "spec": {
+                      "query": "SELECT date_trunc('second', start_timestamp) AS time_utc,\n    attributes->>'provider' AS provider,\n    attributes->>'link.stage' AS stage,\n    attributes->>'link.reason' AS reason,\n    attributes->>'outcome' AS outcome,\n    attributes->>'link.source_url' AS source_url,\n    json_get_int(attributes, 'telegram.chat_id') AS chat_id,\n    json_get_int(attributes, 'telegram.user_id') AS user_id,\n    json_get_int(attributes, 'telegram.message_id') AS message_id,\n    json_get_int(attributes, 'telegram.thread_id') AS thread_id,\n    json_get_int(attributes, 'http.response.status_code') AS http_status,\n    attributes->>'duration_ms' AS duration_ms,\n    trace_id, span_id\nFROM records\nWHERE service_name = 'msu-hub-bot' AND deployment_environment = 'production'\n  AND kind = 'log' AND span_name = 'bot.link.completed'\n  AND attributes->>'operation' = 'links.preview'\n  AND attributes->>'outcome' IN ('rejected', 'unavailable', 'timeout', 'unexpected')\nORDER BY start_timestamp DESC LIMIT 40\n"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "recent-steps": {
+          "kind": "Panel",
+          "spec": {
+            "display": {
+              "name": "Recent failed steps · may recover",
+              "description": "Earlier failures may precede a delivered preview. Follow the trace and its bot.link.completed result before declaring delivery failed or retrying an uncertain Telegram send. Logs are independent of trace sampling."
+            },
+            "plugin": {
+              "kind": "Table",
+              "spec": {}
+            },
+            "queries": [
+              {
+                "kind": "NonTimeSeriesQuery",
+                "spec": {
+                  "plugin": {
+                    "kind": "LogfireNonTimeSeriesQuery",
+                    "spec": {
+                      "query": "SELECT date_trunc('second', start_timestamp) AS time_utc,\n    attributes->>'provider' AS provider,\n    attributes->>'link.stage' AS stage,\n    attributes->>'link.reason' AS reason,\n    attributes->>'outcome' AS outcome,\n    attributes->>'link.source_url' AS source_url,\n    json_get_int(attributes, 'telegram.chat_id') AS chat_id,\n    json_get_int(attributes, 'telegram.user_id') AS user_id,\n    json_get_int(attributes, 'telegram.message_id') AS message_id,\n    json_get_int(attributes, 'telegram.thread_id') AS thread_id,\n    json_get_int(attributes, 'http.response.status_code') AS http_status,\n    attributes->>'duration_ms' AS duration_ms,\n    trace_id, span_id\nFROM records\nWHERE service_name = 'msu-hub-bot' AND deployment_environment = 'production'\n  AND kind = 'log' AND span_name = 'bot.link.step.failed'\n  AND attributes->>'operation' = 'links.step'\n  AND attributes->>'outcome' IN ('rejected', 'unavailable', 'timeout', 'unexpected')\nORDER BY start_timestamp DESC LIMIT 40\n"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "layouts": [
+        {
+          "kind": "Grid",
+          "spec": {
+            "display": {
+              "title": "Native link previews",
+              "collapse": {
+                "open": true
+              }
+            },
+            "items": [
+              {
+                "x": 0,
+                "y": 0,
+                "width": 12,
+                "height": 7,
+                "content": {
+                  "$ref": "#/spec/panels/outcomes"
+                }
+              },
+              {
+                "x": 12,
+                "y": 0,
+                "width": 12,
+                "height": 7,
+                "content": {
+                  "$ref": "#/spec/panels/deliveries"
+                }
+              },
+              {
+                "x": 0,
+                "y": 7,
+                "width": 24,
+                "height": 7,
+                "content": {
+                  "$ref": "#/spec/panels/providers"
+                }
+              },
+              {
+                "x": 0,
+                "y": 14,
+                "width": 12,
+                "height": 9,
+                "content": {
+                  "$ref": "#/spec/panels/terminal-causes"
+                }
+              },
+              {
+                "x": 12,
+                "y": 14,
+                "width": 12,
+                "height": 9,
+                "content": {
+                  "$ref": "#/spec/panels/step-causes"
+                }
+              },
+              {
+                "x": 0,
+                "y": 23,
+                "width": 24,
+                "height": 12,
+                "content": {
+                  "$ref": "#/spec/panels/recent-failures"
+                }
+              },
+              {
+                "x": 0,
+                "y": 35,
+                "width": 24,
+                "height": 12,
+                "content": {
+                  "$ref": "#/spec/panels/recent-steps"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "duration": "24h",
+      "refreshInterval": "60s"
+    }
+  }
+}
