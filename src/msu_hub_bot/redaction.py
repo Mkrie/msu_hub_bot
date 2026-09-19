@@ -37,7 +37,7 @@ def _strings(value, sensitive=False):
                     yield password
             except ValueError:
                 pass
-    elif isinstance(value, int) and abs(value) >= 1_000_000:
+    elif isinstance(value, int) and not isinstance(value, bool) and sensitive:
         yield str(value)
 
 
@@ -54,6 +54,15 @@ def redact(value: object) -> str:
     for pattern in _patterns:
         text = pattern.sub(MASK, text)
     return text
+
+
+def redact_json(value: object) -> object:
+    """Protect diagnostic values without replacing JSON keys or numeric IDs."""
+    if isinstance(value, dict):
+        return {key: MASK if _sensitive_key.search(str(key)) else redact_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_json(item) for item in value]
+    return redact(value) if isinstance(value, str) else value
 
 
 class RedactingFormatter(logging.Formatter):

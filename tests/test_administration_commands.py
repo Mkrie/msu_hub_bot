@@ -9,6 +9,7 @@ from aiogram.methods import AnswerInlineQuery, ForwardMessage, GetChatMember
 from aiogram.types import Chat, ChatMemberAdministrator, ChatMemberMember, ChatMemberOwner, InlineQuery, Message, User
 
 from msu_hub_bot.commands import admin, debug, infra
+from msu_hub_bot.settings import settings
 
 
 def user(user_id=10):
@@ -174,6 +175,48 @@ async def test_debug_json_preserves_telegram_aliases_dates_and_redacts_tokens(re
     assert "from_user" not in payload
     assert canary not in serialized and "[REDACTED]" in serialized
     assert replies.call_args.kwargs["disable_notification"] is True
+
+
+async def test_debug_json_preserves_configured_numeric_and_opaque_telegram_ids(monkeypatch, replies):
+    owner_id = 9876543210
+    chat_id = -1009876543210
+    emoji_id = "5278611117130653414"
+    monkeypatch.setattr(settings, "owner_id", owner_id)
+    monkeypatch.setattr(settings, "dumps_chat_id", chat_id)
+    monkeypatch.setattr(settings, "founder_ids", [int(emoji_id)])
+    source = message(
+        "🙂",
+        message_id=123456789,
+        from_user=user(owner_id),
+        chat=Chat(id=chat_id, type="supergroup", title="Synthetic"),
+        entities=[{"type": "custom_emoji", "offset": 0, "length": 2, "custom_emoji_id": emoji_id}],
+        photo=[{"file_id": "AgACAgIA9876543210_opaque", "file_unique_id": "AQAD9876543210_unique", "width": 16, "height": 16}],
+    )
+    await debug.process_json(message("/json", reply_to_message=source))
+    payload = json.loads(html.unescape(replies.call_args.args[0].removeprefix("<pre>").removesuffix("</pre>")))
+    assert payload["message_id"] == 123456789
+    assert payload["from"]["id"] == owner_id
+    assert payload["chat"]["id"] == chat_id
+    assert payload["entities"][0]["custom_emoji_id"] == emoji_id
+    assert payload["photo"][0]["file_id"] == "AgACAgIA9876543210_opaque"
+    assert payload["photo"][0]["file_unique_id"] == "AQAD9876543210_unique"
+
+
+async def test_debug_large_json_is_complete_valid_file_with_credentials_hidden(monkeypatch, replies):
+    document_reply = AsyncMock(return_value=message("document result"))
+    monkeypatch.setattr(Message, "reply_document", document_reply)
+    token = "123456:" + "Z" * 35
+    source = message("🙂" * 2000 + token, message_id=123456789, reply_to_message=message("nested", message_id=987654321))
+    await debug.process_json(message("/json", reply_to_message=source))
+    replies.assert_not_called()
+    document = document_reply.call_args.args[0]
+    payload = json.loads(document.data)
+    assert document.filename == "message-123456789.json"
+    assert payload["message_id"] == 123456789
+    assert payload["reply_to_message"]["message_id"] == 987654321
+    assert payload["text"] == "🙂" * 2000 + "[REDACTED]"
+    assert token.encode() not in document.data
+    assert document_reply.call_args.kwargs["disable_notification"] is True
 
 
 @pytest.mark.parametrize("argument,seconds", [("", 0), ("invalid", 0), ("1", 3), ("999999999", 864000)])

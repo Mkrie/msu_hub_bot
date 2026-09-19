@@ -9,7 +9,7 @@ from urllib.parse import quote
 import pytest
 
 from msu_hub_bot.logger import LoggerBuilder
-from msu_hub_bot.redaction import RedactingFormatter, RedactingStream, redact
+from msu_hub_bot.redaction import RedactingFormatter, RedactingStream, _strings, redact, redact_json
 from msu_hub_bot.settings import MissingIntegration, Settings, load_runtime_environment, settings
 
 
@@ -139,6 +139,42 @@ def test_short_configured_password_is_redacted(monkeypatch):
     monkeypatch.setattr(settings, "supabase_password", "a$3")
     assert "a$3" not in redact("Connection failed with a$3")
     assert quote("a$3", safe="") not in redact(quote("a$3", safe=""))
+
+
+def test_configured_telegram_ids_remain_visible_in_logs_while_credentials_stay_hidden(monkeypatch):
+    owner_id, chat_id = 9876543210, -1009876543210
+    secret = "synthetic-credential-value"
+    monkeypatch.setattr(settings, "owner_id", owner_id)
+    monkeypatch.setattr(settings, "error_chat_id", chat_id)
+    monkeypatch.setattr(settings, "founder_ids", [owner_id])
+    monkeypatch.setattr(settings, "supabase_password", secret)
+    value = f"user_id={owner_id} chat_id={chat_id} failed: {secret}"
+    expected = f"user_id={owner_id} chat_id={chat_id} failed: [REDACTED]"
+    assert redact(value) == expected
+    record = logging.LogRecord("test", logging.ERROR, __file__, 1, value, (), None)
+    assert RedactingFormatter().format(record) == expected
+    stream = io.StringIO()
+    writer = RedactingStream(stream)
+    writer.write(value + "\n")
+    writer.flush()
+    assert stream.getvalue() == expected + "\n"
+
+
+def test_numeric_credentials_are_still_sensitive():
+    assert list(_strings({"owner_id": 123456789, "api_key": 123, "nested": {"password": 987654321}})) == ["123", "987654321"]
+
+
+def test_structured_redaction_preserves_json_keys_numbers_and_credential_protection(monkeypatch):
+    monkeypatch.setattr(settings, "supabase_password", "id")
+    source = {"id": 1700000000, "message_id": 123456789, "text": "id", "nested": [{"password": "unknown", "secret": 42}]}
+    redacted = redact_json(source)
+    assert json.loads(json.dumps(redacted)) == {
+        "id": 1700000000,
+        "message_id": 123456789,
+        "text": "[REDACTED]",
+        "nested": [{"password": "[REDACTED]", "secret": "[REDACTED]"}],
+    }
+    assert source["text"] == "id"
 
 
 def test_local_logger_preserves_levels_and_redacts_both_outputs(monkeypatch, tmp_path, capsys):

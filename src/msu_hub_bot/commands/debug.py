@@ -2,7 +2,7 @@ import json
 from datetime import datetime
 
 from aiogram import html
-from aiogram.types import Message
+from aiogram.types import BufferedInputFile, Message
 from aiogram.utils.markdown import hpre
 
 from msu_hub_bot.telegram.constants import TELEGRAM_MESSAGE_MAX_LEN
@@ -10,7 +10,7 @@ from msu_hub_bot.logger import LoggerBuilder
 from msu_hub_bot.telegram.deletions import MessageDeletions
 from msu_hub_bot.telegram.utils import command_arguments, send_super_reply
 from msu_hub_bot.utils import parse_int
-from msu_hub_bot.redaction import redact
+from msu_hub_bot.redaction import redact, redact_json
 
 
 def _json_default(value: object) -> int:
@@ -20,16 +20,14 @@ def _json_default(value: object) -> int:
 
 
 async def process_json(message: Message) -> Message:
+    """Return complete identifiers and valid JSON; larger dumps become files."""
     target_message = message.reply_to_message or message
     target = target_message.model_dump(mode="python", by_alias=True, exclude_none=True)
-    cut_length = TELEGRAM_MESSAGE_MAX_LEN // 2
-    if text_part := target.get("text"):
-        if len(text_part) > cut_length:
-            target["text"] = text_part[:cut_length] + "..."
-    if "pinned_message" in target.get("chat", {}):
-        target["chat"]["pinned_message"] = "{ ... }"
-    text = hpre(redact(json.dumps(target, ensure_ascii=False, indent=True, default=_json_default))[:TELEGRAM_MESSAGE_MAX_LEN])
-    return await target_message.reply(text, disable_notification=True)
+    text = json.dumps(redact_json(target), ensure_ascii=False, indent=True, default=_json_default)
+    if len(text.encode("utf-16-le")) // 2 > TELEGRAM_MESSAGE_MAX_LEN:
+        document = BufferedInputFile(text.encode("utf-8"), filename=f"message-{target_message.message_id}.json")
+        return await target_message.reply_document(document, disable_notification=True)
+    return await target_message.reply(hpre(text), disable_notification=True)
 
 
 async def process_logs(message: Message) -> Message | bool | None:

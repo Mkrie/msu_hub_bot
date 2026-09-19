@@ -55,6 +55,16 @@ Use the [observability contract](observability.md) for the export allowlist and
 dashboard management. A failed step alone does not justify retrying a Telegram
 send whose result is uncertain.
 
+## Message diagnostics
+
+`/json` shows the replied-to message (or the command itself) with complete Telegram
+IDs and hidden credentials. Dumps that exceed Telegram's text limit arrive as a
+JSON file, preserving the complete message and valid JSON. `/echo` uses the same
+diagnostic output before copying the message.
+
+The owner-only `/logs` command and local logs preserve numeric Telegram IDs for
+correlation while redacting configured credentials, sensitive strings and tokens.
+
 ## Scheduled operational alerts
 
 `tools/operations/monitor.py` checks successful maintenance receipts and free space:
