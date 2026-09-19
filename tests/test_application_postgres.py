@@ -365,6 +365,7 @@ async def test_application_facade_preserves_identity_and_fields_through_conflict
     assert await documents.load_settings(observed) == {
         "auto_speech_recognition": True,
         "auto_video_links": False,
+        "auto_x_previews": True,
         "with_nsfw": True,
         "future": {"keep": [1, None]},
         "nullable_extra": None,
