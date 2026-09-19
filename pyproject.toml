@@ -134,6 +134,7 @@ files = [
     "src/msu_hub_bot/telegram/context.py",
     "src/msu_hub_bot/telegram/delivery.py",
     "src/msu_hub_bot/telegram/extraction.py",
+    "src/msu_hub_bot/telegram/rich_input.py",
     "src/msu_hub_bot/telegram/files.py",
     "src/msu_hub_bot/telegram/media_jobs.py",
     "src/msu_hub_bot/telegram/filters.py",

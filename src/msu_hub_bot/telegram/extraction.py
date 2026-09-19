@@ -7,6 +7,7 @@ from typing import TypeVar
 from aiogram.types import Animation, Document, Message, MessageOriginUser, PhotoSize, Sticker, Video, VideoNote
 
 from msu_hub_bot.telegram.context import bot_for
+from msu_hub_bot.telegram.rich_input import rich_media
 
 ImageMedia = PhotoSize | Document | Sticker
 VideoMedia = Video | Animation | VideoNote | Sticker
@@ -25,17 +26,26 @@ class SimpleExtractor:
         if sticker := message.sticker:
             if not (sticker.is_animated or sticker.is_video):
                 return sticker
+        for media in rich_media(message):
+            if isinstance(media, PhotoSize):
+                return media
+            if isinstance(media, Document):
+                base, _, subtype = (media.mime_type or "").partition("/")
+                if base == "image" and subtype.endswith(("jpeg", "png", "tiff", "bmp", "gif", "webp")):
+                    return media
         return None
 
     @classmethod
     async def video(cls, message: Message) -> VideoMedia | None:
         if message.sticker and message.sticker.is_video:
             return message.sticker
-        return message.video or message.animation or message.video_note
+        if media := message.video or message.animation or message.video_note:
+            return media
+        return next((media for media in rich_media(message) if isinstance(media, (Video, Animation))), None)
 
     @classmethod
     async def document(cls, message: Message) -> Document | None:
-        return message.document
+        return message.document or next((media for media in rich_media(message) if isinstance(media, Document)), None)
 
     @classmethod
     async def profile_photo(cls, message: Message) -> PhotoSize | None:

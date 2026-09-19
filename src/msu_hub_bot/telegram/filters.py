@@ -16,6 +16,7 @@ from msu_hub_bot.telegram.extraction import Extractor as Extractor
 from msu_hub_bot.telegram.extraction import ImageMedia, VideoMedia
 from msu_hub_bot.telegram.extraction import SimpleExtractor as SimpleExtractor
 from msu_hub_bot.telegram.files import download, download_text
+from msu_hub_bot.telegram.rich_input import rich_media, rich_text
 
 
 @dataclass(slots=True)
@@ -56,9 +57,11 @@ class MetaInfo:
 
     def _extract_text(self, *, with_doc: bool) -> tuple[Message, str, Document | None]:
         def text_document(message: Message) -> Document | None:
-            document = message.document
-            if with_doc and document and (document.mime_type or "").partition("/")[0] == "text":
-                return document
+            if with_doc:
+                documents = (message.document,) if message.document else rich_media(message)
+                for document in documents:
+                    if isinstance(document, Document) and (document.mime_type or "").partition("/")[0] == "text":
+                        return document
             return None
 
         target = self.message
@@ -67,7 +70,7 @@ class MetaInfo:
         if not (text or document) and self.message.reply_to_message:
             target = self.message.reply_to_message
             document = text_document(target)
-            text = "" if document else target.text or target.caption or ""
+            text = "" if document else target.text or target.caption or rich_text(target)
         return target, text, document
 
     async def extract_image(self, with_reply: bool = True, with_profile_photo: bool = False) -> tuple[Message, ImageMedia | None]:
