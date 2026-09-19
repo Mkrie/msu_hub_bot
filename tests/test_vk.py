@@ -2,7 +2,7 @@ from html.parser import HTMLParser
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from msu_hub_bot.providers.vk import publish
+from msu_hub_bot.telegram import vk as publish
 from msu_hub_bot.providers.vk.posts import best_photo
 from msu_hub_bot.providers.vk.models import Photo
 from msu_hub_bot.providers.vk.utils import href, prepare_vk_text, safe_url

@@ -27,7 +27,7 @@ from msu_hub_bot.telegram.wrapper import BotWrapper
 from msu_hub_bot.utils import megabytes, valid_filename
 from msu_hub_bot.providers.vk.api import VkApi
 from msu_hub_bot.providers.vk.posts import VkPost
-from msu_hub_bot.providers.vk.publish import publish_vk_post
+from msu_hub_bot.telegram.vk import publish_vk_post
 
 
 class PreviewExecutor(Protocol):

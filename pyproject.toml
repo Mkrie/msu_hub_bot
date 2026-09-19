@@ -152,7 +152,7 @@ files = [
     "src/msu_hub_bot/telegram/deletions.py",
     "src/msu_hub_bot/telegram/utils.py",
     "src/msu_hub_bot/telegram/wrapper.py",
-    "src/msu_hub_bot/providers/vk/publish.py",
+    "src/msu_hub_bot/telegram/vk.py",
     "src/msu_hub_bot/providers/vk/api.py",
     "src/msu_hub_bot/providers/vk/models.py",
     "src/msu_hub_bot/providers/vk/posts.py",

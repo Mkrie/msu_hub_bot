@@ -12,8 +12,9 @@ from aiogram.methods import SendMediaGroup, SendMessage, SendPhoto, SendVideo
 from aiogram.types import Message, Update
 from aiogram.utils.markdown import hide_link
 
-from msu_hub_bot.providers.vk import publish
-from msu_hub_bot.providers.vk.utils import href, split_html, utf16_length
+from msu_hub_bot.telegram import vk as publish
+from msu_hub_bot.providers.vk.utils import href
+from msu_hub_bot.telegram.vk import split_html, utf16_length
 from msu_hub_bot.telegram.middlewares.settings import Settings
 from msu_hub_bot.telegram.middlewares.viewer import ViewerMiddleware
 from msu_hub_bot.telegram.wrapper import BotWrapper
