@@ -71,6 +71,7 @@ class Provider(StrEnum):
     JDOODLE = "jdoodle"
     WIT = "wit"
     WOLFRAM = "wolfram"
+    FXEMBED = "fxembed"
     OTHER = "other"
 
 
@@ -107,6 +108,7 @@ OPERATIONS = frozenset(
         "jdoodle.execute",
         "wit.recognize",
         "wolfram.query",
+        "fxembed.fetch",
         "worker.queue",
         "worker.prepare",
         "worker.execute",

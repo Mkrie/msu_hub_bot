@@ -14,6 +14,7 @@ from yarl import URL
 from msu_hub_bot.execution.executor import ExecutorBusy
 from msu_hub_bot.media.limits import MAX_DOWNLOAD_BYTES
 from msu_hub_bot.providers.exceptions import ExternalServiceError
+from msu_hub_bot.providers.fxembed import FxEmbed, PostLink, is_x_url, parse_post_url
 from msu_hub_bot.providers.instagram import InstagramViewer
 from msu_hub_bot.providers.pdf import convert_to_pdf
 from msu_hub_bot.providers.ydl import YDL
@@ -24,6 +25,8 @@ from msu_hub_bot.telegram.middlewares.settings import Settings
 from msu_hub_bot.telegram.state import UpdateStateContext, release_state_isolation
 from msu_hub_bot.telegram.utils import extract_urls
 from msu_hub_bot.telegram.wrapper import BotWrapper
+from msu_hub_bot.telegram.x_posts import publish_x_post
+from msu_hub_bot.telemetry import Boundary, Provider, Telemetry
 from msu_hub_bot.utils import megabytes, valid_filename
 from msu_hub_bot.providers.vk.api import VkApi
 from msu_hub_bot.providers.vk.posts import VkPost
@@ -37,6 +40,7 @@ class PreviewExecutor(Protocol):
 @dataclass(slots=True)
 class _PreviewContext:
     suppressed: bool = False
+    x_suppressed: bool = False
 
 
 async def preview_policy(
@@ -47,14 +51,42 @@ async def preview_policy(
     context = data.get("preview_context")
     if isinstance(context, _PreviewContext) and result is not UNHANDLED:
         context.suppressed = get_flag(data, "automatic_previews") is False
+        context.x_suppressed |= "command" in data or "meta" in data
     return result
 
 
 class ViewerMiddleware(BaseMiddleware):
-    def __init__(self, bot: BotWrapper, vk_api: VkApi, executor: PreviewExecutor) -> None:
+    def __init__(self, bot: BotWrapper, vk_api: VkApi, executor: PreviewExecutor, *, telemetry: Telemetry | None = None) -> None:
         self.bot = bot
         self.vk_api = vk_api
         self.executor = executor
+        self.fxembed = FxEmbed()
+        self.telemetry = telemetry or Telemetry()
+
+    async def handle_x_post(self, message: Message, link: PostLink) -> None:
+        try:
+            with self.telemetry.operation(Boundary.PROVIDER, "fxembed.fetch", provider=Provider.FXEMBED):
+                post = await self.fxembed.get_post(link)
+        except ExternalServiceError:
+            return
+        await publish_x_post(
+            post,
+            self.bot,
+            message.chat.id,
+            message.message_id,
+            message_thread_id=message.message_thread_id if message.is_topic_message else None,
+            link=link,
+        )
+
+    @staticmethod
+    def x_preview_allowed(message: Message) -> bool:
+        return not (
+            (message.from_user and message.from_user.is_bot)
+            or message.is_automatic_forward
+            or (message.link_preview_options and message.link_preview_options.is_disabled is True)
+            or (message.text or message.caption or "").lstrip().startswith("/")
+            or any(entity.type == MessageEntityType.BOT_COMMAND for entity in message.entities or message.caption_entities or [])
+        )
 
     async def handle_vk_posts(self, message: Message, url: URL) -> bool:
         matches = VkPost.pattern_vk_post.findall(str(url))[:2]
@@ -105,8 +137,27 @@ class ViewerMiddleware(BaseMiddleware):
         else:
             await message.reply(text, disable_web_page_preview=True)
 
-    async def view(self, message: Message, preferences: Settings) -> None:
-        for url, entity_type in extract_urls(message)[:2]:
+    async def view(self, message: Message, preferences: Settings, *, x_previews: bool = True) -> None:
+        seen_x: set[tuple[str, str | None, int | None]] = set()
+        considered = 0
+        for url, entity_type in extract_urls(message):
+            if considered >= 2:
+                break
+            if is_x_url(str(url)):
+                link = parse_post_url(str(url))
+                if link is None:
+                    # Fixed embeds already have a preview; other X routes are not posts.
+                    considered += 1
+                    continue
+                identity = (link.id, link.media_kind, link.media_index)
+                if identity in seen_x:
+                    continue
+                seen_x.add(identity)
+                considered += 1
+                if x_previews and preferences.auto_x_previews and self.x_preview_allowed(message):
+                    await self.handle_x_post(message, link)
+                continue
+            considered += 1
             if entity_type == MessageEntityType.URL and await self.handle_vk_posts(message, url):
                 continue
             if url.host:
@@ -177,7 +228,7 @@ class ViewerMiddleware(BaseMiddleware):
     async def __call__(
         self, handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]], event: TelegramObject, data: dict[str, Any]
     ) -> Any:
-        preview_context = _PreviewContext()
+        preview_context = _PreviewContext(x_suppressed=data.get("raw_state") is not None)
         data["preview_context"] = preview_context
         result = await handler(event, data)
         if isinstance(event, Message):
@@ -188,5 +239,5 @@ class ViewerMiddleware(BaseMiddleware):
             if isinstance(context, UpdateStateContext):
                 release_state_isolation(context)
             if not preview_context.suppressed:
-                await self.view(event, preferences)
+                await self.view(event, preferences, x_previews=not preview_context.x_suppressed)
         return result
