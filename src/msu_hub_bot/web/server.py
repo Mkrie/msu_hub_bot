@@ -83,9 +83,11 @@ class WebServer:
         port: int = 8081,
         static_path: Path | None = None,
         vk_api: VkApi | None = None,
+        settings_changed: Callable[[int], Awaitable[None]] | None = None,
     ) -> None:
         self.bot, self.reminders, self.database, self.links, self.telemetry = bot, reminders, database, links, telemetry
         self.port = port
+        self.settings_changed = settings_changed
         self.static_path = static_path or Path(__file__).with_name("static")
         endpoint = urlsplit(links.url)
         self.origin = f"{endpoint.scheme}://{endpoint.netloc}"

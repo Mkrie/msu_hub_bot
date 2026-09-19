@@ -7,6 +7,10 @@ membership, and settings/repost mutations require current administrator rights
 for both the person and the bot. No request can supply a different destination
 or topic. Personal timezone preferences are owner-scoped and permanent.
 
+Confirmed chat-setting changes invalidate the bot's local preference cache.
+The next update reloads the shared settings object, preserving unsaved command
+edits. A failed or conflicting web write does not change the cached preferences.
+
 ## Repost configuration
 
 VK targets use the existing permanent `vk/subscriptions` feature collection in

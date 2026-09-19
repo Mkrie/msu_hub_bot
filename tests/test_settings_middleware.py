@@ -133,6 +133,191 @@ async def test_preference_save_patches_only_changed_keys_after_an_external_updat
     assert rows[100].metadata == {"other": 7, "settings": {"auto_video_links": False, "future_option": [1, 2], "with_nsfw": True}}
 
 
+async def test_external_change_refreshes_shared_object_and_preserves_dirty_keys(storage):
+    db, rows, _ = storage
+    middleware = SettingsMiddleware(db)
+    preferences = await middleware.proxy(message().chat)
+    preferences.with_nsfw = True
+    preferences.future_option = None
+    rows[100].metadata["settings"] = {"auto_x_previews": False, "new_remote_option": [1, 2]}
+
+    await middleware.invalidate(100)
+    refreshed = await middleware.proxy(message().chat)
+
+    assert refreshed is preferences
+    assert refreshed.auto_x_previews is False
+    assert refreshed.with_nsfw is True
+    assert refreshed.model_dump()["future_option"] is None
+    assert refreshed.model_dump()["new_remote_option"] == [1, 2]
+    assert refreshed._is_dirty
+    await refreshed.save(db)
+    assert rows[100].metadata["settings"] == {
+        "auto_x_previews": False,
+        "new_remote_option": [1, 2],
+        "with_nsfw": True,
+        "future_option": None,
+    }
+    assert not refreshed._is_dirty
+    assert await middleware.proxy(message().chat) is preferences
+    assert db.load_settings.await_count == 2
+
+
+@pytest.mark.parametrize("cold_failure", [False, True])
+async def test_invalidation_during_first_load_does_not_leave_a_stale_cache(storage, cold_failure):
+    db, rows, _ = storage
+    middleware = SettingsMiddleware(db)
+    started, release = asyncio.Event(), asyncio.Event()
+    original = db.load_settings.side_effect
+
+    async def load(chat):
+        snapshot = await original(chat)
+        if db.load_settings.await_count == 1:
+            started.set()
+            await release.wait()
+            if cold_failure:
+                raise RuntimeError("Unavailable")
+        return snapshot
+
+    db.load_settings.side_effect = load
+    initial = asyncio.create_task(middleware.proxy(message().chat))
+    await started.wait()
+    rows[100].metadata["settings"] = {"auto_x_previews": False}
+    await middleware.invalidate(100)
+    assert not initial.done()
+    release.set()
+    if cold_failure:
+        with pytest.raises(RuntimeError, match="Unavailable"):
+            await initial
+        assert not middleware._stale
+        preferences = await middleware.proxy(message().chat)
+    else:
+        preferences = await initial
+        assert await middleware.proxy(message().chat) is preferences
+    assert preferences.auto_x_previews is False
+    assert db.load_settings.await_count == 2
+
+
+async def test_invalidation_and_local_edits_during_refresh_survive_the_reload(storage):
+    db, rows, _ = storage
+    middleware = SettingsMiddleware(db)
+    preferences = await middleware.proxy(message().chat)
+    rows[100].metadata["settings"] = {"auto_x_previews": False}
+    await middleware.invalidate(100)
+    started, release = asyncio.Event(), asyncio.Event()
+    original = db.load_settings.side_effect
+
+    async def load(chat):
+        snapshot = await original(chat)
+        started.set()
+        await release.wait()
+        return snapshot
+
+    db.load_settings.side_effect = load
+    first = asyncio.create_task(middleware.proxy(message().chat))
+    await started.wait()
+    preferences.auto_speech_recognition = False
+    rows[100].metadata["settings"]["auto_video_links"] = False
+    await middleware.invalidate(100)
+    second = asyncio.create_task(middleware.proxy(message().chat))
+    await asyncio.sleep(0)
+    assert not second.done()
+    release.set()
+    assert await first is preferences
+    assert await second is preferences
+    assert not preferences.auto_x_previews
+    assert not preferences.auto_video_links
+    assert not preferences.auto_speech_recognition
+    assert preferences._is_dirty
+    assert db.load_settings.await_count == 3
+    await preferences.save(db)
+    assert rows[100].metadata["settings"] == {
+        "auto_x_previews": False,
+        "auto_video_links": False,
+        "auto_speech_recognition": False,
+    }
+
+
+async def test_refresh_waits_for_pending_save_and_preserves_newer_edits(storage):
+    db, rows, _ = storage
+    middleware = SettingsMiddleware(db)
+    preferences = await middleware.proxy(message().chat)
+    preferences.with_nsfw = True
+    started, release = asyncio.Event(), asyncio.Event()
+    original = db.patch_settings
+
+    async def patch(chat_id, changes):
+        started.set()
+        await release.wait()
+        return await original(chat_id, changes)
+
+    db.patch_settings = patch
+    save = asyncio.create_task(preferences.save(db))
+    await started.wait()
+    preferences.auto_speech_recognition = False
+    rows[100].metadata["settings"] = {"auto_x_previews": False}
+    await middleware.invalidate(100)
+    refresh = asyncio.create_task(middleware.proxy(message().chat))
+    await asyncio.sleep(0)
+    assert db.load_settings.await_count == 1
+    release.set()
+    await save
+    assert await refresh is preferences
+    assert not preferences.auto_x_previews
+    assert not preferences.auto_speech_recognition
+    assert preferences.with_nsfw
+    assert preferences._is_dirty
+    await preferences.save(db)
+    assert rows[100].metadata["settings"] == {
+        "auto_x_previews": False,
+        "with_nsfw": True,
+        "auto_speech_recognition": False,
+    }
+
+
+async def test_failed_refresh_remains_stale_and_does_not_discard_local_edits(storage):
+    db, rows, _ = storage
+    middleware = SettingsMiddleware(db)
+    preferences = await middleware.proxy(message().chat)
+    preferences.with_nsfw = True
+    rows[100].metadata["settings"] = {"auto_x_previews": False}
+    await middleware.invalidate(100)
+    original = db.load_settings.side_effect
+    db.load_settings.side_effect = RuntimeError("Unavailable")
+    with pytest.raises(RuntimeError, match="Unavailable"):
+        await middleware.proxy(message().chat)
+    assert preferences.auto_x_previews and preferences.with_nsfw
+    db.load_settings.side_effect = original
+    assert await middleware.proxy(message().chat) is preferences
+    assert not preferences.auto_x_previews and preferences.with_nsfw
+
+
+async def test_refresh_cannot_be_evicted_and_unknown_invalidations_do_not_accumulate(storage):
+    db, _, _ = storage
+    middleware = SettingsMiddleware(db, cache_size=1)
+    first = await middleware.proxy(message(100).chat)
+    await middleware.proxy(message(200).chat)
+    await middleware.invalidate(100)
+    started, release = asyncio.Event(), asyncio.Event()
+    original = db.load_settings.side_effect
+
+    async def load(chat):
+        started.set()
+        await release.wait()
+        return await original(chat)
+
+    db.load_settings.side_effect = load
+    refresh = asyncio.create_task(middleware.proxy(message(100).chat))
+    await started.wait()
+    for chat_id in range(300, 400):
+        await middleware.invalidate(chat_id)
+    await middleware.invalidate(200)
+    middleware._trim()
+    assert middleware.proxies[100] is first
+    assert not middleware._stale
+    release.set()
+    assert await refresh is first
+
+
 async def test_cache_pressure_cannot_replace_an_active_preference_object(storage):
     db, _, _ = storage
     middleware = SettingsMiddleware(db, cache_size=1)

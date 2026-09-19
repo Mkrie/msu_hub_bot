@@ -121,8 +121,20 @@ class Application:
             stack.push_async_callback(asyncio.to_thread, executor.shutdown, wait=True)
             vk_api = VkApi(token=settings.vk_user_token)
             stack.push_async_callback(vk_api.close)
+            backend = Backend(settings.storage_backend)
+            preferences = SettingsMiddleware(database, telemetry=telemetry, backend=backend)
+            stack.push_async_callback(preferences.close)
             web = (
-                WebServer(bot, reminders, database, web_apps, telemetry, port=settings.web_port, vk_api=vk_api)
+                WebServer(
+                    bot,
+                    reminders,
+                    database,
+                    web_apps,
+                    telemetry,
+                    port=settings.web_port,
+                    vk_api=vk_api,
+                    settings_changed=preferences.invalidate,
+                )
                 if settings.web_app_url
                 else None
             )
@@ -138,9 +150,6 @@ class Application:
             stack.push_async_callback(crypto_exchange.close)
             health = HealthCheck(settings.health_check_url)
             stack.push_async_callback(health.stop)
-            backend = Backend(settings.storage_backend)
-            preferences = SettingsMiddleware(database, telemetry=telemetry, backend=backend)
-            stack.push_async_callback(preferences.close)
             ecosystem = EcosystemManager(bot, database)
             events = EventsMiddleware(bot, database, settings.events_chat_id, em=ecosystem)
 
@@ -161,7 +170,7 @@ class Application:
             dispatcher.message.outer_middleware(Skip777000())
             dispatcher.message.outer_middleware(CheckGets())
             dispatcher.message.outer_middleware(events)
-            dispatcher.message.outer_middleware(ViewerMiddleware(bot, vk_api, executor))
+            dispatcher.message.outer_middleware(ViewerMiddleware(bot, vk_api, executor, telemetry=telemetry))
             dispatcher.message.middleware(preview_policy)
             dispatcher.workflow_data.update(
                 telemetry=telemetry,

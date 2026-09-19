@@ -145,6 +145,8 @@ class CommunityAPI:
         tx.put(self.documents.settings, str(destination.chat_id), value)
         result = await ApplicationDocuments._commit(tx)
         row = self.documents.settings.decode(result.records[0], APPLICATION)
+        if self.server.settings_changed is not None:
+            await self.server.settings_changed(destination.chat_id)
         return web.json_response(self._settings_payload(row, row.value))
 
     @staticmethod

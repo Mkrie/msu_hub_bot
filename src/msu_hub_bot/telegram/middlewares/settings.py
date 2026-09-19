@@ -55,6 +55,19 @@ class Settings(ChatPreferences):
             self._saved_snapshot = snapshot
         return self
 
+    async def refresh(self, db: BotRepository, chat: Chat) -> None:
+        """Apply external changes in place while retaining unsaved handler edits."""
+        async with self._save_lock:
+            persisted = (await Settings.create(db, chat)).model_dump()
+            current = self.model_dump()
+            dirty = {key: value for key, value in current.items() if key not in self._saved_snapshot or value != self._saved_snapshot[key]}
+            merged = persisted | dirty
+            for key in current.keys() - merged.keys():
+                delattr(self, key)
+            for key, value in merged.items():
+                setattr(self, key, value)
+            self._saved_snapshot = persisted
+
 
 class SettingsMiddleware(BaseMiddleware):
     def __init__(
@@ -74,9 +87,17 @@ class SettingsMiddleware(BaseMiddleware):
         self.proxies: OrderedDict[int, Settings] = OrderedDict()
         self._active: dict[int, int] = {}
         self._load_lock = asyncio.Lock()
+        self._loading_chat_id: int | None = None
+        self._stale: set[int] = set()
+
+    async def invalidate(self, chat_id: int) -> None:
+        """Notify a confirmed external write without discarding shared objects."""
+        if chat_id in self.proxies or self._loading_chat_id == chat_id:
+            # A first read already in flight may predate the external commit.
+            self._stale.add(chat_id)
 
     async def proxy(self, chat: Chat) -> Settings:
-        if chat.id in self.proxies:
+        if chat.id in self.proxies and chat.id not in self._stale and chat.id != self._loading_chat_id:
             self.proxies.move_to_end(chat.id)
             return self.proxies[chat.id]
         with self.telemetry.operation(Boundary.STORAGE, "settings.load", backend=self.backend, trace=False):
@@ -84,8 +105,21 @@ class SettingsMiddleware(BaseMiddleware):
 
     async def _load(self, chat: Chat) -> Settings:
         async with self._load_lock:
-            if chat.id not in self.proxies:
-                self.proxies[chat.id] = await Settings.create(self.db, chat)
+            self._loading_chat_id = chat.id
+            try:
+                if chat.id not in self.proxies:
+                    self.proxies[chat.id] = await Settings.create(self.db, chat)
+                elif chat.id in self._stale:
+                    self._stale.discard(chat.id)
+                    try:
+                        await self.proxies[chat.id].refresh(self.db, chat)
+                    except BaseException:
+                        self._stale.add(chat.id)
+                        raise
+            finally:
+                self._loading_chat_id = None
+                if chat.id not in self.proxies:
+                    self._stale.discard(chat.id)
             self.proxies.move_to_end(chat.id)
             return self.proxies[chat.id]
 
@@ -94,8 +128,9 @@ class SettingsMiddleware(BaseMiddleware):
         for chat_id in list(self.proxies):
             if len(self.proxies) <= self.cache_size:
                 break
-            if not self._active.get(chat_id) and not self.proxies[chat_id]._is_dirty:
+            if chat_id != self._loading_chat_id and not self._active.get(chat_id) and not self.proxies[chat_id]._is_dirty:
                 del self.proxies[chat_id]
+                self._stale.discard(chat_id)
 
     async def __call__(
         self, handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]], event: TelegramObject, data: dict[str, Any]

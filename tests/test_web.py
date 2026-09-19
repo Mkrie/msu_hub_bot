@@ -708,6 +708,82 @@ async def test_x_preview_setting_can_be_changed_independently(rig, monkeypatch):
     assert (await collection.get(APPLICATION, "-123")).value.auto_x_previews is True
 
 
+async def test_mini_app_disabling_x_previews_updates_the_next_message_without_restart(rig, monkeypatch):
+    from aiogram import Dispatcher
+    from aiogram.types import Update
+
+    from msu_hub_bot.storage.application import APPLICATION, ChatPreferences
+    from msu_hub_bot.telegram.middlewares.settings import SettingsMiddleware
+    from msu_hub_bot.telegram.middlewares.viewer import ViewerMiddleware
+
+    launch = await _community_access(rig, monkeypatch)
+    collection = rig.server.community.documents.settings
+    tx = rig.reminders.store.transaction("settings", APPLICATION, operation_id=uuid4().hex)
+    tx.expect_absent("chats", "-123")
+    tx.put(collection, "-123", ChatPreferences())
+    await tx.commit()
+
+    async def load(chat):
+        return (await collection.get(APPLICATION, str(chat.chat_id))).value.model_dump()
+
+    database = SimpleNamespace(load_settings=AsyncMock(side_effect=load), patch_settings=AsyncMock())
+    preferences = SettingsMiddleware(database)
+    rig.server.settings_changed = AsyncMock(side_effect=preferences.invalidate)
+    viewer = ViewerMiddleware(rig.bot, None, SimpleNamespace(run=AsyncMock()))
+    viewer.handle_x_post = AsyncMock()
+    dispatcher = Dispatcher(disable_fsm=True)
+    dispatcher.message.outer_middleware(preferences)
+    dispatcher.message.outer_middleware(viewer)
+    url = "https://x.com/example/status/123"
+    message = make_message(
+        rig.bot,
+        chat={"id": -123, "type": "supergroup", "title": "Synthetic chat"},
+        text=url,
+        entities=[{"type": "url", "offset": 0, "length": len(url)}],
+    )
+    await dispatcher.feed_update(rig.bot, Update(update_id=1, message=message))
+    viewer.handle_x_post.assert_awaited_once()
+    original = preferences.proxies[-123]
+    assert original.auto_x_previews
+
+    path = f"/api/chats/-123/settings?launch={launch}"
+    current = await (await rig.api("GET", path)).json()
+    body = {"etag": current["etag"], "auto_x_previews": False}
+    rig.backend.lose_after_commit = 1
+    response = await rig.api("PATCH", path, body=body)
+    assert response.status == 200
+    rig.server.settings_changed.assert_awaited_once_with(-123)
+    assert (await rig.api("PATCH", path, body=body)).status == 409
+    rig.server.settings_changed.assert_awaited_once_with(-123)
+
+    await dispatcher.feed_update(rig.bot, Update(update_id=2, message=message))
+    viewer.handle_x_post.assert_awaited_once()
+    viewer.executor.run.assert_not_awaited()
+    assert preferences.proxies[-123] is original
+    assert not original.auto_x_previews
+    assert database.load_settings.await_count == 2
+    database.patch_settings.assert_not_awaited()
+
+
+async def test_settings_cache_notification_requires_a_confirmed_commit(rig, monkeypatch):
+    from msu_hub_bot.storage.application import APPLICATION, ApplicationDocuments, ChatPreferences
+
+    launch = await _community_access(rig, monkeypatch)
+    collection = rig.server.community.documents.settings
+    tx = rig.reminders.store.transaction("settings", APPLICATION, operation_id=uuid4().hex)
+    tx.expect_absent("chats", "-123")
+    tx.put(collection, "-123", ChatPreferences())
+    await tx.commit()
+    rig.server.settings_changed = AsyncMock()
+    path = f"/api/chats/-123/settings?launch={launch}"
+    current = await (await rig.api("GET", path)).json()
+    monkeypatch.setattr(ApplicationDocuments, "_commit", AsyncMock(side_effect=RepositoryUnavailable(RepositoryFailure.UNAVAILABLE)))
+    response = await rig.api("PATCH", path, body={"etag": current["etag"], "auto_x_previews": False})
+    assert response.status == 503
+    rig.server.settings_changed.assert_not_awaited()
+    assert (await collection.get(APPLICATION, "-123")).value.auto_x_previews
+
+
 async def test_game_views_hide_live_answers_other_topics_and_unrelated_chat_players(rig, monkeypatch):
     from msu_hub_bot.games.models import Question, RoundState, Score
     from msu_hub_bot.storage.features import Scope
