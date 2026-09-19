@@ -95,6 +95,15 @@ def test_custom_small_limits_count_decoded_entities_and_astral_characters():
     assert "".join(check_html(chunk).text for chunk in chunks) == "😀<&>" * 25
 
 
+def test_url_shaped_link_labels_can_split_within_the_raw_byte_budget():
+    label = "https://vk.ru/" + "x" * 60
+    target = "https://vk.ru/id20"
+    chunks = checked_chunks(href(target, label), max_bytes=100)
+    assert len(chunks) == 2
+    assert "".join(check_html(chunk).text for chunk in chunks) == label
+    assert all(check_html(chunk).links == [target] for chunk in chunks)
+
+
 def test_paragraph_boundary_is_preferred_when_recent():
     first = "я" * 3900 + "\n\n"
     chunks = checked_chunks(first + "next paragraph " * 100)

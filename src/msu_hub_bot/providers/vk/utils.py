@@ -99,7 +99,7 @@ def split_html(text: str, *, limit: int = 4096, max_bytes: int = 32768, max_link
         next_link = token if opening else "" if closing else active_link
         token_size = utf16_length(visible)
         token_bytes = len(token.encode())
-        if token.startswith(("http://", "https://")) and (token_size > limit or token_bytes > max_bytes):
+        if token.startswith(("http://", "https://")) and (active_link or token_size > limit or token_bytes > max_bytes):
             pending.extendleft(reversed([match[0] for match in _HTML_ATOM.finditer(token)]))
             continue
         if (
