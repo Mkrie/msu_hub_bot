@@ -38,7 +38,7 @@ from msu_hub_bot.telegram.middlewares.settings import SettingsMiddleware
 from msu_hub_bot.telegram.middlewares.skip777000 import Skip777000
 from msu_hub_bot.telegram.middlewares.updates import UpdatesMiddleware
 from msu_hub_bot.telegram.middlewares.telemetry import DispatchTelemetryMiddleware, HandlerTelemetryMiddleware
-from msu_hub_bot.telegram.middlewares.viewer import ViewerMiddleware
+from msu_hub_bot.telegram.middlewares.viewer import ViewerMiddleware, preview_policy
 from msu_hub_bot.telegram.runtime import AdmissionMiddleware, DrainTimeout, Supervisor
 from msu_hub_bot.telegram.state import (
     ReleasableEventIsolation,
@@ -162,6 +162,7 @@ class Application:
             dispatcher.message.outer_middleware(CheckGets())
             dispatcher.message.outer_middleware(events)
             dispatcher.message.outer_middleware(ViewerMiddleware(bot, vk_api, executor))
+            dispatcher.message.middleware(preview_policy)
             dispatcher.workflow_data.update(
                 telemetry=telemetry,
                 db=database,

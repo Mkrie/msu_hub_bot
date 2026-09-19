@@ -1,9 +1,12 @@
 """Automatic message previews, after routing and without holding FSM isolation."""
 
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from aiogram import BaseMiddleware
+from aiogram.dispatcher.event.bases import UNHANDLED
+from aiogram.dispatcher.flags import get_flag
 from aiogram.enums import MessageEntityType
 from aiogram.types import InputMediaDocument, InputMediaVideo, Message, TelegramObject, URLInputFile
 from yarl import URL
@@ -31,24 +34,42 @@ class PreviewExecutor(Protocol):
     async def run(self, func: Callable[..., Any], *args: Any, timeout: float | None = 180) -> tuple[Any, bool]: ...
 
 
+@dataclass(slots=True)
+class _PreviewContext:
+    suppressed: bool = False
+
+
+async def preview_policy(
+    handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]], event: TelegramObject, data: dict[str, Any]
+) -> Any:
+    """Carry a completed handler's explicit policy across router data copies."""
+    result = await handler(event, data)
+    context = data.get("preview_context")
+    if isinstance(context, _PreviewContext) and result is not UNHANDLED:
+        context.suppressed = get_flag(data, "automatic_previews") is False
+    return result
+
+
 class ViewerMiddleware(BaseMiddleware):
     def __init__(self, bot: BotWrapper, vk_api: VkApi, executor: PreviewExecutor) -> None:
         self.bot = bot
         self.vk_api = vk_api
         self.executor = executor
 
-    async def handle_vk_posts(self, message: Message, url: URL) -> None:
+    async def handle_vk_posts(self, message: Message, url: URL) -> bool:
         matches = VkPost.pattern_vk_post.findall(str(url))[:2]
         paths = ",".join(dict.fromkeys(matches))
-        if paths:
-            for post in await VkPost.from_api_by_id(self.vk_api, paths):
-                await publish_vk_post(
-                    post,
-                    self.bot,
-                    message.chat.id,
-                    message.message_id,
-                    message_thread_id=message.message_thread_id if message.is_topic_message else None,
-                )
+        if not paths:
+            return False
+        for post in await VkPost.from_api_by_id(self.vk_api, paths):
+            await publish_vk_post(
+                post,
+                self.bot,
+                message.chat.id,
+                message.message_id,
+                message_thread_id=message.message_thread_id if message.is_topic_message else None,
+            )
+        return True
 
     @staticmethod
     async def handle_instagram(message: Message, url: URL) -> None:
@@ -86,8 +107,8 @@ class ViewerMiddleware(BaseMiddleware):
 
     async def view(self, message: Message, preferences: Settings) -> None:
         for url, entity_type in extract_urls(message)[:2]:
-            if entity_type == MessageEntityType.URL:
-                await self.handle_vk_posts(message, url)
+            if entity_type == MessageEntityType.URL and await self.handle_vk_posts(message, url):
+                continue
             if url.host:
                 if url.host.endswith("instagram.com"):
                     await self.handle_instagram(message, url)
@@ -156,6 +177,8 @@ class ViewerMiddleware(BaseMiddleware):
     async def __call__(
         self, handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]], event: TelegramObject, data: dict[str, Any]
     ) -> Any:
+        preview_context = _PreviewContext()
+        data["preview_context"] = preview_context
         result = await handler(event, data)
         if isinstance(event, Message):
             preferences = data.get("settings")
@@ -164,5 +187,6 @@ class ViewerMiddleware(BaseMiddleware):
             context = data.get("state_context")
             if isinstance(context, UpdateStateContext):
                 release_state_isolation(context)
-            await self.view(event, preferences)
+            if not preview_context.suppressed:
+                await self.view(event, preferences)
         return result

@@ -10,8 +10,9 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from msu_hub_bot.providers.vk.api import VkApi, public_source
-from msu_hub_bot.providers.vk.models import Resolution, Wall
+from msu_hub_bot.providers.vk.api import VkApi
+from msu_hub_bot.providers.vk.models import Resolution
+from msu_hub_bot.providers.vk.posts import VkPost
 from msu_hub_bot.storage.application import APPLICATION, ApplicationDocuments, VkDocument, upgrade_vk, vk_key
 from msu_hub_bot.storage.features import Conflict, FeatureProtocolError, FeatureStore, Payload, Record
 
@@ -221,11 +222,8 @@ class Reposts:
             return base | {"available": False, "reason": "Доступ к VK не настроен. Подписку можно сохранить на паузе."}
         try:
             async with asyncio.timeout(6), self._providers:
-                if not await public_source(self.api, owner_id):
-                    return base | {"available": False, "reason": "Предпросмотр доступен только для подтверждённо открытых страниц VK."}
-                raw: object = await self.api.request("wall.get", owner_id=owner_id, count=3, filter="all")
-            wall = Wall.model_validate(raw)
-            if len(wall.items) > 3 or any(post.owner_id != owner_id for post in wall.items):
+                posts = await VkPost.from_api_wall(self.api, owner_id, count=3)
+            if len(posts) > 3:
                 raise ValueError("Unexpected source")
         except Exception:
             return base | {"available": False, "reason": "VK не отдал стену. Проверь доступ к странице; подписка останется на паузе."}
@@ -235,12 +233,11 @@ class Reposts:
             "posts": [
                 {
                     "id": post.id,
-                    "text": post.text[:4000],
-                    "url": f"https://vk.com/wall{owner_id}_{post.id}",
-                    "is_repost": bool(post.copy_history),
-                    "selected": body.selects(post.text, bool(post.copy_history)),
+                    "text": post.body_text[:4000],
+                    "url": post.url,
+                    "is_repost": post.is_repost,
+                    "selected": body.selects(post.body_text, post.is_repost),
                 }
-                for post in wall.items
-                if not post.friends_only and not post.donut.is_donut
+                for post in posts
             ],
         }

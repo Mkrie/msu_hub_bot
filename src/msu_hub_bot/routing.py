@@ -724,7 +724,7 @@ def build_router(*, wit: Wit, wolfram: WolframAPI, config: Settings) -> Router:
         SlashCommand("vk_post"),
         StateFilter(None),
         F.content_type == ContentType.TEXT,
-        flags={"handler_key": "process_vk_post", "fsm_release": True},
+        flags={"handler_key": "process_vk_post", "fsm_release": True, "automatic_previews": False},
     )
     group("vk").message.register(
         process_list_vk_wall,

@@ -24,9 +24,10 @@ are immutable: archive a target and create another when they change.
 Preview reads at most three VK posts with a deadline and bounded concurrency.
 It never sends a Telegram message, downloads arbitrary user URLs or advances a
 cursor. Numeric wall IDs and canonical VK page links are accepted; vanity
-names are resolved through the configured VK API. Preview requires explicit
-public-page metadata, and omits friends-only and paid posts; a privileged token
-never makes a closed wall public. A post passes filters when
+names are resolved through the configured VK API. Preview shares Telegram's
+public-source checks, including copied walls; a privileged token never makes a
+closed wall public. Filters inspect the original body and retained copied
+bodies together, before the displayed excerpt is shortened. A post passes filters when
 it matches any include term (or there are none), matches no exclude term, and
 its repost flag is permitted. Comparisons are literal and case-insensitive.
 

@@ -1,12 +1,12 @@
 """Source privacy, destination indexing and creation replay for paused targets."""
 
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
 
 from msu_hub_bot.community.reposts import RepostCreate, Reposts, SourcePreview
+from msu_hub_bot.providers.vk.api import VkApi
 from msu_hub_bot.storage.application import APPLICATION, ApplicationDocuments
 from msu_hub_bot.storage.features import Conflict, FeatureStore
 from msu_hub_bot.storage.models import VkPatch
@@ -18,19 +18,18 @@ from quiz_helpers import FeatureFixture
     [({"id": 10, "is_closed": 0}, True), ({"id": 10, "is_closed": 1}, False), ({"id": 10}, False), ({"id": 99, "is_closed": 0}, False)],
 )
 async def test_preview_only_fetches_wall_after_public_identity_is_verified(metadata, public):
-    api = SimpleNamespace(
-        request=AsyncMock(
-            side_effect=[
-                [metadata],
-                {
-                    "items": [
-                        {"id": 1, "owner_id": -10, "text": "news"},
-                        {"id": 2, "owner_id": -10, "text": "private-canary", "friends_only": 1},
-                        {"id": 3, "owner_id": -10, "text": "donor-canary", "donut": {"is_donut": True}},
-                    ]
-                },
-            ]
-        )
+    api = VkApi("synthetic-token")
+    api.request = AsyncMock(
+        side_effect=[
+            [metadata],
+            {
+                "items": [
+                    {"id": 1, "owner_id": -10, "text": "news"},
+                    {"id": 2, "owner_id": -10, "text": "private-canary", "friends_only": 1},
+                    {"id": 3, "owner_id": -10, "text": "donor-canary", "donut": {"is_donut": True}},
+                ]
+            },
+        ]
     )
     service = Reposts(FeatureStore(FeatureFixture()), api)
     result = await service.preview(SourcePreview(source="-10", include_keywords=["NEWS"]))
@@ -43,7 +42,8 @@ async def test_preview_only_fetches_wall_after_public_identity_is_verified(metad
 
 
 async def test_private_user_token_access_does_not_make_a_closed_profile_public():
-    api = SimpleNamespace(request=AsyncMock(return_value=[{"id": 10, "is_closed": True, "can_access_closed": True}]))
+    api = VkApi("synthetic-token")
+    api.request = AsyncMock(return_value=[{"id": 10, "is_closed": True, "can_access_closed": True}])
     result = await Reposts(FeatureStore(FeatureFixture()), api).preview(SourcePreview(source="10"))
     assert not result["available"] and not result["posts"]
     api.request.assert_awaited_once_with("users.get", user_ids="10")
