@@ -1,6 +1,7 @@
 """Native X output keeps content, attribution and Telegram delivery boundaries."""
 
 import asyncio
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -9,15 +10,18 @@ from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, Telegra
 from aiogram.methods import SendRichMessage
 from aiogram.types import (
     BufferedInputFile,
+    InputMediaVideo,
     InputRichBlockBlockQuotation,
     InputRichBlockCollage,
     InputRichBlockFooter,
     InputRichBlockPhoto,
     InputRichBlockVideo,
     RichTextBold,
+    RichTextCustomEmoji,
+    RichTextUrl,
 )
 
-from msu_hub_bot.providers.fxembed import FxMedia, FxPost, FxText, parse_post_url
+from msu_hub_bot.providers.fxembed import FxMedia, FxMediaFormat, FxPost, FxText, parse_post_url
 from msu_hub_bot.telegram import x_posts
 from msu_hub_bot.telegram.wrapper import BotWrapper
 from telegram_helpers import RecordingSession, make_message
@@ -74,7 +78,7 @@ def links_of(items):
     return [span.url for block in all_blocks(items) if hasattr(block, "text") for span in x_posts._rich_spans(block.text) if span.url]
 
 
-def test_native_layout_keeps_order_quote_media_and_clean_footer():
+def test_native_layout_keeps_compact_linked_header_quote_media_and_no_footer():
     items = [media(1), media(2, "video"), media(3)]
     quoted = post(id="321", text="На Луну", media={"all": [items[2]]})
     value = post(media={"all": items[:2]}, quote=quoted)
@@ -82,13 +86,22 @@ def test_native_layout_keeps_order_quote_media_and_clean_footer():
     assert len(messages) == 1
     assert messages[0].skip_entity_detection is True
     result = messages[0].blocks
-    assert text_of(result[:2]) == "Космокот · @cosmocat\n\n" + value.text
+    header = result[0].text
+    assert isinstance(header[0], RichTextCustomEmoji)
+    assert header[0].custom_emoji_id == "5422502846648039176"
+    assert header[0].alternative_text == "💬"
+    assert isinstance(header[2], RichTextBold) and header[2].text == "Космокот"
+    assert isinstance(header[4], RichTextUrl) and header[4].text == "@cosmocat" and header[4].url == value.author.url
+    assert isinstance(header[6], RichTextUrl) and header[6].text == "↗" and header[6].url == value.url
+    assert header[-1] == "\n"
+    assert text_of(result[:1]) == "💬 Космокот · @cosmocat · ↗\n"
+    assert text_of(result[1:2]) == value.text
     assert isinstance(result[2], InputRichBlockCollage)
     assert [item.type for item in result[2].blocks] == ["photo", "video"]
     assert isinstance(result[3], InputRichBlockBlockQuotation)
     assert any(isinstance(item, InputRichBlockPhoto) for item in result[3].blocks)
-    assert isinstance(result[-1], InputRichBlockFooter)
-    assert links_of(result)[-1] == value.url
+    assert not any(isinstance(item, InputRichBlockFooter) for item in all_blocks(result))
+    assert links_of(result) == [value.author.url, value.url, quoted.author.url, quoted.url]
     assert "Статистика" not in text_of(result)
 
 
@@ -107,6 +120,155 @@ def test_utf16_facets_preserve_emoji_and_link_mentions_to_x():
     assert "😀 @cat example.org/page tail" in text_of(blocks(result))
     assert "https://x.com/cat" in links_of(blocks(result))
     assert "https://example.org/page" in links_of(blocks(result))
+
+
+def test_uploaded_selected_media_links_are_removed_without_hiding_other_attachments():
+    first, second = media(1), media(2)
+    raw = {
+        "text": "😀 Photos https://t.co/first https://t.co/second",
+        "facets": [
+            {"type": "media", "indices": [10, 28], "id": "1"},
+            {"type": "media", "indices": [29, 48], "id": "2"},
+        ],
+    }
+    value = post(raw_text=raw, media={"all": [first, second]})
+    rendered = x_posts.render_x_post(value, uploads([first, second]), link=parse_post_url("https://x.com/cat/status/123/photo/2"))
+    output = text_of(blocks(rendered))
+    assert "😀 Photos https://t.co/first" in output
+    assert "https://t.co/second" not in output
+    attached = [block for block in all_blocks(blocks(rendered)) if isinstance(block, InputRichBlockPhoto)]
+    assert len(attached) == 1 and attached[0].photo.media.filename == "1"
+
+
+@pytest.mark.parametrize(
+    "facet,uploaded",
+    [
+        ({"type": "media", "id": "1"}, False),
+        ({"type": "media", "id": "different"}, True),
+        ({"type": "media"}, True),
+        ({"type": "url", "id": "1"}, True),
+    ],
+    ids=["download-missing", "other-media-id", "missing-media-id", "ordinary-url"],
+)
+def test_unproven_media_links_are_never_removed(facet, uploaded):
+    item = media(1)
+    link = "https://t.co/keep"
+    value = post(
+        raw_text={"text": link, "facets": [{**facet, "indices": [0, len(link)]}]},
+        media={"all": [item]},
+    )
+    rendered = x_posts.render_x_post(value, uploads([item]) if uploaded else {})
+    assert link in text_of(blocks(rendered))
+
+
+@pytest.mark.parametrize("uploaded", [False, True], ids=["missing-upload", "uploaded"])
+@pytest.mark.parametrize(
+    "body,indices,original",
+    [
+        ("Keep these words intact", [5, 16], None),
+        ("Read https://t.co/real", [5, 22], "https://t.co/different"),
+    ],
+    ids=["offsets-cover-ordinary-words", "offsets-cover-another-link"],
+)
+def test_stale_media_facets_cannot_remove_or_replace_original_content(body, indices, original, uploaded):
+    item = media(1)
+    value = post(
+        raw_text={
+            "text": body,
+            "facets": [
+                {
+                    "type": "media",
+                    "id": "1",
+                    "indices": indices,
+                    "original": original,
+                    "replacement": "https://x.com/wrong/status/999/photo/1",
+                    "display": "Unrelated replacement",
+                }
+            ],
+        },
+        media={"all": [item]},
+    )
+    rendered = x_posts.render_x_post(value, uploads([item]) if uploaded else {})
+    assert text_of(rendered[0].blocks[1:2]) == body
+    assert "https://x.com/wrong/status/999/photo/1" not in links_of(blocks(rendered))
+
+
+def test_matching_media_original_removes_the_trailing_link_and_its_empty_spacing():
+    item = media(1)
+    body = "😀 Keep this\n\nhttps://t.co/media  \n"
+    start = len("😀 Keep this\n\n".encode("utf-16-le")) // 2
+    value = post(
+        raw_text={
+            "text": body,
+            "facets": [{"type": "media", "id": "1", "indices": [start, start + 18], "original": "https://t.co/media"}],
+        },
+        media={"all": [item]},
+    )
+    rendered = x_posts.render_x_post(value, uploads([item]))
+    assert text_of(rendered[0].blocks[1:2]) == "😀 Keep this"
+    assert any(isinstance(block, InputRichBlockPhoto) for block in all_blocks(blocks(rendered)))
+
+
+def test_media_link_without_a_facet_is_preserved_even_when_media_is_uploaded():
+    item = media(1)
+    value = post(raw_text={"text": "https://t.co/keep"}, media={"all": [item]})
+    assert "https://t.co/keep" in text_of(blocks(x_posts.render_x_post(value, uploads([item]))))
+
+
+@pytest.mark.parametrize("prefix", ["😀 ", "🧑🏽‍🚀 "])
+def test_media_facet_removal_preserves_utf16_neighbors_links_and_trailing_text(prefix):
+    item = media(1)
+    body = prefix + "https://t.co/media @cat https://t.co/page end 😺"
+
+    def facet(kind, label, **extra):
+        index = body.index(label)
+        start = len(body[:index].encode("utf-16-le")) // 2
+        end = start + len(label.encode("utf-16-le")) // 2
+        return {"type": kind, "indices": [start, end], **extra}
+
+    value = post(
+        raw_text={
+            "text": body,
+            "facets": [
+                facet("media", "https://t.co/media", id="1"),
+                facet("mention", "@cat"),
+                facet("url", "https://t.co/page", replacement="https://example.org/page", display="example.org/page"),
+            ],
+        },
+        media={"all": [item]},
+    )
+    rendered = x_posts.render_x_post(value, uploads([item]))
+    output = text_of(blocks(rendered))
+    assert prefix in output
+    assert "https://t.co/media" not in output
+    assert "@cat example.org/page end 😺" in output
+    assert "https://x.com/cat" in links_of(blocks(rendered))
+    assert "https://example.org/page" in links_of(blocks(rendered))
+
+
+def test_uploaded_media_link_in_a_quote_does_not_remove_unselected_parent_media():
+    first, second = media(1), media(2)
+    short = "https://t.co/media"
+    value = post(
+        raw_text={"text": short, "facets": [{"type": "media", "id": "1", "indices": [0, len(short)]}]},
+        media={"all": [first, second]},
+        quote=post(id="456", text="Quoted photo", media={"all": [first]}),
+    )
+    rendered = x_posts.render_x_post(value, uploads([first, second]), link=parse_post_url("https://x.com/cat/status/123/photo/2"))
+    assert short in text_of(rendered[0].blocks[:2])
+
+
+def test_overflow_preserves_custom_header_emoji_and_plain_fallback_glyph():
+    value = post(text="😀" * 40000)
+    rendered = x_posts.render_x_post(value, {})
+    assert len(rendered) > 1
+    spans = [span for block in all_blocks(blocks(rendered)) if hasattr(block, "text") for span in x_posts._rich_spans(block.text)]
+    custom = [span for span in spans if span.custom_emoji_id]
+    assert len(custom) == 1
+    assert custom[0].custom_emoji_id == "5422502846648039176" and custom[0].text == "💬"
+    first = x_posts._plain(rendered[0].blocks)
+    assert first.startswith("💬 Космокот · @cosmocat")
+    assert value.author.url in first and value.url in first
 
 
 def test_no_facet_post_uses_full_raw_body_and_safe_explicit_links():
@@ -273,6 +435,66 @@ def test_sensitive_media_are_spoilers():
     )
 
 
+@pytest.mark.parametrize("sensitive", [False, True])
+def test_shared_video_upload_keeps_geometry_and_independent_post_spoilers(sensitive):
+    item = media(1, "video")
+    uploaded = InputMediaVideo(
+        media=BufferedInputFile(b"synthetic", filename="video.mp4"),
+        width=800,
+        height=600,
+        duration=7,
+        supports_streaming=True,
+    )
+    value = post(
+        possibly_sensitive=sensitive,
+        media={"all": [item]},
+        quote=post(id="456", possibly_sensitive=not sensitive, media={"all": [item]}),
+    )
+    rendered = x_posts.render_x_post(value, {item.url: uploaded})
+    videos = [block.video for block in all_blocks(blocks(rendered)) if isinstance(block, InputRichBlockVideo)]
+    assert len(videos) == 2 and videos[0] is not videos[1]
+    assert [video.has_spoiler for video in videos] == [sensitive, not sensitive]
+    assert all((video.width, video.height, video.duration, video.supports_streaming) == (800, 600, 7, True) for video in videos)
+    assert uploaded.has_spoiler is None
+
+
+@pytest.mark.parametrize(
+    "dimensions,variant_dimensions,expected",
+    [
+        ((800, 600), None, (800, 600)),
+        ((800, 600), (320, 180), (320, 180)),
+        ((800, 600), (320, None), (800, 600)),
+        ((800, 600), (None, 180), (800, 600)),
+        ((0, 600), None, (None, None)),
+        ((800, 0), None, (None, None)),
+        ((0, 0), (320, 180), (320, 180)),
+        ((40000, 20000), None, (10000, 5000)),
+        ((800, 600), (10**400, 5 * 10**399), (10000, 5000)),
+    ],
+    ids=[
+        "primary",
+        "variant",
+        "variant-width-only",
+        "variant-height-only",
+        "primary-width-missing",
+        "primary-height-missing",
+        "variant-only",
+        "scaled",
+        "malformed-huge-variant",
+    ],
+)
+def test_video_geometry_uses_a_complete_pair_from_the_selected_source(dimensions, variant_dimensions, expected):
+    item = media(1, "video", width=dimensions[0], height=dimensions[1], duration=3.2)
+    variant = (
+        FxMediaFormat(url="https://video.twimg.com/variant.mp4", width=variant_dimensions[0], height=variant_dimensions[1])
+        if variant_dimensions is not None
+        else None
+    )
+    upload = x_posts._video_upload(BufferedInputFile(b"synthetic", filename="video.mp4"), item, variant)
+    assert (upload.width, upload.height) == expected
+    assert upload.duration == 3 and upload.supports_streaming
+
+
 def test_poll_notes_and_reply_attribution_are_visible():
     result = x_posts.render_x_post(
         post(
@@ -359,10 +581,68 @@ async def test_definite_media_rejection_falls_back_to_complete_text(monkeypatch)
     monkeypatch.setattr(bot, "send_rich_message", AsyncMock(side_effect=error))
     value = post(text="full body " * 700)
     await x_posts.publish_x_post(value, bot, -10042, 12, message_thread_id=73)
+    assert session.methods[0].text.startswith("💬 Космокот · @cosmocat")
     assert "full body " * 700 in "".join(method.text for method in session.methods)
     assert value.url in "".join(method.text for method in session.methods)
     assert all(method.parse_mode is None and method.link_preview_options.is_disabled for method in session.methods)
     assert all(method.message_thread_id == 73 for method in session.methods)
+
+
+@pytest.mark.parametrize("reason", ["Bad Request: invalid custom emoji", "Bad Request: CUSTOM_EMOJI_NOT_ALLOWED"])
+async def test_custom_emoji_rejection_retries_once_with_plain_glyph_and_intact_rich_media(monkeypatch, reason):
+    async def download(session, item, path, budget):
+        path.write_bytes(b"synthetic")
+
+    monkeypatch.setattr(x_posts, "_download", download)
+    session = RecordingSession()
+    bot = BotWrapper("123456789:" + "a" * 35, session=session)
+    value = post(
+        media={"all": [media(1)]},
+        quote=post(id="456", possibly_sensitive=True, media={"all": [media(2, "video")]}),
+    )
+    method = SendRichMessage(chat_id=-10042, rich_message=x_posts.render_x_post(value, {})[0])
+    sent = make_message(message_id=501)
+    monkeypatch.setattr(bot, "send_rich_message", AsyncMock(side_effect=[TelegramBadRequest(method=method, message=reason), sent]))
+
+    result = await x_posts.publish_x_post(value, bot, -10042, 12, message_thread_id=73)
+
+    assert result is sent
+    assert bot.send_rich_message.await_count == 2
+    first, retry = [call.kwargs for call in bot.send_rich_message.await_args_list]
+    original, retried = first["rich_message"], retry["rich_message"]
+    original_spans = [span for block in all_blocks(original.blocks) if hasattr(block, "text") for span in x_posts._rich_spans(block.text)]
+    retried_spans = [span for block in all_blocks(retried.blocks) if hasattr(block, "text") for span in x_posts._rich_spans(block.text)]
+    assert sum(bool(span.custom_emoji_id) for span in original_spans) == 2
+    assert not any(span.custom_emoji_id for span in retried_spans)
+    assert text_of(retried.blocks) == text_of(original.blocks)
+    assert links_of(retried.blocks) == links_of(original.blocks)
+    assert retried.skip_entity_detection is True
+    original_media = [block for block in all_blocks(original.blocks) if isinstance(block, InputRichBlockPhoto | InputRichBlockVideo)]
+    retried_media = [block for block in all_blocks(retried.blocks) if isinstance(block, InputRichBlockPhoto | InputRichBlockVideo)]
+    assert original_media == retried_media
+    assert len(retried_media) == 2 and retried_media[1].video.has_spoiler
+    assert (retried_media[1].video.width, retried_media[1].video.height) == (800, 600)
+    for call in (first, retry):
+        assert call["chat_id"] == -10042 and call["message_thread_id"] == 73
+        assert call["reply_parameters"].message_id == 12
+    assert not session.methods
+
+
+@pytest.mark.parametrize("error_type", [TelegramBadRequest, TelegramNetworkError, TelegramServerError, TimeoutError])
+async def test_emoji_retry_propagates_a_second_unrelated_or_ambiguous_failure(monkeypatch, error_type):
+    session = RecordingSession()
+    bot = BotWrapper("123456789:" + "a" * 35, session=session)
+    method = SendRichMessage(chat_id=1, rich_message=x_posts.render_x_post(post(), {})[0])
+    second = TimeoutError() if error_type is TimeoutError else error_type(method=method, message="chat not found")
+    monkeypatch.setattr(
+        bot,
+        "send_rich_message",
+        AsyncMock(side_effect=[TelegramBadRequest(method=method, message="invalid custom emoji"), second]),
+    )
+    with pytest.raises(error_type):
+        await x_posts.publish_x_post(post(), bot, 1, 12)
+    assert bot.send_rich_message.await_count == 2
+    assert not session.methods
 
 
 @pytest.mark.asyncio
@@ -480,6 +760,47 @@ async def test_supported_redirect_and_bounded_media_stream(tmp_path):
     assert target.read_bytes() == b"abcd"
     assert budget.remaining == 6
     assert session.calls[1][0] == "https://pbs.twimg.com/image.jpg"
+
+
+@pytest.mark.parametrize("use_variant", [False, True], ids=["primary", "selected-variant"])
+async def test_published_video_retains_downloaded_geometry_across_redirects(monkeypatch, use_variant):
+    item = media(
+        1,
+        "video",
+        width=1280,
+        height=720,
+        filesize=100 * 1024 * 1024 if use_variant else None,
+        formats=[
+            {
+                "url": "https://video.twimg.com/smaller.mp4",
+                "container": "mp4",
+                "codec": "h264",
+                "width": 320,
+                "height": 180,
+                "size": 1024,
+            }
+        ],
+    )
+    http = http_session(
+        Response(status=302, headers={"Location": "/redirected.mp4"}),
+        Response(headers={"Content-Type": "video/mp4"}, chunks=[b"synthetic-video"]),
+    )
+
+    @asynccontextmanager
+    async def client_session(**kwargs):
+        yield http
+
+    session = RecordingSession()
+    bot = BotWrapper("123456789:" + "a" * 35, session=session)
+    monkeypatch.setattr(x_posts.aiohttp, "ClientSession", client_session)
+    await x_posts.publish_x_post(post(media={"all": [item]}), bot, -10042, 12)
+    assert len(session.methods) == 1 and isinstance(session.methods[0], SendRichMessage)
+    video = next(block.video for block in all_blocks(session.methods[0].rich_message.blocks) if isinstance(block, InputRichBlockVideo))
+    assert (video.width, video.height) == ((320, 180) if use_variant else (1280, 720))
+    assert [url for url, _ in http.calls] == [
+        "https://video.twimg.com/smaller.mp4" if use_variant else item.url,
+        "https://video.twimg.com/redirected.mp4",
+    ]
 
 
 @pytest.mark.asyncio

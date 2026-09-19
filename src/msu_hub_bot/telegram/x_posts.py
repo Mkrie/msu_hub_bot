@@ -3,7 +3,7 @@
 import asyncio
 import re
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -30,6 +30,7 @@ from aiogram.types import (
     ReplyParameters,
     RichTextBold,
     RichTextCode,
+    RichTextCustomEmoji,
     RichTextItalic,
     RichTextStrikethrough,
     RichTextUnderline,
@@ -44,10 +45,16 @@ from msu_hub_bot.telegram.wrapper import BotWrapper
 _MAX_TEXT = 32768
 _MAX_BLOCKS = 500
 _MAX_MEDIA = 50
+_MAX_VIDEO_SIDE = 10000
 _MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+_X_EMOJI_ID = "5422502846648039176"
+_X_EMOJI_FALLBACK = "💬"
 _DOWNLOADS = asyncio.Semaphore(2)
 _LINK = re.compile(r"https?://[^\s<>]+|(?<![\w@])@[A-Za-z0-9_]{1,15}\b")
+_MEDIA_LINK = re.compile(r"(?:https?://)?(?:t\.co|(?:pic\.)?(?:x\.com|twitter\.com))/[^\s<>]+", re.IGNORECASE)
 _STYLES = {"BOLD", "ITALIC", "CODE", "STRIKETHROUGH", "UNDERLINE"}
+
+type _Upload = InputFile | InputMediaVideo
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,9 +62,14 @@ class _Span:
     text: str
     url: str | None = None
     style: str | None = None
+    custom_emoji_id: str | None = None
 
     def rich(self) -> RichTextUnion:
-        text: RichTextUnion = RichTextUrl(text=self.text, url=self.url) if self.url else self.text
+        text: RichTextUnion = (
+            RichTextCustomEmoji(custom_emoji_id=self.custom_emoji_id, alternative_text=self.text) if self.custom_emoji_id else self.text
+        )
+        if self.url:
+            text = RichTextUrl(text=text, url=self.url)
         for style in (self.style or "").split(","):
             if style == "BOLD":
                 text = RichTextBold(text=text)
@@ -110,7 +122,14 @@ def _unescape_x(text: str) -> str:
     return text
 
 
-def _spans(text: str, raw: FxText | None = None, styles: Sequence[FxStyleRange] = (), *, unescape: bool = False) -> list[_Span]:
+def _spans(
+    text: str,
+    raw: FxText | None = None,
+    styles: Sequence[FxStyleRange] = (),
+    *,
+    unescape: bool = False,
+    shown_media_ids: frozenset[str] = frozenset(),
+) -> list[_Span]:
     """Facet offsets refer to raw UTF-16 text, not Python character indices."""
     text = raw.text if raw is not None else text
     if (raw is None or not raw.facets) and not styles:
@@ -155,6 +174,23 @@ def _spans(text: str, raw: FxText | None = None, styles: Sequence[FxStyleRange] 
             continue
         result.extend(gap(start, left))
         original = _unescape_x(text[left:right]) if unescape else text[left:right]
+        if facet.type == "media" and (
+            not _MEDIA_LINK.fullmatch(original) or (facet.original is not None and _unescape_x(facet.original) != original)
+        ):
+            # Stale offsets must not replace or erase unrelated words or links.
+            result.extend(gap(left, right))
+            start = right
+            continue
+        if facet.type == "media" and facet.id in shown_media_ids:
+            start = right
+            if not text[right:].strip():
+                while result and not result[-1].text.strip():
+                    result.pop()
+                if result:
+                    result[-1] = replace(result[-1], text=result[-1].text.rstrip())
+                start = len(text)
+                break
+            continue
         target = facet.replacement or ""
         if facet.type == "mention":
             target = "https://x.com/" + original.lstrip("@")
@@ -184,7 +220,7 @@ def _paragraphs(spans: Sequence[_Span], *, limit: int = _MAX_TEXT) -> list[Input
                 current, size = [], 0
                 continue
             piece = next(_pieces(remaining, available))
-            current.append(_Span(piece, span.url, span.style).rich())
+            current.append(replace(span, text=piece).rich())
             size += _units(piece)
             remaining = remaining[len(piece) :]
     if current:
@@ -195,9 +231,14 @@ def _paragraphs(spans: Sequence[_Span], *, limit: int = _MAX_TEXT) -> list[Input
 def _author(post: FxPost) -> InputRichBlockParagraph:
     return InputRichBlockParagraph(
         text=[
-            RichTextBold(text=RichTextUrl(text=post.author.name, url=post.author.url)),
+            RichTextCustomEmoji(custom_emoji_id=_X_EMOJI_ID, alternative_text=_X_EMOJI_FALLBACK),
+            " ",
+            RichTextBold(text=post.author.name),
             " · ",
             RichTextUrl(text="@" + post.author.screen_name, url=post.author.url),
+            " · ",
+            RichTextUrl(text="↗", url=post.url),
+            "\n",
         ]
     )
 
@@ -209,7 +250,26 @@ def _selected(post: FxPost, link: PostLink | None) -> list[FxMedia]:
     return [item for index, item in enumerate(media, 1) if (item.source_index or index) == link.media_index]
 
 
-def _gallery(media: Sequence[FxMedia], uploads: Mapping[str, InputFile], post: FxPost) -> list[InputRichBlockUnion]:
+def _video_upload(file: InputFile, media: FxMedia, variant: FxMediaFormat | None = None) -> InputMediaVideo:
+    # Rich video blocks need explicit geometry; omitted dimensions reach Telegram as 0×0.
+    width, height = media.width, media.height
+    if variant and variant.width and variant.height:
+        width, height = variant.width, variant.height
+    if width > 0 and height > 0:
+        scale = max(_MAX_VIDEO_SIDE, width, height)
+        dimensions: tuple[int | None, int | None] = (max(1, width * _MAX_VIDEO_SIDE // scale), max(1, height * _MAX_VIDEO_SIDE // scale))
+    else:
+        dimensions = None, None
+    return InputMediaVideo(
+        media=file,
+        width=dimensions[0],
+        height=dimensions[1],
+        duration=round(media.duration) if media.duration is not None else None,
+        supports_streaming=True,
+    )
+
+
+def _gallery(media: Sequence[FxMedia], uploads: Mapping[str, _Upload], post: FxPost) -> list[InputRichBlockUnion]:
     result: list[InputRichBlockUnion] = []
     group: list[InputRichBlockUnion] = []
 
@@ -225,32 +285,27 @@ def _gallery(media: Sequence[FxMedia], uploads: Mapping[str, InputFile], post: F
             label = "Фото" if item.type == "photo" else "Видео"
             result.append(InputRichBlockParagraph(text=RichTextUrl(text=f"{label} — в оригинале", url=post.url)))
         elif item.type == "photo":
-            group.append(InputRichBlockPhoto(photo=InputMediaPhoto(media=upload, has_spoiler=post.possibly_sensitive)))
+            file = upload.media if isinstance(upload, InputMediaVideo) else upload
+            group.append(InputRichBlockPhoto(photo=InputMediaPhoto(media=file, has_spoiler=post.possibly_sensitive)))
         else:
-            group.append(
-                InputRichBlockVideo(
-                    video=InputMediaVideo(
-                        media=upload,
-                        duration=round(item.duration) if item.duration is not None else None,
-                        supports_streaming=True,
-                        has_spoiler=post.possibly_sensitive,
-                    )
-                )
-            )
+            video = upload if isinstance(upload, InputMediaVideo) else _video_upload(upload, item)
+            group.append(InputRichBlockVideo(video=video.model_copy(update={"has_spoiler": post.possibly_sensitive})))
         if len(group) == 10:
             flush()
     flush()
     return result
 
 
-def _post_blocks(post: FxPost, uploads: Mapping[str, InputFile], link: PostLink | None = None, depth: int = 0) -> list[InputRichBlockUnion]:
+def _post_blocks(post: FxPost, uploads: Mapping[str, _Upload], link: PostLink | None = None, depth: int = 0) -> list[InputRichBlockUnion]:
     blocks: list[InputRichBlockUnion] = [_author(post)]
     if post.replying_to:
         blocks.append(
             InputRichBlockParagraph(text=RichTextUrl(text=f"↪ В ответ @{post.replying_to.screen_name}", url=post.replying_to.url))
         )
-    blocks.extend(_paragraphs(_spans(post.text, post.raw_text, unescape=True)))
-    blocks.extend(_gallery(_selected(post, link), uploads, post))
+    media = _selected(post, link)
+    shown = frozenset(item.id for item in media if item.id and item.url in uploads)
+    blocks.extend(_paragraphs(_spans(post.text, post.raw_text, unescape=True, shown_media_ids=shown)))
+    blocks.extend(_gallery(media, uploads, post))
     if post.media.unsupported_count:
         blocks.append(
             InputRichBlockParagraph(text=RichTextUrl(text="Другие вложения — в оригинале", url=post.media.external_url or post.url))
@@ -273,7 +328,6 @@ def _post_blocks(post: FxPost, uploads: Mapping[str, InputFile], link: PostLink 
         label = "Цитируемая публикация недоступна."
         source = post.quote.url or (f"https://x.com/i/status/{post.quote.id}" if post.quote.id else None)
         blocks.append(InputRichBlockParagraph(text=RichTextUrl(text=label, url=source) if source else label))
-    blocks.append(InputRichBlockFooter(text=RichTextUrl(text="↗ Оригинал", url=post.url)))
     return blocks
 
 
@@ -294,7 +348,7 @@ def _poll_blocks(post: FxPost) -> list[InputRichBlockUnion]:
     return blocks
 
 
-def _article_blocks(post: FxPost, uploads: Mapping[str, InputFile]) -> list[InputRichBlockUnion]:
+def _article_blocks(post: FxPost, uploads: Mapping[str, _Upload]) -> list[InputRichBlockUnion]:
     article = post.article
     assert article is not None
     blocks: list[InputRichBlockUnion] = []
@@ -369,6 +423,8 @@ def _rich_spans(text: RichTextUnion, *, url: str | None = None, style: str | Non
             yield from _rich_spans(child, url=url, style=style)
     elif isinstance(text, RichTextUrl):
         yield from _rich_spans(text.text, url=text.url, style=style)
+    elif isinstance(text, RichTextCustomEmoji):
+        yield _Span(text.alternative_text, url, style, text.custom_emoji_id)
     elif isinstance(text, RichTextBold | RichTextItalic | RichTextCode | RichTextStrikethrough | RichTextUnderline):
         combined = ",".join(sorted({*(style or "").split(","), text.type.upper()} - {""}))
         yield from _rich_spans(text.text, url=url, style=combined)
@@ -407,7 +463,7 @@ def _flat_blocks(blocks: Sequence[InputRichBlockUnion]) -> Iterator[InputRichBlo
             yield block
 
 
-def render_x_post(post: FxPost, uploads: Mapping[str, InputFile], *, link: PostLink | None = None) -> list[InputRichMessage]:
+def render_x_post(post: FxPost, uploads: Mapping[str, _Upload], *, link: PostLink | None = None) -> list[InputRichMessage]:
     """Keep ordinary posts together; flatten and split only genuine overflows."""
     blocks = _post_blocks(post, uploads, link)
     if _fits(blocks):
@@ -469,11 +525,12 @@ def _download_url(media: FxMedia, limit: int) -> str:
     return max(candidates, key=lambda variant: (variant.bitrate or 0, (variant.width or 0) * (variant.height or 0))).url
 
 
-async def _download(session: aiohttp.ClientSession, media: FxMedia, destination: Path, budget: _DownloadBudget) -> None:
+async def _download(session: aiohttp.ClientSession, media: FxMedia, destination: Path, budget: _DownloadBudget) -> FxMediaFormat | None:
     limit = min(9 * 1024 * 1024 if media.type == "photo" else 49 * 1024 * 1024, budget.remaining)
     if limit <= 0 or not safe_media_url(media.url):
         raise ValueError("X media is outside upload limits")
     url = _download_url(media, limit)
+    variant = next((item for item in media.formats if item.url == url), None)
     async with _DOWNLOADS:
         for _ in range(4):
             async with session.get(url, allow_redirects=False) as response:
@@ -498,7 +555,7 @@ async def _download(session: aiohttp.ClientSession, media: FxMedia, destination:
                         stream.write(chunk)
                 if not size:
                     raise ValueError("Empty X media")
-                return
+                return variant
     raise ValueError("Too many media redirects")
 
 
@@ -519,6 +576,18 @@ def _can_fallback(error: TelegramBadRequest) -> bool:
     return any(word in reason for word in ("rich", "media", "photo", "video", "file", "entity", "text is too long"))
 
 
+def _without_custom_emoji(blocks: Sequence[InputRichBlockUnion]) -> list[InputRichBlockUnion]:
+    result: list[InputRichBlockUnion] = []
+    for block in blocks:
+        if isinstance(block, InputRichBlockBlockQuotation | InputRichBlockCollage):
+            block = block.model_copy(update={"blocks": _without_custom_emoji(block.blocks)})
+        elif isinstance(block, InputRichBlockParagraph | InputRichBlockFooter | InputRichBlockSectionHeading):
+            text = [replace(span, custom_emoji_id=None).rich() for span in _rich_spans(block.text)]
+            block = block.model_copy(update={"text": text})
+        result.append(block)
+    return result
+
+
 async def publish_x_post(
     post: FxPost,
     bot: BotWrapper,
@@ -529,7 +598,7 @@ async def publish_x_post(
     link: PostLink | None = None,
 ) -> Message | None:
     """Download only public X CDN media; never repeat an ambiguous Telegram send."""
-    uploads: dict[str, InputFile] = {}
+    uploads: dict[str, _Upload] = {}
     with TemporaryDirectory(prefix="msu-x-") as directory:
         async with aiohttp.ClientSession(
             headers={"User-Agent": USER_AGENT}, timeout=aiohttp.ClientTimeout(total=40, connect=10)
@@ -545,36 +614,43 @@ async def publish_x_post(
                         suffix = ".jpg" if media.type == "photo" else ".mp4"
                         path = Path(directory) / f"{index}{suffix}"
                         try:
-                            await _download(session, media, path, budget)
+                            variant = await _download(session, media, path, budget)
                         except aiohttp.ClientError, TimeoutError, OSError, ValueError:
                             path.unlink(missing_ok=True)
                             continue
-                        uploads[media.url] = FSInputFile(path)
+                        file = FSInputFile(path)
+                        uploads[media.url] = file if media.type == "photo" else _video_upload(file, media, variant)
             except TimeoutError:
                 pass
         result = None
         async with bot.serial_send(chat_id):
             for message in render_x_post(post, uploads, link=link):
                 reply = ReplyParameters(message_id=reply_to, allow_sending_without_reply=True) if reply_to is not None else None
-                try:
-                    result = await bot.send_rich_message(
-                        chat_id=chat_id, rich_message=message, reply_parameters=reply, message_thread_id=message_thread_id
-                    )
-                except TelegramBadRequest as error:
-                    if not _can_fallback(error):
-                        raise
-                    for text in _pieces(_plain(message.blocks or []), 4096):
-                        if not text.strip():
-                            continue
-                        result = await bot.send_message(
-                            chat_id=chat_id,
-                            text=text,
-                            parse_mode=None,
-                            link_preview_options=LinkPreviewOptions(is_disabled=True),
-                            reply_parameters=reply,
-                            message_thread_id=message_thread_id,
+                for custom_emoji in (True, False):
+                    try:
+                        result = await bot.send_rich_message(
+                            chat_id=chat_id, rich_message=message, reply_parameters=reply, message_thread_id=message_thread_id
                         )
-                        reply = ReplyParameters(message_id=result.message_id, allow_sending_without_reply=True)
+                    except TelegramBadRequest as error:
+                        if custom_emoji and any(word in error.message.lower() for word in ("custom emoji", "custom_emoji")):
+                            # A definite rejection permits one retry if the bot loses emoji eligibility.
+                            message = message.model_copy(update={"blocks": _without_custom_emoji(message.blocks or [])})
+                            continue
+                        if not _can_fallback(error):
+                            raise
+                        for text in _pieces(_plain(message.blocks or []), 4096):
+                            if not text.strip():
+                                continue
+                            result = await bot.send_message(
+                                chat_id=chat_id,
+                                text=text,
+                                parse_mode=None,
+                                link_preview_options=LinkPreviewOptions(is_disabled=True),
+                                reply_parameters=reply,
+                                message_thread_id=message_thread_id,
+                            )
+                            reply = ReplyParameters(message_id=result.message_id, allow_sending_without_reply=True)
+                    break
                 if result:
                     reply_to = result.message_id
         return result
