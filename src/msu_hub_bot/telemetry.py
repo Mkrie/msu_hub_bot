@@ -34,6 +34,9 @@ from opentelemetry.sdk.trace.sampling import Decision, ParentBased, Sampler, Sam
 from opentelemetry.trace import INVALID_SPAN, Link, Span, SpanContext, SpanKind, StatusCode, TraceState, set_span_in_context
 from opentelemetry.util.types import Attributes
 
+from msu_hub_bot.providers.link_diagnostics import LinkDiagnostic, LinkReason, LinkStage
+from msu_hub_bot.providers.link_source import source_metadata
+
 logger = logging.getLogger(__name__)
 EU_ENDPOINT = "https://logfire-eu.pydantic.dev"
 
@@ -75,6 +78,8 @@ class Provider(StrEnum):
     YOUTUBE = "youtube"
     INSTAGRAM = "instagram"
     TIKTOK = "tiktok"
+    VK = "vk"
+    YTDLP = "ytdlp"
     OTHER = "other"
 
 
@@ -135,6 +140,8 @@ OPERATIONS = frozenset(
         "fxembed.fetch",
         "links.extract",
         "links.publish",
+        "links.preview",
+        "links.step",
         "x.media.prepare",
         "worker.queue",
         "worker.prepare",
@@ -180,6 +187,7 @@ UPDATE_KINDS = frozenset(
 )
 METRIC_KEYS = {"boundary", "operation", "outcome", "provider", "backend", "update.kind", *JOB_METRIC_KEYS}
 MEDIA_METRIC_KEYS = {"provider", "media.kind", "media.reason", "outcome"}
+LINK_METRIC_KEYS = {"provider", "link.stage", "link.reason", "outcome"}
 _MEDIA_SIZE_BUCKETS = (0, 65536, 1048576, 4194304, 16777216, 67108864, 134217728, 1073741824)
 _MEDIA_READY = frozenset({MediaReason.READY, MediaReason.READY_REDUCED})
 
@@ -498,6 +506,32 @@ _current: ContextVar[Operation | None] = ContextVar("telemetry_operation", defau
 _job_link: ContextVar[SpanContext | None] = ContextVar("telemetry_job_link", default=None)
 
 
+@dataclass
+class _LinkContext:
+    owner: asyncio.Task[Any] | None
+    attributes: dict[str, str]
+    active: bool = True
+
+
+_link: ContextVar[_LinkContext | None] = ContextVar("telemetry_link", default=None)
+
+
+def _link_outcome(reason: LinkReason) -> Outcome:
+    if reason in {LinkReason.OK, LinkReason.READY}:
+        return Outcome.SUCCESS
+    if reason in {LinkReason.DISABLED, LinkReason.POLICY, LinkReason.UNSUPPORTED}:
+        return Outcome.IGNORED
+    if reason is LinkReason.TIMEOUT:
+        return Outcome.TIMEOUT
+    if reason is LinkReason.CANCELLED:
+        return Outcome.CANCELLED
+    if reason in {LinkReason.BUSY, LinkReason.REJECTED, LinkReason.TOO_LARGE}:
+        return Outcome.REJECTED
+    if reason is LinkReason.UNEXPECTED:
+        return Outcome.UNEXPECTED
+    return Outcome.UNAVAILABLE
+
+
 def failure_outcome(error: BaseException) -> Outcome:
     # Classification examines types only: Telegram/provider exception strings contain inputs.
     from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter
@@ -532,14 +566,54 @@ class Operation:
         span: Span | None = None,
         *,
         media_record: Callable[[MediaKind, MediaReason, int, int, float], None] | None = None,
+        link_record: Callable[[LinkDiagnostic], None] | None = None,
     ) -> None:
         self.owner, self._span = owner, span
         self.outcome = Outcome.SUCCESS
         self.active = True
         self.failure: dict[str, str | int] = {}
-        self.details: dict[str, int] = {}
+        self.details: dict[str, str | int] = {}
+        self._link_record = link_record
         self._media_record = media_record
         self._media = _MediaSummary() if media_record is not None else None
+
+    def _owned(self) -> bool:
+        try:
+            return self.active and self.owner is not None and self.owner is asyncio.current_task()
+        except RuntimeError:
+            return False
+
+    def link_result(self, stage: LinkStage, reason: LinkReason) -> None:
+        if self._owned() and isinstance(stage, LinkStage) and isinstance(reason, LinkReason):
+            self.details.update({"link.stage": stage.value, "link.reason": reason.value})
+            self.set_outcome(_link_outcome(reason))
+            if self._span is not None:
+                self._span.set_attributes(self.details)
+
+    def link_diagnostics(self, diagnostics: Sequence[LinkDiagnostic]) -> None:
+        if not self._owned() or self._link_record is None:
+            return
+        for diagnostic in diagnostics[:128]:
+            if isinstance(diagnostic, LinkDiagnostic):
+                self._link_record(diagnostic)
+
+    def link_error(self, stage: LinkStage, error: BaseException) -> None:
+        if not self._owned() or not isinstance(stage, LinkStage):
+            return
+        self.failure = safe_failure(error)
+        reason = {
+            Outcome.IGNORED: LinkReason.POLICY,
+            Outcome.REJECTED: LinkReason.REJECTED,
+            Outcome.UNAVAILABLE: LinkReason.UNAVAILABLE,
+            Outcome.TIMEOUT: LinkReason.TIMEOUT,
+            Outcome.CANCELLED: LinkReason.CANCELLED,
+            Outcome.UNEXPECTED: LinkReason.UNEXPECTED,
+        }.get(failure_outcome(error), LinkReason.UNEXPECTED)
+        if self.failure.get("error.reason") == "worker_busy":
+            reason = LinkReason.BUSY
+        self.link_result(stage, reason)
+        if self._span is not None:
+            self._span.set_attributes(self.failure)
 
     def set_outcome(self, outcome: Outcome) -> None:
         if isinstance(outcome, Outcome):
@@ -765,6 +839,19 @@ class Telemetry:
         if self._available() and isinstance(name, GaugeName) and math.isfinite(value) and 0 <= value <= 1e9:
             self._gauge_values[name] = value
 
+    @contextmanager
+    def link_preview(self, source_url: str, provider: Provider) -> Iterator[Operation]:
+        """Own one source attempt; source identity never enters workers or job context."""
+        context = _LinkContext(asyncio.current_task(), source_metadata(source_url))
+        token = _link.set(context)
+        try:
+            with self.operation(Boundary.PROVIDER, "links.preview", provider=provider) as operation:
+                operation.link_result(LinkStage.ROUTE, LinkReason.READY)
+                yield operation
+        finally:
+            context.active = False
+            _link.reset(token)
+
     def _gauge_callback(self, name: GaugeName) -> Callable[[CallbackOptions], Sequence[Observation]]:
         def observe(options: CallbackOptions) -> Sequence[Observation]:
             if name is GaugeName.POLL_AGE and self._last_poll is not None:
@@ -835,6 +922,8 @@ class Telemetry:
                     View(instrument_name="bot.telemetry.dropped_logs", meter_name="msu_hub_bot.telemetry", attribute_keys=set()),
                     View(instrument_name="bot.poll.requests", meter_name="msu_hub_bot.telemetry", attribute_keys={"outcome"}),
                     View(instrument_name="bot.media.assets", meter_name="msu_hub_bot.telemetry", attribute_keys=MEDIA_METRIC_KEYS),
+                    View(instrument_name="bot.links.attempts", meter_name="msu_hub_bot.telemetry", attribute_keys=LINK_METRIC_KEYS),
+                    View(instrument_name="bot.links.steps", meter_name="msu_hub_bot.telemetry", attribute_keys=LINK_METRIC_KEYS),
                     View(
                         instrument_name="bot.media.download.attempts", meter_name="msu_hub_bot.telemetry", attribute_keys=MEDIA_METRIC_KEYS
                     ),
@@ -870,6 +959,8 @@ class Telemetry:
             self._log_drops = meter.create_counter("bot.telemetry.dropped_logs", unit="1")
             self._poll_count = meter.create_counter("bot.poll.requests", unit="1")
             self._media_assets = meter.create_counter("bot.media.assets", unit="1")
+            self._link_attempts = meter.create_counter("bot.links.attempts", unit="1")
+            self._link_steps = meter.create_counter("bot.links.steps", unit="1")
             self._media_attempts = meter.create_counter("bot.media.download.attempts", unit="1")
             self._media_duration = meter.create_histogram("bot.media.download.duration", unit="s")
             self._media_size = meter.create_histogram("bot.media.download.size", unit="By")
@@ -892,7 +983,7 @@ class Telemetry:
                 meter_provider=NoOpMeterProvider(),
                 span_limits=SpanLimits(
                     max_attributes=32,
-                    max_events=1,
+                    max_events=128,
                     max_links=1,
                     max_span_attributes=32,
                     max_event_attributes=8,
@@ -942,7 +1033,13 @@ class Telemetry:
     def _operation_log(self, boundary: Boundary, handle: Operation, attributes: dict[str, str | int], duration: float) -> None:
         failed = handle.outcome not in {Outcome.SUCCESS, Outcome.IGNORED, Outcome.CANCELLED}
         span = handle._span
-        if boundary is Boundary.TELEGRAM:
+        if attributes.get("operation") == "links.preview":
+            event = "bot.link.completed"
+        elif attributes.get("operation") == "links.step":
+            if not failed:
+                return
+            event = "bot.link.step.failed"
+        elif boundary is Boundary.TELEGRAM:
             if not failed or handle.failure.get("error.reason") == "message_not_modified":
                 return
             event = "telegram.request.failed"
@@ -996,6 +1093,31 @@ class Telemetry:
             self._count.add(1, attributes)
             self._duration.record(max(0, duration), attributes)
 
+    def _record_link_step(
+        self, diagnostic: LinkDiagnostic, provider: Provider | None, parent: Operation, attributes: dict[str, str | int]
+    ) -> None:
+        if not isinstance(diagnostic.stage, LinkStage) or not isinstance(diagnostic.reason, LinkReason):
+            return
+        try:
+            handle = Operation(parent.owner, parent._span)
+            handle.outcome = _link_outcome(diagnostic.reason)
+            labels = {
+                "provider": provider.value if isinstance(provider, Provider) else Provider.OTHER.value,
+                "link.stage": diagnostic.stage.value,
+                "link.reason": diagnostic.reason.value,
+                "outcome": handle.outcome.value,
+            }
+            handle.details.update(labels)
+            duration = min(3600000, max(0, diagnostic.duration_ms)) / 1000 if type(diagnostic.duration_ms) is int else 0
+            if type(diagnostic.http_status) is int and 100 <= diagnostic.http_status <= 599:
+                handle.details["http.response.status_code"] = diagnostic.http_status
+            self._link_steps.add(1, labels)
+            if parent._span is not None:
+                parent._span.add_event("link.step", {**handle.details, "duration_ms": round(duration * 1000)})
+            self._operation_log(Boundary.PROVIDER, handle, {**attributes, "operation": "links.step"}, duration)
+        except Exception:
+            logger.warning("Telemetry link diagnostics failed")
+
     @contextmanager
     def operation(
         self,
@@ -1026,6 +1148,9 @@ class Telemetry:
         if dispatch is not None and boundary is not Boundary.HANDLER:
             attributes = {**dict(dispatch.last_context), **attributes}
         request_token = _request.set(_RequestContext(tuple(attributes.items())))
+        link_context = _link.get()
+        if boundary is not Boundary.JOB and link_context is not None and link_context.active and link_context.owner is owner:
+            attributes.update(link_context.attributes)
         labels: dict[str, str] = {}
         if isinstance(provider, Provider):
             labels["provider"] = provider.value
@@ -1072,8 +1197,33 @@ class Telemetry:
 
         def record_asset(kind: MediaKind, reason: MediaReason, attempts: int, size_bucket: int, duration: float) -> None:
             self._record_media_asset(kind, reason, attempts, size_bucket, duration, provider=provider)
+            if link_context is not None and link_context.active and link_context.owner is owner:
+                link_reason = {
+                    MediaReason.READY: LinkReason.OK,
+                    MediaReason.READY_REDUCED: LinkReason.OK,
+                    MediaReason.OVERSIZE: LinkReason.TOO_LARGE,
+                    MediaReason.UNSUPPORTED_FORMAT: LinkReason.UNSUPPORTED,
+                    MediaReason.HTTP_ERROR: LinkReason.HTTP_ERROR,
+                    MediaReason.REDIRECT_REJECTED: LinkReason.REJECTED,
+                    MediaReason.EMPTY: LinkReason.EMPTY,
+                    MediaReason.TIMEOUT: LinkReason.TIMEOUT,
+                    MediaReason.NETWORK: LinkReason.NETWORK_ERROR,
+                    MediaReason.IO_ERROR: LinkReason.PROCESS_ERROR,
+                    MediaReason.BUDGET_EXHAUSTED: LinkReason.TOO_LARGE,
+                    MediaReason.CANCELLED: LinkReason.CANCELLED,
+                }[reason]
+                self._record_link_step(
+                    LinkDiagnostic(
+                        LinkStage.IMAGE if kind is MediaKind.PHOTO else LinkStage.VIDEO, link_reason, min(300000, round(duration * 1000))
+                    ),
+                    provider,
+                    handle,
+                    attributes,
+                )
 
         handle = Operation(owner, span, media_record=record_asset if boundary is Boundary.MEDIA and key == "x.media.prepare" else None)
+        if key == "links.preview":
+            handle._link_record = lambda diagnostic: self._record_link_step(diagnostic, provider, handle, attributes)
         token = _current.set(handle)
         start = time.monotonic()
         try:
@@ -1084,6 +1234,8 @@ class Telemetry:
                 span.set_attributes(handle.failure)
             if handle.outcome is Outcome.SUCCESS:
                 handle.set_outcome(failure_outcome(error))
+            if key == "links.preview":
+                handle.link_error(LinkStage(str(handle.details.get("link.stage", "extract"))), error)
             if boundary in {Boundary.HANDLER, Boundary.JOB, Boundary.DISPATCH} and handle.outcome not in {
                 Outcome.CANCELLED,
                 Outcome.REJECTED,
@@ -1118,6 +1270,16 @@ class Telemetry:
                         span.set_status(StatusCode.ERROR)
                 if boundary is not Boundary.DISPATCH:
                     self._measure(boundary, key, handle.outcome, duration, **labels)
+                if key == "links.preview":
+                    self._link_attempts.add(
+                        1,
+                        {
+                            "provider": provider.value if isinstance(provider, Provider) else Provider.OTHER.value,
+                            "link.stage": str(handle.details.get("link.stage", "route")),
+                            "link.reason": str(handle.details.get("link.reason", "unexpected")),
+                            "outcome": handle.outcome.value,
+                        },
+                    )
                 self._operation_log(boundary, handle, attributes, duration)
                 if dispatch is not None and boundary is Boundary.HANDLER and span is not None:
                     dispatch.last_span = span.get_span_context()

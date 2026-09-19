@@ -128,6 +128,8 @@ files = [
     "src/msu_hub_bot/providers/dvach.py",
     "src/msu_hub_bot/providers/ydl.py",
     "src/msu_hub_bot/providers/link_models.py",
+    "src/msu_hub_bot/providers/link_diagnostics.py",
+    "src/msu_hub_bot/providers/link_source.py",
     "src/msu_hub_bot/providers/link_download.py",
     "src/msu_hub_bot/providers/youtube.py",
     "src/msu_hub_bot/providers/instagram.py",

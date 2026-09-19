@@ -21,6 +21,7 @@ from aiogram.types import (
 )
 
 from msu_hub_bot.execution.executor import ExecutorBusy
+from msu_hub_bot.providers.link_diagnostics import LinkExtraction, LinkReason, LinkStage, collect_link_diagnostics, record_link_diagnostic
 from msu_hub_bot.providers.link_models import LinkAsset, LinkPost
 from msu_hub_bot.providers.vk.api import VkApi
 from msu_hub_bot.providers.vk.posts import VkPost
@@ -121,10 +122,10 @@ def emoji_ids(value):
 @pytest.mark.parametrize("site,url,fetcher,emoji", SITES)
 @pytest.mark.parametrize("topic", [False, True])
 async def test_new_sites_use_their_provider_and_preserve_source_topic(runtime, site, url, fetcher, emoji, topic):
-    runtime.executor.run.return_value = post(site), False
+    runtime.executor.run.return_value = LinkExtraction(post(site), ()), False
     message = source(runtime, url, message_id=501, message_thread_id=77, is_topic_message=topic)
     await runtime.viewer.view(message, Settings())
-    runtime.executor.run.assert_awaited_once_with(getattr(service, fetcher), url, timeout=85)
+    runtime.executor.run.assert_awaited_once_with(collect_link_diagnostics, getattr(service, fetcher), url, timeout=85)
     assert len(runtime.session.methods) == 1
     method = runtime.session.methods[0]
     assert isinstance(method, SendRichMessage) and method.chat_id == message.chat.id
@@ -151,7 +152,7 @@ async def test_disabled_auto_video_links_skips_every_new_provider(runtime, site,
 )
 async def test_unsupported_recognized_routes_never_use_generic_ydl(runtime, url, fetcher):
     await runtime.viewer.view(source(runtime, url), Settings())
-    runtime.executor.run.assert_awaited_once_with(getattr(service, fetcher), url, timeout=85)
+    runtime.executor.run.assert_awaited_once_with(collect_link_diagnostics, getattr(service, fetcher), url, timeout=85)
     assert not runtime.session.methods
 
 
@@ -212,7 +213,7 @@ async def test_repeated_native_url_is_published_only_once(runtime):
         text=url + " " + url,
         entities=[{"type": "url", "offset": offset, "length": len(url)} for offset in (0, len(url) + 1)],
     )
-    runtime.executor.run.return_value = post(), False
+    runtime.executor.run.return_value = LinkExtraction(post(), ()), False
     await runtime.viewer.view(message, Settings())
     assert runtime.executor.run.await_count == 1
     assert len(runtime.session.methods) == 1
@@ -220,9 +221,9 @@ async def test_repeated_native_url_is_published_only_once(runtime):
 
 async def test_other_downloaders_keep_their_standard_emoji_text(runtime):
     caption = '🎞 Original preview\n\n— <a href="https://example.org/media">MP4</a>'
-    runtime.executor.run.return_value = (caption, None), False
+    runtime.executor.run.return_value = LinkExtraction((caption, None), ()), False
     await runtime.viewer.view(source(runtime, "https://example.org/watch/123"), Settings())
-    assert runtime.executor.run.call_args.args[0] == service.text_with_preview
+    assert runtime.executor.run.call_args.args[:2] == (collect_link_diagnostics, service.text_with_preview)
     method = runtime.session.methods[0]
     assert isinstance(method, SendMessage) and method.text == caption and "tg-emoji" not in method.text
 
@@ -323,7 +324,7 @@ async def test_uncertain_or_unrelated_native_send_failure_is_never_replayed(runt
 
 
 async def test_native_service_does_not_fall_back_after_uncertain_delivery(runtime, monkeypatch):
-    runtime.executor.run.return_value = post(), False
+    runtime.executor.run.return_value = LinkExtraction(post(), ()), False
     publish = AsyncMock(side_effect=TimeoutError())
     monkeypatch.setattr(service, "publish_native_post", publish)
     await runtime.viewer.view(source(runtime), Settings())
@@ -419,7 +420,7 @@ async def test_quiet_native_failures_keep_safe_telemetry_outcomes(runtime, monke
         return True
 
     canary = "DO_NOT_EXPORT_NATIVE_PAYLOAD"
-    runtime.executor.run.return_value = post(text=canary), False
+    runtime.executor.run.return_value = LinkExtraction(post(text=canary), ()), False
     if stage == "provider_none":
         runtime.executor.run.return_value = None, False
     elif stage == "provider_timeout":
@@ -432,7 +433,7 @@ async def test_quiet_native_failures_keep_safe_telemetry_outcomes(runtime, monke
     try:
         await dispatcher.feed_update(
             runtime.bot,
-            Update(update_id=17, message=source(runtime, "https://vt.tiktok.com/PRIVATEURL", prefix=canary + " ")),
+            Update(update_id=17, message=source(runtime, "https://vt.tiktok.com/EXAMPLE?tracking=PRIVATEURL", prefix=canary + " ")),
             settings=Settings(),
         )
     finally:
@@ -451,8 +452,49 @@ async def test_quiet_native_failures_keep_safe_telemetry_outcomes(runtime, monke
     if reason:
         assert attributes["error.reason"].string_value == reason
     serialized = capture.serialized()
-    assert canary not in serialized and "PRIVATEURL" not in serialized and "https://vt.tiktok.com" not in serialized
+    assert canary not in serialized and "PRIVATEURL" not in serialized and "https://vt.tiktok.com/EXAMPLE" in serialized
     assert not runtime.session.methods
+
+
+@pytest.mark.parametrize("recovered", [False, True])
+async def test_worker_diagnostics_are_replayed_with_source_even_without_a_trace(runtime, monkeypatch, recovered):
+    monkeypatch.delenv("OTEL_SDK_DISABLED", raising=False)
+    capture = Capture()
+    telemetry = Telemetry(config(sample_rate=0), transport=capture)
+    runtime.viewer.links.telemetry = telemetry
+
+    def fetch(url):
+        assert url == "https://vt.tiktok.com/EXAMPLE?tracking=CANARY"
+        record_link_diagnostic(LinkStage.VIDEO, LinkReason.HTTP_ERROR, http_status=403)
+        if not recovered:
+            record_link_diagnostic(LinkStage.ADAPTER, LinkReason.UNAVAILABLE)
+            return None
+        record_link_diagnostic(LinkStage.VIDEO, LinkReason.OK)
+        return post(text="CANARY")
+
+    async def execute(func, *args, **kwargs):
+        import asyncio
+
+        return await asyncio.to_thread(func, *args), False
+
+    monkeypatch.setattr(service, "fetch_tiktok", fetch)
+    runtime.executor.run.side_effect = execute
+    await telemetry.start()
+    try:
+        with telemetry.context(user_id=42, chat_id=-10042, message_id=501):
+            await runtime.viewer.view(source(runtime, "https://vt.tiktok.com/EXAMPLE?tracking=CANARY"), Settings())
+    finally:
+        await telemetry.close()
+    logs = [{item.key: getattr(item.value, item.value.WhichOneof("value")) for item in row.attributes} for row in capture.logs()]
+    terminal = next(row for row in logs if row["operation"] == "links.preview")
+    assert terminal["link.source_url"] == "https://vt.tiktok.com/EXAMPLE"
+    assert terminal["outcome"] == ("success" if recovered else "unavailable")
+    assert terminal["link.reason"] == ("ready" if recovered else "http_error")
+    if not recovered:
+        assert terminal["http.response.status_code"] == 403
+    assert len(runtime.session.methods) == int(recovered)
+    assert "CANARY" not in capture.serialized()
+    assert not capture.spans()
 
 
 @pytest.mark.parametrize(

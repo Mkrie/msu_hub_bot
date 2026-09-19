@@ -4,8 +4,9 @@ from unittest.mock import MagicMock
 
 import pytest
 import requests
-from yt_dlp.utils import DownloadError
+from yt_dlp.utils import DownloadError, UnsupportedError
 
+from msu_hub_bot.providers.link_diagnostics import LinkExtraction, LinkReason, LinkStage, collect_link_diagnostics
 from msu_hub_bot.providers.ydl import YDL
 from msu_hub_bot.telegram.links.video import text_with_preview
 
@@ -161,6 +162,82 @@ def test_preview_probes_stop_after_budget_but_links_remain(monkeypatch):
     session.head.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "cause,reason,status",
+    [
+        (requests.Timeout("PRIVATE_BODY"), LinkReason.TIMEOUT, None),
+        (requests.ConnectionError("PRIVATE_BODY"), LinkReason.NETWORK_ERROR, None),
+        (UnsupportedError("https://example.test/PRIVATE_BODY"), LinkReason.UNSUPPORTED, None),
+        (None, LinkReason.UNAVAILABLE, None),
+    ],
+)
+def test_scoped_extractor_failures_preserve_fixed_causes_without_message_parsing(cause, reason, status):
+    client = MagicMock()
+    info = (type(cause), cause, None) if cause is not None else None
+    client.extract_info.side_effect = DownloadError("HTTP 403 PRIVATE_BODY", exc_info=info)
+
+    result = collect_link_diagnostics(YDL.extract_data, "https://example.test/PRIVATE_URL", client)
+
+    assert result.value is None
+    assert [(item.stage, item.reason, item.http_status) for item in result.diagnostics] == [(LinkStage.EXTRACT, reason, status)]
+    assert "PRIVATE" not in repr(result.diagnostics)
+    assert not collect_link_diagnostics(lambda: None).diagnostics
+
+
+def test_wrapped_extractor_http_error_retains_status_only():
+    response = requests.Response()
+    response.status_code = 429
+    response.url = "https://example.test/PRIVATE_URL?token=PRIVATE_TOKEN"
+    cause = requests.HTTPError("PRIVATE_BODY", response=response)
+    client = MagicMock()
+    client.extract_info.side_effect = DownloadError("PRIVATE_BODY", exc_info=(type(cause), cause, None))
+
+    result = collect_link_diagnostics(YDL.extract_data, response.url, client)
+
+    assert result.value is None
+    assert [(item.reason, item.http_status) for item in result.diagnostics] == [(LinkReason.HTTP_ERROR, 429)]
+    assert "PRIVATE" not in repr(result.diagnostics)
+
+
+@pytest.mark.parametrize(
+    "info,reason",
+    [
+        (None, LinkReason.UNSUPPORTED),
+        ("malformed response", LinkReason.INVALID_RESPONSE),
+        ({"extractor": "generic"}, LinkReason.UNSUPPORTED),
+        ({"_type": "playlist"}, LinkReason.UNSUPPORTED),
+        ({"formats": []}, LinkReason.EMPTY),
+    ],
+)
+def test_scoped_unusable_metadata_is_distinguished_without_changing_results(info, reason):
+    client = MagicMock()
+    client.extract_info.return_value = info
+    result = collect_link_diagnostics(YDL.extract, "https://example.test/source", client)
+    assert result.value is None
+    assert result.diagnostics[-1].stage is LinkStage.EXTRACT
+    assert result.diagnostics[-1].reason is reason
+
+
+def test_head_failure_diagnostics_retain_links_and_omit_signed_download_urls(monkeypatch):
+    response = requests.Response()
+    response.status_code = 403
+    response.url = "https://cdn.example.test/PRIVATE_PATH?signature=PRIVATE_SIGNATURE"
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.head.side_effect = [requests.HTTPError("PRIVATE_BODY", response=response), requests.Timeout("PRIVATE_BODY")]
+    monkeypatch.setattr(requests, "Session", lambda: client)
+    links = [(response.url, "one", 100, 100), ("https://cdn.example.test/PRIVATE_SECOND", "two", 100, 100)]
+
+    result = collect_link_diagnostics(YDL.post_process_links, links)
+
+    assert result.value == (links, None)
+    assert [(item.stage, item.reason, item.http_status) for item in result.diagnostics] == [
+        (LinkStage.REQUEST, LinkReason.HTTP_ERROR, 403),
+        (LinkStage.REQUEST, LinkReason.TIMEOUT, None),
+    ]
+    assert "PRIVATE" not in repr(result.diagnostics)
+
+
 def test_song_gets_url_and_viewer_gets_dimensions_with_escaped_text(monkeypatch):
     video = "https://example.test/video?a=1&b=2"
     preview = (video, 640, 480)
@@ -192,13 +269,13 @@ async def test_generic_video_viewer_preserves_preference_timeout_topic_and_video
         bot, text=url, entities=[dict(type="url", offset=0, length=len(url))], is_topic_message=True, message_thread_id=9
     )
     preview = ("https://example.test/video.mp4", 640, 480)
-    executor = SimpleNamespace(run=AsyncMock(return_value=(("Synthetic caption", preview), timed_out)))
+    executor = SimpleNamespace(run=AsyncMock(return_value=(LinkExtraction(("Synthetic caption", preview), ()), timed_out)))
     viewer = ViewerMiddleware(bot, SimpleNamespace(), executor)
     await viewer.view(message, Settings(auto_video_links=enabled))
     if not enabled:
         executor.run.assert_not_awaited()
     else:
-        executor.run.assert_awaited_once_with(text_with_preview, url, timeout=60)
+        executor.run.assert_awaited_once_with(collect_link_diagnostics, text_with_preview, url, timeout=60)
     if enabled and not timed_out:
         method = bot.session.methods[-1]
         assert isinstance(method, SendVideo) and isinstance(method.video, URLInputFile)

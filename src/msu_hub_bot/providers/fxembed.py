@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, Valida
 
 from msu_hub_bot.providers.exceptions import BadRequestError, NotFoundError
 from msu_hub_bot.providers.http import USER_AGENT, read_limited
+from msu_hub_bot.providers.link_diagnostics import LinkDiagnostic, LinkReason, LinkStage
 
 API_ROOT = "https://api.fxtwitter.com/2"
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -617,6 +618,18 @@ class _PostFetch:
     waiters: int = 0
 
 
+class _FetchError(BadRequestError):
+    def __init__(self, diagnostic: LinkDiagnostic) -> None:
+        super().__init__()
+        self.diagnostic = diagnostic
+
+
+class _MissingPost(NotFoundError):
+    def __init__(self, diagnostic: LinkDiagnostic) -> None:
+        super().__init__()
+        self.diagnostic = diagnostic
+
+
 class FxEmbed:
     """Share concurrent public reads; completed posts are never cached."""
 
@@ -655,6 +668,7 @@ class FxEmbed:
         fetch.done.set()
 
     async def _fetch_post(self, post_id: str) -> FxPost:
+        http_status = None
         try:
             async with (
                 asyncio.timeout(REQUEST_TIMEOUT),
@@ -665,14 +679,20 @@ class FxEmbed:
                 ) as session,
             ):
                 async with session.get(f"{API_ROOT}/status/{post_id}", allow_redirects=False) as response:
+                    http_status = response.status if 100 <= response.status <= 599 else None
                     if response.status in {401, 403, 404}:
-                        raise NotFoundError()
-                    raw = await read_limited(response, MAX_RESPONSE_BYTES)
+                        raise _MissingPost(LinkDiagnostic(LinkStage.REQUEST, LinkReason.UNAVAILABLE, http_status=http_status))
+                    if response.status != 200:
+                        raise _FetchError(LinkDiagnostic(LinkStage.REQUEST, LinkReason.HTTP_ERROR, http_status=http_status))
+                    try:
+                        raw = await read_limited(response, MAX_RESPONSE_BYTES)
+                    except BadRequestError:
+                        raise _FetchError(LinkDiagnostic(LinkStage.REQUEST, LinkReason.TOO_LARGE, http_status=http_status)) from None
                     payload = json.loads(raw)
                 if not isinstance(payload, dict) or type(payload.get("code")) is not int:
-                    raise BadRequestError()
+                    raise _FetchError(LinkDiagnostic(LinkStage.EXTRACT, LinkReason.INVALID_RESPONSE, http_status=http_status))
                 if payload["code"] in {401, 403, 404}:
-                    raise NotFoundError()
+                    raise _MissingPost(LinkDiagnostic(LinkStage.EXTRACT, LinkReason.UNAVAILABLE, http_status=http_status))
                 status = payload.get("status")
                 if (
                     payload["code"] != 200
@@ -681,7 +701,14 @@ class FxEmbed:
                     or status.get("provider") != "twitter"
                     or status.get("id") != post_id
                 ):
-                    raise BadRequestError()
+                    raise _FetchError(LinkDiagnostic(LinkStage.EXTRACT, LinkReason.INVALID_RESPONSE, http_status=http_status))
                 return FxPost.model_validate(status)
-        except aiohttp.ClientError, TimeoutError, ValueError, RecursionError:
-            raise BadRequestError() from None
+        except TimeoutError:
+            raise _FetchError(LinkDiagnostic(LinkStage.REQUEST, LinkReason.TIMEOUT, http_status=http_status)) from None
+        except aiohttp.ClientResponseError as error:
+            status_code = error.status if 100 <= error.status <= 599 else None
+            raise _FetchError(LinkDiagnostic(LinkStage.REQUEST, LinkReason.HTTP_ERROR, http_status=status_code)) from None
+        except aiohttp.ClientError:
+            raise _FetchError(LinkDiagnostic(LinkStage.REQUEST, LinkReason.NETWORK_ERROR, http_status=http_status)) from None
+        except ValueError, RecursionError:
+            raise _FetchError(LinkDiagnostic(LinkStage.EXTRACT, LinkReason.INVALID_RESPONSE, http_status=http_status)) from None

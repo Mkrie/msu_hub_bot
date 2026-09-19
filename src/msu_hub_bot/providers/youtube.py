@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from msu_hub_bot.providers.link_download import allowed_url, download_image, download_video, extract_info, request_json
+from msu_hub_bot.providers.link_diagnostics import LinkReason, LinkStage, record_link_diagnostic
 from msu_hub_bot.providers.link_models import LinkAsset, LinkPost
 
 _HOSTS = ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be", "www.youtu.be")
@@ -92,10 +93,12 @@ def fetch_youtube(url: str) -> LinkPost | None:
     """Keep useful public metadata even when the host cannot obtain video formats."""
     link = parse_youtube_url(url)
     if link is None:
+        record_link_diagnostic(LinkStage.ADAPTER, LinkReason.UNSUPPORTED)
         return None
     deadline = time.monotonic() + _MAX_SECONDS
     info = extract_info(link.url, provider="youtube", deadline=min(deadline, time.monotonic() + 25)) or {}
     if info.get("id") not in (None, link.id) or info.get("_type") in ("playlist", "multi_video", "compat_list"):
+        record_link_diagnostic(LinkStage.ADAPTER, LinkReason.INVALID_RESPONSE)
         info = {}
     title = _text(info.get("title"))
     author = _text(info.get("channel")) or _text(info.get("uploader"))
@@ -117,6 +120,7 @@ def fetch_youtube(url: str) -> LinkPost | None:
         author_url = author_url or _text(fallback.get("author_url"))
         thumbnail = thumbnail or _thumbnail(fallback)
     if not title or title == link.id:
+        record_link_diagnostic(LinkStage.ADAPTER, LinkReason.UNAVAILABLE)
         return None
     assets: tuple[LinkAsset, ...] = ()
     if link.shorts and _short_video(info):
@@ -128,10 +132,14 @@ def fetch_youtube(url: str) -> LinkPost | None:
         )
         if video is not None:
             assets = (video,)
+    elif link.shorts:
+        record_link_diagnostic(LinkStage.ADAPTER, LinkReason.POLICY)
     if not assets and thumbnail is not None:
         picture = download_image(thumbnail, deadline=deadline, allowed_hosts=_THUMBNAIL_HOSTS)
         if picture is not None:
             assets = (picture,)
+    if not assets:
+        record_link_diagnostic(LinkStage.ADAPTER, LinkReason.EMPTY)
     description = _text(info.get("description"))
     return LinkPost(
         site="youtube",

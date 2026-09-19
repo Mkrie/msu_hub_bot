@@ -8,6 +8,8 @@ import requests
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import YoutubeDLError
 
+from msu_hub_bot.providers.link_diagnostics import LinkReason, LinkStage, record_link_diagnostic
+from msu_hub_bot.providers.link_download import classify_link_error
 from msu_hub_bot.utils import megabytes
 
 MediaLink = tuple[str, str, int | None, int | None]
@@ -34,6 +36,7 @@ class _SingleVideoYoutubeDL(YoutubeDL):  # type: ignore[misc]  # yt-dlp does not
         self, ie_result: dict[str, Any], download: bool = True, extra_info: dict[str, Any] | None = None
     ) -> dict[str, Any] | None:
         if ie_result.get("_type") in ("playlist", "multi_video", "compat_list"):
+            record_link_diagnostic(LinkStage.EXTRACT, LinkReason.UNSUPPORTED)
             return None
         return cast(dict[str, Any] | None, super().process_ie_result(ie_result, download=download, extra_info=extra_info))
 
@@ -75,8 +78,16 @@ class YDL:
         try:
             with nullcontext(ydl) if ydl is not None else cls.create_ydl() as client:
                 info = client.extract_info(url, download=False)
+                if isinstance(info, dict):
+                    record_link_diagnostic(LinkStage.EXTRACT, LinkReason.OK)
+                elif info is not None:
+                    record_link_diagnostic(LinkStage.EXTRACT, LinkReason.INVALID_RESPONSE)
+                else:
+                    record_link_diagnostic(LinkStage.EXTRACT, LinkReason.UNSUPPORTED)
                 return cast(dict[str, Any], info) if isinstance(info, dict) else None
-        except YoutubeDLError:
+        except YoutubeDLError as error:
+            reason, status = classify_link_error(error)
+            record_link_diagnostic(LinkStage.EXTRACT, reason, http_status=status)
             return None
 
     @classmethod
@@ -86,6 +97,7 @@ class YDL:
             return None
         extractor = str(info.get("extractor", "")).lower()
         if extractor in ("generic", "yandexmusic") or info.get("_type") in ("playlist", "multi_video"):
+            record_link_diagnostic(LinkStage.EXTRACT, LinkReason.UNSUPPORTED)
             return None
 
         raw_formats = info.get("formats")
@@ -109,6 +121,7 @@ class YDL:
 
         links = [link for item in formats if (link := _media_link(item)) is not None]
         if not links:
+            record_link_diagnostic(LinkStage.EXTRACT, LinkReason.EMPTY)
             return None
         links, preview = cls.post_process_links(links)
         return str(info.get("title") or "Video"), links, preview
@@ -123,6 +136,7 @@ class YDL:
         # A rejected HEAD request must not discard otherwise useful download links.
         headers: dict[str, tuple[int, str]] = {}
         deadline = time.monotonic() + 20
+        expired = False
         with requests.Session() as session:
             for url, *_ in links:
                 if url in headers:
@@ -130,6 +144,9 @@ class YDL:
                 headers[url] = (0, "")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    if not expired:
+                        record_link_diagnostic(LinkStage.REQUEST, LinkReason.TIMEOUT)
+                        expired = True
                     continue
                 try:
                     with session.head(url, timeout=min(5, remaining), allow_redirects=True) as response:
@@ -137,7 +154,15 @@ class YDL:
                         size = max(0, int(response.headers.get("Content-Length", 0)))
                         content_type = response.headers.get("Content-Type", "").partition(";")[0].strip().lower()
                         headers[url] = (size, content_type)
-                except requests.RequestException, ValueError:
+                        response_status = response.status_code
+                        record_link_diagnostic(
+                            LinkStage.REQUEST,
+                            LinkReason.OK,
+                            http_status=response_status if type(response_status) is int and 100 <= response_status <= 599 else None,
+                        )
+                except (requests.RequestException, ValueError) as error:
+                    reason, status = classify_link_error(error)
+                    record_link_diagnostic(LinkStage.REQUEST, reason, http_status=status)
                     continue
 
         ordered = sorted(links, key=lambda link: headers[link[0]][0], reverse=True)

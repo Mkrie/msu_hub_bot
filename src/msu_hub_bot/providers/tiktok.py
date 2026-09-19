@@ -10,6 +10,7 @@ from urllib.parse import urlsplit, urlunsplit
 from pydantic import BaseModel, ConfigDict, Field
 
 from msu_hub_bot.providers.link_download import download_image, download_video, request_page
+from msu_hub_bot.providers.link_diagnostics import LinkReason, LinkStage, record_link_diagnostic
 from msu_hub_bot.providers.link_models import LinkAsset, LinkPost
 
 _PAGE_HOSTS = ("tiktok.com", "www.tiktok.com", "vm.tiktok.com", "vt.tiktok.com")
@@ -189,34 +190,48 @@ def fetch_tiktok(url: str) -> LinkPost | None:
     """Return a complete public post, or quietly leave the original link alone."""
     normalized = normalize_tiktok_url(url)
     if normalized is None:
+        record_link_diagnostic(LinkStage.ADAPTER, LinkReason.UNSUPPORTED)
         return None
     deadline = time.monotonic() + _TIMEOUT
     ref = _reference(normalized)
     if ref is None:
         resolved = request_page(normalized, deadline=deadline, allowed_hosts=_PAGE_HOSTS, max_bytes=_MAX_PAGE_BYTES)
         if resolved is None or (canonical := normalize_tiktok_url(resolved[0])) is None:
+            record_link_diagnostic(LinkStage.ADAPTER, LinkReason.UNAVAILABLE if resolved is None else LinkReason.UNSUPPORTED)
             return None
         ref = _reference(canonical)
         if ref is None:
+            record_link_diagnostic(LinkStage.ADAPTER, LinkReason.UNSUPPORTED)
             return None
     if time.monotonic() >= deadline:
+        record_link_diagnostic(LinkStage.ADAPTER, LinkReason.TIMEOUT)
         return None
     response = request_page(ref.page_url, deadline=deadline, allowed_hosts=_PAGE_HOSTS, max_bytes=_MAX_PAGE_BYTES)
     if response is None or (final_url := normalize_tiktok_url(response[0])) is None:
+        record_link_diagnostic(LinkStage.ADAPTER, LinkReason.UNAVAILABLE if response is None else LinkReason.UNSUPPORTED)
         return None
     final_ref = _reference(final_url)
     if final_ref is None or final_ref.id != ref.id or (item := _item(response[1], ref.id)) is None:
+        record_link_diagnostic(LinkStage.ADAPTER, LinkReason.INVALID_RESPONSE)
         return None
     if item.imagePost is not None:
         assets = _photos(item.imagePost, ref.page_url, deadline)
         kind = "photo"
     else:
-        if item.video is None or item.video.duration > _MAX_VIDEO_DURATION or time.monotonic() >= deadline:
+        if item.video is None or item.video.duration > _MAX_VIDEO_DURATION:
+            record_link_diagnostic(LinkStage.ADAPTER, LinkReason.POLICY)
+            return None
+        if time.monotonic() >= deadline:
+            record_link_diagnostic(LinkStage.ADAPTER, LinkReason.TIMEOUT)
             return None
         video = download_video(ref.page_url, deadline=deadline, max_duration=_MAX_VIDEO_DURATION)
         assets = (video,) if video is not None and video.kind == "video" and video.data else None
         kind = "video"
-    if not assets or time.monotonic() >= deadline:
+    if not assets:
+        record_link_diagnostic(LinkStage.ADAPTER, LinkReason.UNAVAILABLE)
+        return None
+    if time.monotonic() >= deadline:
+        record_link_diagnostic(LinkStage.ADAPTER, LinkReason.TIMEOUT)
         return None
     username = item.author.uniqueId if _HANDLE.fullmatch(item.author.uniqueId) else None
     text = "\n\n".join(content.desc for content in item.contents if content.desc) or item.desc

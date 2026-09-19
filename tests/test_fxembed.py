@@ -23,6 +23,7 @@ from msu_hub_bot.providers.fxembed import (
     safe_media_url,
     safe_public_url,
 )
+from msu_hub_bot.providers.link_diagnostics import LinkDiagnostic, LinkReason, LinkStage
 
 
 def post_payload(**changes):
@@ -537,9 +538,10 @@ async def test_fetch_uses_only_id_without_cookies_secrets_or_user_query(monkeypa
 async def test_redirect_and_http_errors_are_not_followed_or_retried(monkeypatch, status):
     response = Response({"code": 200, "status": post_payload()}, status=status)
     session = install(monkeypatch, response)
-    with pytest.raises(BadRequestError):
+    with pytest.raises(BadRequestError) as error:
         await FxEmbed().get_post(link())
     assert len(session.calls) == 1 and session.closed and response.closed
+    assert error.value.diagnostic == LinkDiagnostic(LinkStage.REQUEST, LinkReason.HTTP_ERROR, http_status=status)
 
 
 @pytest.mark.parametrize("http,code", [(404, 404), (401, 401), (403, 403), (200, 404), (200, 403)])
@@ -548,6 +550,9 @@ async def test_unavailable_posts_have_structured_generic_error(monkeypatch, http
     with pytest.raises(NotFoundError) as error:
         await FxEmbed().get_post(link())
     assert "Sensitive" not in str(error.value) and session.closed
+    assert error.value.diagnostic == LinkDiagnostic(
+        LinkStage.REQUEST if http != 200 else LinkStage.EXTRACT, LinkReason.UNAVAILABLE, http_status=http
+    )
 
 
 @pytest.mark.parametrize(
@@ -566,18 +571,20 @@ async def test_unavailable_posts_have_structured_generic_error(monkeypatch, http
 )
 async def test_malformed_or_wrong_post_envelopes_cannot_escape(monkeypatch, payload):
     session = install(monkeypatch, Response(payload))
-    with pytest.raises(BadRequestError):
+    with pytest.raises(BadRequestError) as error:
         await FxEmbed().get_post(link())
     assert session.closed
+    assert error.value.diagnostic == LinkDiagnostic(LinkStage.EXTRACT, LinkReason.INVALID_RESPONSE, http_status=200)
 
 
 @pytest.mark.parametrize("declared", [True, False])
 async def test_declared_and_streamed_body_size_are_bounded(monkeypatch, declared):
     monkeypatch.setattr(fxembed, "MAX_RESPONSE_BYTES", 16)
     session = install(monkeypatch, Response(b"x" if declared else b"x" * 17, declared_length=17 if declared else None))
-    with pytest.raises(BadRequestError):
+    with pytest.raises(BadRequestError) as error:
         await FxEmbed().get_post(link())
     assert session.closed
+    assert error.value.diagnostic == LinkDiagnostic(LinkStage.REQUEST, LinkReason.TOO_LARGE, http_status=200)
 
 
 @pytest.mark.parametrize("cancel", [False, True])
@@ -590,9 +597,11 @@ async def test_total_deadline_and_cancellation_close_own_session(monkeypatch, ca
     await asyncio.wait_for(blocked.wait(), timeout=1)
     if cancel:
         task.cancel()
-    with pytest.raises(asyncio.CancelledError if cancel else BadRequestError):
+    with pytest.raises(asyncio.CancelledError if cancel else BadRequestError) as error:
         await task
     assert session.closed and response.closed
+    if not cancel:
+        assert error.value.diagnostic == LinkDiagnostic(LinkStage.REQUEST, LinkReason.TIMEOUT, http_status=200)
 
 
 async def test_transport_errors_never_include_provider_payload_in_public_exception(monkeypatch):
@@ -605,6 +614,32 @@ async def test_transport_errors_never_include_provider_payload_in_public_excepti
     with pytest.raises(BadRequestError) as error:
         await FxEmbed().get_post(link())
     assert "sensitive" not in str(error.value) and session.closed
+    assert error.value.diagnostic == LinkDiagnostic(LinkStage.REQUEST, LinkReason.NETWORK_ERROR)
+
+
+async def test_shared_failure_propagates_only_fixed_diagnostics_to_each_waiter(monkeypatch):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class GatedResponse(Response):
+        async def iter_chunked(self, size):
+            entered.set()
+            await release.wait()
+            yield self.body
+
+    response = GatedResponse(b"PRIVATE_RESPONSE https://provider.test/PRIVATE_TOKEN")
+    session = install(monkeypatch, response)
+    client = FxEmbed()
+    first = asyncio.create_task(client.get_post(link()))
+    second = asyncio.create_task(client.get_post(link()))
+    await entered.wait()
+    assert len(session.calls) == 1
+    release.set()
+    failures = await asyncio.gather(first, second, return_exceptions=True)
+    assert all(isinstance(error, BadRequestError) for error in failures)
+    diagnostics = [error.diagnostic for error in failures]
+    assert diagnostics == [LinkDiagnostic(LinkStage.EXTRACT, LinkReason.INVALID_RESPONSE, http_status=200)] * 2
+    assert "PRIVATE" not in repr(diagnostics)
+    assert session.closed and response.closed and not client._inflight
 
 
 async def test_concurrent_selectors_share_one_fetch_and_receive_independent_complete_models(monkeypatch):

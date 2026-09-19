@@ -10,6 +10,7 @@ from yt_dlp import YoutubeDL
 from yt_dlp.extractor.instagram import InstagramIE
 
 from msu_hub_bot.providers.link_download import allowed_url, download_image, download_video, extract_info, ydl_options
+from msu_hub_bot.providers.link_diagnostics import LinkReason, LinkStage, record_link_diagnostic
 from msu_hub_bot.providers.link_models import LinkAsset, LinkPost
 
 _TIMEOUT = 75
@@ -122,21 +123,26 @@ def fetch_instagram(url: str) -> LinkPost | None:
     """Acquire one public post within a shared hard deadline; incomplete posts stay quiet."""
     parsed = _post_url(url)
     if parsed is None:
+        record_link_diagnostic(LinkStage.ADAPTER, LinkReason.UNSUPPORTED)
         return None
     canonical, shortcode = parsed
     deadline = time.monotonic() + _TIMEOUT
     info = extract_info(canonical, deadline=deadline, provider="instagram")
     decoded = _parse_info(info, shortcode) if info else None
     if decoded is None:
+        record_link_diagnostic(LinkStage.ADAPTER, LinkReason.INVALID_RESPONSE if info else LinkReason.UNAVAILABLE)
         return None
     post, items = decoded
     sources = [item.source() for item in items]
     if any(source is None for source in sources):
+        record_link_diagnostic(LinkStage.ADAPTER, LinkReason.UNSUPPORTED)
         return None
     assets: list[LinkAsset] = []
     remaining = _MAX_BYTES
     for item, source in zip(items, sources, strict=True):
-        if time.monotonic() >= deadline or remaining <= 0 or source is None:
+        expired = time.monotonic() >= deadline
+        if expired or remaining <= 0 or source is None:
+            record_link_diagnostic(LinkStage.ADAPTER, LinkReason.TIMEOUT if expired else LinkReason.TOO_LARGE)
             return None
         if item.media_type == 1:
             asset = download_image(
@@ -152,6 +158,7 @@ def fetch_instagram(url: str) -> LinkPost | None:
                 require_audio=item.has_audio is True,
             )
         if asset is None or not asset.data or len(asset.data) > remaining or asset.kind != ("photo" if item.media_type == 1 else "video"):
+            record_link_diagnostic(LinkStage.ADAPTER, LinkReason.UNAVAILABLE if asset is None else LinkReason.INVALID_RESPONSE)
             return None
         remaining -= len(asset.data)
         assets.append(asset)

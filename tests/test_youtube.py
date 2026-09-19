@@ -215,7 +215,7 @@ def test_worker_cleans_private_files_and_bounds_output(monkeypatch):
         assert 0 < timeout <= 10 and max_output_bytes == download.JSON_BYTES
         assert payload["url"] == THUMB and payload["operation"] == "image"
         (request.parent / "result.bin").write_bytes(b"jpeg")
-        return b'{"width":480,"height":360}'
+        return b'{"ok":true,"metadata":{"width":480,"height":360}}'
 
     monkeypatch.setattr(download, "run_process", process)
     result = download.download_image(THUMB, deadline=time.monotonic() + 10, allowed_hosts=("i.ytimg.com",))
@@ -274,7 +274,7 @@ def session(monkeypatch, *responses):
 def test_requests_validate_each_redirect_and_ignore_environment_proxy(monkeypatch):
     redirect = response(status=302, headers={"Location": "https://private.test/secret"})
     client = session(monkeypatch, redirect)
-    with pytest.raises(ValueError, match="host policy"):
+    with pytest.raises(ValueError, match="unsupported"):
         download._request("https://cdn.test/start", ("cdn.test",), 1024)
     assert client.trust_env is False
     assert client.get.call_count == 1
@@ -286,7 +286,7 @@ def test_requests_validate_each_redirect_and_ignore_environment_proxy(monkeypatc
 def test_known_and_streaming_response_overflow_are_rejected(monkeypatch, headers):
     source = response(b"12345678901", headers=headers)
     session(monkeypatch, source)
-    with pytest.raises(ValueError, match="size limit"):
+    with pytest.raises(ValueError, match="too_large"):
         download._request("https://cdn.test/image", ("cdn.test",), 10)
     source.__exit__.assert_called_once()
 
@@ -294,7 +294,7 @@ def test_known_and_streaming_response_overflow_are_rejected(monkeypatch, headers
 @pytest.mark.parametrize("address", ["127.0.0.1", "10.0.0.1", "169.254.169.254", "::1", "fc00::1"])
 def test_dns_private_addresses_are_rejected(monkeypatch, address):
     monkeypatch.setattr(download.socket, "getaddrinfo", lambda *args, **kwargs: [(None, None, None, None, (address, 443))])
-    with pytest.raises(ValueError, match="Non-public"):
+    with pytest.raises(ValueError, match="unsupported"):
         download._public_dns("https://cdn.test/image")
 
 
@@ -424,7 +424,7 @@ def test_download_policy_and_codec_selector_keep_sound(monkeypatch, tmp_path):
     assert options["match_filter"]({"duration": 3}, incomplete=False) is None
     hook = options["progress_hooks"][0]
     hook({"filename": "video", "downloaded_bytes": 600})
-    with pytest.raises(ValueError, match="aggregate"):
+    with pytest.raises(ValueError, match="too_large"):
         hook({"filename": "audio", "downloaded_bytes": 600})
 
 
@@ -447,5 +447,5 @@ def test_finished_video_must_retain_supported_audio_when_required(monkeypatch, t
     if ok:
         assert download._video(payload, tmp_path / "output") == {"width": 144, "height": 198, "duration": 3.0}
     else:
-        with pytest.raises(ValueError, match="video/audio"):
+        with pytest.raises(ValueError, match="unsupported"):
             download._video(payload, tmp_path / "output")

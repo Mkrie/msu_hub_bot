@@ -277,7 +277,11 @@ async def test_provider_telemetry_has_ids_and_outcomes_without_source_content(ru
         await dp.feed_update(runtime.bot, Update(update_id=17, message=source(runtime)), settings=Settings())
     finally:
         await telemetry.close()
-    spans = [span for span in capture.spans() if span.name == "provider.request"]
+    spans = [
+        span
+        for span in capture.spans()
+        if any(item.key == "operation" and item.value.string_value == "fxembed.fetch" for item in span.attributes)
+    ]
     assert len(spans) == 1
     attributes = {item.key: item.value for item in spans[0].attributes}
     assert attributes["provider"].string_value == "fxembed"
@@ -286,4 +290,4 @@ async def test_provider_telemetry_has_ids_and_outcomes_without_source_content(ru
     assert attributes["telegram.update_id"].int_value == 17
     serialized = capture.serialized()
     assert "SYNTHETIC_PRIVATE_TEXT" not in serialized
-    assert "https://x.com" not in serialized
+    assert "https://x.com/i/web/status/" in serialized
