@@ -63,6 +63,9 @@ class Settings(BaseSettings):
     health_check_url: str = Field(default="", repr=False)
     web_app_url: str = ""
     web_port: int = Field(default=8081, ge=1, le=65535)
+    openrouter_api_key: str = Field(default="", repr=False)
+    jev_enabled: bool = False
+    jev_confidence: float = Field(default=0.8, ge=0.5, le=1)
     dumps_chat_id: int = 0
     events_chat_id: int = 0
     error_chat_id: int = 0
@@ -103,6 +106,8 @@ class Settings(BaseSettings):
         missing = [name for name in ("bot_token", *database_fields) if not getattr(self, name)]
         if missing:
             raise ValueError("Missing required settings: " + ", ".join("HUB_" + name.upper() for name in missing))
+        if self.jev_enabled and not self.openrouter_api_key.strip():
+            raise ValueError("HUB_OPENROUTER_API_KEY is required when HUB_JEV_ENABLED is true")
         endpoint = urlsplit(self.supabase_url)
         if (
             endpoint.scheme not in {"http", "https"}

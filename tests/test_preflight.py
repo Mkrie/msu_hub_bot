@@ -11,6 +11,7 @@ from aiohttp_socks import ProxyConnector
 from python_socks.async_.asyncio.v2 import Proxy
 
 from msu_hub_bot import preflight
+from msu_hub_bot.settings import Settings
 from telegram_helpers import RecordingSession
 
 
@@ -40,6 +41,26 @@ async def test_preflight_only_gets_identity_and_closes_all_clients(boundaries, m
     database.feature_request.assert_awaited_once_with("health", {})
     assert session.closed
     database.close.assert_awaited_once()
+
+
+async def test_enabled_jev_without_a_key_fails_before_preflight_opens_connections(monkeypatch):
+    settings = Settings(
+        bot_token="123456789:" + "a" * 35,
+        supabase_url="https://database.invalid",
+        supabase_key="synthetic-key",
+        supabase_email="bot@example.invalid",
+        supabase_password="synthetic-password",
+        jev_enabled=True,
+        openrouter_api_key="",
+    )
+    database, session = Mock(), Mock()
+    monkeypatch.setattr(preflight, "settings", settings)
+    monkeypatch.setattr(preflight, "create_repository", database)
+    monkeypatch.setattr(preflight, "AiohttpSession", session)
+    with pytest.raises(ValueError, match="HUB_OPENROUTER_API_KEY"):
+        await preflight.check()
+    database.assert_not_called()
+    session.assert_not_called()
 
 
 async def test_socks_preflight_uses_runtime_connector_without_network(boundaries, monkeypatch):

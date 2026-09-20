@@ -73,6 +73,9 @@ jobs:
           HUB_HEALTH_CHECK_URL: ${{ secrets.HUB_HEALTH_CHECK_URL }}
           HUB_WEB_APP_URL: ${{ vars.HUB_WEB_APP_URL }}
           HUB_WEB_PORT: '8081'
+          HUB_OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          HUB_JEV_ENABLED: ${{ vars.HUB_JEV_ENABLED || 'false' }}
+          HUB_JEV_CONFIDENCE: ${{ vars.HUB_JEV_CONFIDENCE || '0.8' }}
           HUB_DUMPS_CHAT_ID: ${{ secrets.HUB_DUMPS_CHAT_ID }}
           HUB_EVENTS_CHAT_ID: ${{ secrets.HUB_EVENTS_CHAT_ID }}
           HUB_ERROR_CHAT_ID: ${{ secrets.HUB_ERROR_CHAT_ID }}

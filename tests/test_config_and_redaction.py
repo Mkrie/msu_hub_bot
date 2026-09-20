@@ -51,6 +51,33 @@ def test_required_storage_credentials():
         supabase_settings(bot_token="").validate_core()
 
 
+def test_jev_is_opt_in_and_requires_its_own_credential():
+    config = supabase_settings(openrouter_api_key="")
+    assert config.jev_enabled is False and config.jev_confidence == 0.8
+    config.validate_core()
+    config = supabase_settings(jev_enabled=True, openrouter_api_key="synthetic-openrouter-credential")
+    config.validate_core()
+    assert config.openrouter_api_key not in repr(config)
+
+
+@pytest.mark.parametrize("key", ["", " \t"])
+def test_enabled_jev_rejects_missing_credentials_with_a_safe_error(key):
+    with pytest.raises(ValueError) as caught:
+        supabase_settings(jev_enabled=True, openrouter_api_key=key).validate_core()
+    assert str(caught.value) == "HUB_OPENROUTER_API_KEY is required when HUB_JEV_ENABLED is true"
+
+
+@pytest.mark.parametrize("confidence", [0.49, 1.01, float("nan"), float("inf")])
+def test_jev_rejects_confidence_outside_its_supported_range(confidence):
+    with pytest.raises(ValueError):
+        supabase_settings(jev_confidence=confidence)
+
+
+@pytest.mark.parametrize("confidence", [0.5, 1.0])
+def test_jev_accepts_confidence_range_endpoints(confidence):
+    assert supabase_settings(jev_confidence=confidence).jev_confidence == confidence
+
+
 @pytest.mark.parametrize("backend", ["edgedb", "unsupported-backend-canary"])
 def test_unsupported_storage_backends_fail_closed(backend):
     with pytest.raises(ValueError) as caught:
@@ -99,6 +126,9 @@ def test_json_collections_and_deployment_roundtrip(monkeypatch):
         "HUB_SUPABASE_PASSWORD": secret,
         "HUB_FOUNDER_IDS": "[101, 202]",
         "HUB_JDOODLE_TOKENS": '[["client", "secret"]]',
+        "HUB_OPENROUTER_API_KEY": secret,
+        "HUB_JEV_ENABLED": "true",
+        "HUB_JEV_CONFIDENCE": "0.85",
         "LOGFIRE_TOKEN": secret + "-write-token",
     }
     for key in payload:
@@ -113,6 +143,8 @@ def test_json_collections_and_deployment_roundtrip(monkeypatch):
     assert config.supabase_password == secret
     assert config.founder_ids == [101, 202]
     assert config.jdoodle_tokens == [("client", "secret")]
+    assert config.openrouter_api_key == secret
+    assert config.jev_enabled is True and config.jev_confidence == 0.85
     assert os.environ["LOGFIRE_TOKEN"] == payload["LOGFIRE_TOKEN"]
     assert "logfire_token" not in config.model_dump()
     assert secret not in repr(config)
@@ -182,6 +214,7 @@ def test_ordinary_configuration_is_visible_in_repr_and_diagnostics(monkeypatch):
     "field",
     [
         "bot_token",
+        "openrouter_api_key",
         "supabase_key",
         "supabase_password",
         "proxy",
@@ -351,6 +384,16 @@ def test_example_and_deployment_cover_current_settings():
     deployed = set(re.findall(r"^\s+(HUB_[A-Z0-9_]+):", (root / ".github/workflows/deploy.yml").read_text(), re.MULTILINE))
     assert example == configured
     assert deployed == configured
+
+
+def test_jev_workflow_passes_the_existing_secret_only_to_deployment():
+    root = Path(__file__).resolve().parents[1]
+    workflow = (root / ".github/workflows/deploy.yml").read_text()
+    before, deployment = workflow.split("      - name: Deploy with automatic rollback", 1)
+    assert "OPENROUTER_API_KEY" not in before
+    assert "HUB_OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}" in deployment
+    assert "HUB_JEV_ENABLED: ${{ vars.HUB_JEV_ENABLED || 'false' }}" in deployment
+    assert "HUB_JEV_CONFIDENCE: ${{ vars.HUB_JEV_CONFIDENCE || '0.8' }}" in deployment
 
 
 def test_project_write_token_is_redacted_outside_application_settings(monkeypatch):

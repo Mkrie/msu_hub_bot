@@ -24,6 +24,17 @@ def test_public_deployment_output_excludes_ssh_diagnostics(capsys):
     assert "/private/example/key" not in output.out + output.err
 
 
+@pytest.mark.parametrize("enabled", ["true", "false"])
+def test_jev_uses_the_runtime_alias_without_forwarding_unscoped_credentials(enabled):
+    runtime = {
+        "HUB_OPENROUTER_API_KEY": "synthetic-openrouter-key",
+        "HUB_JEV_ENABLED": enabled,
+        "HUB_JEV_CONFIDENCE": "0.8",
+    }
+    environment = {**runtime, "OPENROUTER_API_KEY": "unscoped-canary", "GITHUB_TOKEN": "github-canary"}
+    assert client.runtime_environment(environment) == runtime
+
+
 @pytest.mark.parametrize("enabled", [None, "", "false", "0", "invalid"])
 def test_disabled_deployment_omits_all_telemetry_credentials(enabled):
     environment = {
