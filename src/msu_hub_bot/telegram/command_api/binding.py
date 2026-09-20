@@ -152,7 +152,11 @@ class MetaCommand:
             parameters.append(_Parameter(name, annotation, default, declaration, adapter))
         if text_count > 1 or media_count > 1:
             raise TypeError("One text input and one media input per command keep extraction and reply selection unambiguous")
-        setattr(function, _ATTRIBUTE, _Command(self.keywords, tuple(parameters), self.policy, self.resolver, self.context_messages, self.guidance))
+        setattr(
+            function,
+            _ATTRIBUTE,
+            _Command(self.keywords, tuple(parameters), self.policy, self.resolver, self.context_messages, self.guidance),
+        )
         return function
 
 
@@ -228,7 +232,7 @@ def _parse(command: _Command, meta: MetaInfo) -> dict[str, object]:
         tokens = list(re.finditer(r"\S+", raw_text))
         # Internal callers may supply arguments separately from their request text.
         if all(index < len(tokens) and tokens[index].group() == meta.arguments[index] for index in range(consumed)):
-            meta.text = raw_text[tokens[consumed - 1].end():].lstrip() if consumed else raw_text
+            meta.text = raw_text[tokens[consumed - 1].end() :].lstrip() if consumed else raw_text
     return values
 
 
@@ -237,8 +241,7 @@ def _finish(parameter: _Parameter, values: dict[str, object], command: _Command)
     if value is not _MISSING:
         value = _validate(parameter, value)
         if value is _MISSING and (
-            isinstance(parameter.declaration, _MEDIA)
-            or isinstance(parameter.declaration, Argument) and parameter.declaration.strict
+            isinstance(parameter.declaration, _MEDIA) or isinstance(parameter.declaration, Argument) and parameter.declaration.strict
         ):
             raise InputError(command.usage())
     if value is _MISSING:
@@ -349,7 +352,11 @@ async def invoke_command(function: Callable[..., object], message: Message, **da
     meta = data.get("meta")
     if not isinstance(meta, MetaInfo):
         selected = await CommandFilter(*command.keywords)(message, bot=data.get("bot") or bot_for(message))
-        meta = selected["meta"] if isinstance(selected, dict) else MetaInfo(message, command=command.keywords[0], text=message.text or message.caption or "")
+        meta = (
+            selected["meta"]
+            if isinstance(selected, dict)
+            else MetaInfo(message, command=command.keywords[0], text=message.text or message.caption or "")
+        )
     meta.context_messages = command.context_messages
     meta._response_policy = command.policy
     with ExitStack() as resources:
