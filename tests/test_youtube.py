@@ -13,12 +13,14 @@ import requests
 
 from msu_hub_bot.providers import link_download as download
 from msu_hub_bot.providers import youtube
+from msu_hub_bot.providers.link_diagnostics import LinkDiagnostic, LinkReason, LinkStage, collect_link_diagnostics, record_link_diagnostic
 from msu_hub_bot.providers.link_models import LinkAsset
 
 VIDEO_ID = "jNQXAC9IVRw"
 WATCH = f"https://www.youtube.com/watch?v={VIDEO_ID}"
 SHORT = f"https://www.youtube.com/shorts/{VIDEO_ID}"
 THUMB = f"https://i.ytimg.com/vi/{VIDEO_ID}/hqdefault.jpg"
+MAXRES = f"https://i.ytimg.com/vi/{VIDEO_ID}/maxresdefault.jpg"
 PHOTO = LinkAsset("photo", b"jpeg", 480, 360)
 VIDEO = LinkAsset("video", b"mp4", 144, 198, 3)
 
@@ -160,6 +162,88 @@ def test_official_oembed_card_works_without_playback_metadata(monkeypatch):
     assert call.args[0].startswith("https://www.youtube.com/oembed?")
     assert call.kwargs["allowed_hosts"] == ("www.youtube.com",)
     assert call.kwargs["max_bytes"] == 65536
+
+
+def test_missing_maxres_uses_official_thumbnail_without_losing_metadata_or_diagnostics(monkeypatch):
+    monkeypatch.setattr(youtube.time, "monotonic", lambda: 100)
+    methods = install(
+        monkeypatch,
+        metadata(thumbnail=MAXRES),
+        fallback={"title": "Short fallback title", "author_name": "Fallback author", "thumbnail_url": THUMB},
+    )
+
+    def image(url, *, deadline, allowed_hosts):
+        assert deadline == 175 and allowed_hosts == youtube._THUMBNAIL_HOSTS
+        if url == MAXRES:
+            record_link_diagnostic(LinkStage.IMAGE, LinkReason.HTTP_ERROR, http_status=404)
+            return None
+        assert url == THUMB
+        record_link_diagnostic(LinkStage.IMAGE, LinkReason.OK)
+        return PHOTO
+
+    methods["download_image"].side_effect = image
+    extracted = collect_link_diagnostics(youtube.fetch_youtube, WATCH)
+    result = extracted.value
+    assert result.assets == (PHOTO,)
+    assert result.title == metadata()["title"] and result.author == metadata()["channel"]
+    assert result.author_url == metadata()["channel_url"] and result.text == metadata()["description"]
+    assert extracted.diagnostics == (
+        LinkDiagnostic(LinkStage.IMAGE, LinkReason.HTTP_ERROR, http_status=404),
+        LinkDiagnostic(LinkStage.IMAGE, LinkReason.OK),
+    )
+    assert [call.args[0] for call in methods["download_image"].call_args_list] == [MAXRES, THUMB]
+    methods["request_json"].assert_called_once()
+    assert methods["request_json"].call_args.kwargs["deadline"] == 108
+
+
+def test_failed_thumbnail_reuses_oembed_already_loaded_for_author(monkeypatch):
+    methods = install(
+        monkeypatch, metadata(channel="", thumbnail=MAXRES), fallback={"author_name": "Fallback author", "thumbnail_url": THUMB}
+    )
+    methods["download_image"].side_effect = [None, PHOTO]
+    result = youtube.fetch_youtube(WATCH)
+    assert result.assets == (PHOTO,) and result.author == "Fallback author"
+    assert result.text == metadata()["description"]
+    methods["request_json"].assert_called_once()
+    assert [call.args[0] for call in methods["download_image"].call_args_list] == [MAXRES, THUMB]
+
+
+@pytest.mark.parametrize(
+    "fallback_thumbnail,attempts", [(MAXRES, [MAXRES]), ("https://127.0.0.1/private", [MAXRES]), (None, [MAXRES]), (THUMB, [MAXRES, THUMB])]
+)
+def test_failed_thumbnail_is_quiet_and_never_retries_duplicates_unsafe_or_more_variants(monkeypatch, fallback_thumbnail, attempts):
+    methods = install(
+        monkeypatch,
+        metadata(thumbnail=MAXRES, thumbnails=[{"url": THUMB + "?unused=1"}, {"url": THUMB + "?unused=2"}]),
+        fallback={"thumbnail_url": fallback_thumbnail},
+        photo=None,
+    )
+    result = youtube.fetch_youtube(WATCH)
+    assert result.assets == () and result.text == metadata()["description"]
+    methods["request_json"].assert_called_once()
+    assert [call.args[0] for call in methods["download_image"].call_args_list] == attempts
+
+
+def test_failed_official_thumbnail_is_not_fetched_twice(monkeypatch):
+    methods = install(monkeypatch, fallback={"title": "Public title", "author_name": "Public author", "thumbnail_url": THUMB}, photo=None)
+    assert youtube.fetch_youtube(WATCH).assets == ()
+    methods["request_json"].assert_called_once()
+    methods["download_image"].assert_called_once()
+
+
+def test_expired_thumbnail_budget_does_not_start_oembed_recovery(monkeypatch):
+    clock = [100]
+    monkeypatch.setattr(youtube.time, "monotonic", lambda: clock[0])
+    methods = install(monkeypatch, metadata(thumbnail=MAXRES), fallback={"thumbnail_url": THUMB})
+
+    def expired(*args, **kwargs):
+        clock[0] = 175
+        return None
+
+    methods["download_image"].side_effect = expired
+    assert youtube.fetch_youtube(WATCH).assets == ()
+    methods["request_json"].assert_not_called()
+    methods["download_image"].assert_called_once()
 
 
 def test_malformed_optional_metadata_does_not_hide_title(monkeypatch):

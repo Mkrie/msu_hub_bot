@@ -89,6 +89,18 @@ def _short_video(info: dict[str, Any]) -> bool:
     )
 
 
+def _oembed(url: str, deadline: float) -> dict[str, Any]:
+    return (
+        request_json(
+            "https://www.youtube.com/oembed?" + urlencode({"url": url, "format": "json"}),
+            deadline=min(deadline, time.monotonic() + 8),
+            allowed_hosts=("www.youtube.com",),
+            max_bytes=64 * 1024,
+        )
+        or {}
+    )
+
+
 def fetch_youtube(url: str) -> LinkPost | None:
     """Keep useful public metadata even when the host cannot obtain video formats."""
     link = parse_youtube_url(url)
@@ -104,16 +116,9 @@ def fetch_youtube(url: str) -> LinkPost | None:
     author = _text(info.get("channel")) or _text(info.get("uploader"))
     thumbnail = _thumbnail(info)
     author_url = _text(info.get("channel_url")) or _text(info.get("uploader_url"))
+    fallback: dict[str, Any] | None = None
     if not title or title == link.id or not author or thumbnail is None:
-        fallback = (
-            request_json(
-                "https://www.youtube.com/oembed?" + urlencode({"url": link.url, "format": "json"}),
-                deadline=min(deadline, time.monotonic() + 8),
-                allowed_hosts=("www.youtube.com",),
-                max_bytes=64 * 1024,
-            )
-            or {}
-        )
+        fallback = _oembed(link.url, deadline)
         if not title or title == link.id:
             title = _text(fallback.get("title"))
         author = author or _text(fallback.get("author_name"))
@@ -138,6 +143,15 @@ def fetch_youtube(url: str) -> LinkPost | None:
         picture = download_image(thumbnail, deadline=deadline, allowed_hosts=_THUMBNAIL_HOSTS)
         if picture is not None:
             assets = (picture,)
+    if not assets and time.monotonic() < deadline:
+        # Extractor thumbnails can include guessed, nonexistent resolutions.
+        if fallback is None:
+            fallback = _oembed(link.url, deadline)
+        alternative = _thumbnail(fallback)
+        if alternative and alternative != thumbnail:
+            picture = download_image(alternative, deadline=deadline, allowed_hosts=_THUMBNAIL_HOSTS)
+            if picture is not None:
+                assets = (picture,)
     if not assets:
         record_link_diagnostic(LinkStage.ADAPTER, LinkReason.EMPTY)
     description = _text(info.get("description"))
