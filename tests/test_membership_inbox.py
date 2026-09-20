@@ -15,7 +15,9 @@ import pytest
 from aiogram.types import Update
 
 from msu_hub_bot.storage.errors import RepositoryFailure, RepositoryUnavailable
+from msu_hub_bot.storage.models import ChatObservation, MembershipBatch, MembershipObservation, UserObservation
 from msu_hub_bot.storage.observations import membership_batch
+from msu_hub_bot.storage.supabase import SupabaseRepository
 from msu_hub_bot.telegram.membership_inbox import MembershipInbox, MembershipInboxError
 
 NOW = datetime(2026, 9, 20, tzinfo=UTC)
@@ -52,9 +54,11 @@ async def wait_empty(inbox):
 
 async def finish(inbox, worker=None):
     inbox.stop()
-    if worker is not None:
-        await asyncio.wait_for(worker, timeout=1)
-    await inbox.close()
+    try:
+        if worker is not None:
+            await asyncio.wait_for(worker, timeout=1)
+    finally:
+        await inbox.close()
 
 
 async def test_capture_saves_only_direct_membership_facts_in_private_storage(tmp_path):
@@ -110,10 +114,87 @@ async def test_redelivery_deduplicates_receipt_time_and_strips_caller_profiles(t
     assert b"CANARY" not in inbox.path.read_bytes()
 
 
+@pytest.mark.parametrize("explicit_clear", [False, True])
+async def test_sparse_identity_fields_survive_persist_reopen_and_rpc_replay(tmp_path, explicit_clear):
+    original = batch()
+    if explicit_clear:
+        original.users[0].username = None
+        original.chats[0].username = None
+    path = tmp_path / "inbox.sqlite3"
+    inbox = MembershipInbox(path, 999, AsyncMock())
+    await inbox.open()
+    await inbox.enqueue([original])
+    await inbox.close()
+    with sqlite3.connect(path) as connection:
+        saved = MembershipBatch.model_validate_json(connection.execute("SELECT payload FROM pending").fetchone()[0])
+    assert ("username" in saved.users[0].model_fields_set) is explicit_clear
+    assert ("username" in saved.chats[0].model_fields_set) is explicit_clear
+    assert "last_name" not in saved.users[0].model_fields_set
+    assert "language_code" not in saved.users[0].model_fields_set
+    assert "first_name" not in saved.chats[0].model_fields_set
+    assert "last_name" not in saved.chats[0].model_fields_set
+    known_user = {"username": "known_user", "last_name": "Known", "language_code": "ru"}
+    known_chat = {"username": "known_chat", "first_name": "Known", "last_name": "Chat"}
+
+    async def apply_wire(rpc, request, *args, **kwargs):
+        assert rpc == "observe_memberships"
+        payload = request["p_observation"]
+        user, chat = payload["users"][0], payload["chats"][0]
+        assert ("username" in user) is explicit_clear
+        assert ("username" in chat) is explicit_clear
+        # Apply the repository's actual sparse RPC payload to existing metadata.
+        known_user.update({name: value for name, value in user.items() if name in known_user})
+        known_chat.update({name: value for name, value in chat.items() if name in known_chat})
+
+    class WireRepository:
+        observe_memberships = SupabaseRepository.observe_memberships
+        _rpc = AsyncMock(side_effect=apply_wire)
+
+    repository = WireRepository()
+    inbox = MembershipInbox(path, 999, repository)
+    await inbox.open()
+    worker = asyncio.create_task(inbox.run())
+    try:
+        await wait_empty(inbox)
+    finally:
+        await finish(inbox, worker)
+    repository._rpc.assert_awaited_once()
+    assert known_user == {"username": None if explicit_clear else "known_user", "last_name": "Known", "language_code": "ru"}
+    assert known_chat == {"username": None if explicit_clear else "known_chat", "first_name": "Known", "last_name": "Chat"}
+
+
+async def test_replay_preserves_default_observation_and_receipt_clocks(tmp_path):
+    original = MembershipBatch(
+        update_id=123,
+        users=[UserObservation(user_id=42, is_bot=False, first_name="Synthetic")],
+        chats=[ChatObservation(chat_id=-1001, type="supergroup")],
+        memberships=[MembershipObservation(chat_id=-1001, user_id=42)],
+    )
+    path = tmp_path / "inbox.sqlite3"
+    inbox = MembershipInbox(path, 999, AsyncMock())
+    await inbox.open()
+    await inbox.enqueue([original])
+    await inbox.close()
+    repository = AsyncMock()
+    inbox = MembershipInbox(path, 999, repository)
+    await inbox.open()
+    worker = asyncio.create_task(inbox.run())
+    await wait_empty(inbox)
+    await finish(inbox, worker)
+    replayed = repository.observe_memberships.await_args.args[0]
+    assert replayed.received_at == original.received_at
+    assert replayed.users[0].observed_at == original.users[0].observed_at
+    assert replayed.chats[0].observed_at == original.chats[0].observed_at
+    assert replayed.memberships[0].observed_at == original.memberships[0].observed_at
+    assert "status" not in replayed.memberships[0].model_fields_set
+
+
 @pytest.mark.parametrize("limit", ["rows", "bytes"])
 async def test_capacity_failure_rolls_back_the_whole_polling_batch(tmp_path, limit):
     first = batch()
-    payload = first.model_dump(mode="json", exclude={"users": {"__all__": {"profile"}}, "chats": {"__all__": {"profile"}}})
+    payload = first.model_dump(
+        mode="json", exclude_unset=True, exclude={"users": {"__all__": {"profile"}}, "chats": {"__all__": {"profile"}}}
+    )
     size = len(json.dumps(payload, sort_keys=True, separators=(",", ":")))
     limits = {"max_rows": 2} if limit == "rows" else {"max_bytes": size * 2 + 5}
     inbox = MembershipInbox(tmp_path / "inbox.sqlite3", 999, AsyncMock(), **limits)

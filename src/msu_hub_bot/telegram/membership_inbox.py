@@ -160,7 +160,19 @@ class MembershipInbox:
         for batch in batches:
             # Keep this boundary minimal even when a future caller supplies
             # richer profiles than the Telegram membership extractor does.
-            payload = batch.model_dump(mode="json", exclude={"users": {"__all__": {"profile"}}, "chats": {"__all__": {"profile"}}})
+            payload = batch.model_dump(
+                mode="json", exclude_unset=True, exclude={"users": {"__all__": {"profile"}}, "chats": {"__all__": {"profile"}}}
+            )
+            # An absent identity field is not an explicit clear. Clocks retain
+            # their original values even when supplied by model defaults.
+            payload["received_at"] = batch.received_at.isoformat()
+            for name, timestamps in (
+                ("users", [user.observed_at for user in batch.users]),
+                ("chats", [chat.observed_at for chat in batch.chats]),
+                ("memberships", [member.observed_at for member in batch.memberships]),
+            ):
+                for value, timestamp in zip(payload.get(name, []), timestamps, strict=True):
+                    value["observed_at"] = timestamp.isoformat()
             identity = json.dumps(
                 {key: value for key, value in payload.items() if key != "received_at"}, sort_keys=True, separators=(",", ":")
             )
