@@ -386,7 +386,7 @@ class TelemetryConfig:
     traces_per_minute: int = 60
     queue_capacity: int = 256
     batch_size: int = 32
-    interval: float = 5
+    interval: float = 60
     request_timeout: float = 2
     shutdown_timeout: float = 3
 
@@ -394,12 +394,16 @@ class TelemetryConfig:
     def from_env(cls, env: Mapping[str, str]) -> TelemetryConfig:
         """The composition root explicitly selects the environment to read."""
         try:
+            interval = float(env.get("HUB_TELEMETRY_METRICS_INTERVAL_SECONDS", "60"))
+            if not 10 <= interval <= 300:
+                raise ValueError("Metric collection interval is outside the supported range")
             return cls(
                 export=env.get("HUB_TELEMETRY_ENABLED", "").casefold() in {"1", "true", "yes"},
                 token=env.get("LOGFIRE_TOKEN", ""),
                 environment=Environment(env.get("HUB_ENVIRONMENT", "production")),
                 release=env.get("HUB_RELEASE", ""),
                 sample_rate=float(env.get("HUB_TELEMETRY_SAMPLE_RATE", "0.1")),
+                interval=interval,
             )
         except ValueError:
             logger.warning("Telemetry configuration is invalid; export remains disabled")
@@ -415,7 +419,7 @@ class TelemetryConfig:
             and 1 <= self.traces_per_minute <= 600
             and 1 <= self.queue_capacity <= 1024
             and 1 <= self.batch_size <= 64
-            and 0.01 <= self.interval <= 60
+            and 0.01 <= self.interval <= 300
             and 0.01 <= self.request_timeout <= 5
             and 0.01 <= self.shutdown_timeout <= 10
         )
@@ -1406,6 +1410,7 @@ class Telemetry:
                 await self._send("metrics", cast(bytes, encode_metrics(data).SerializeToString()))
 
     async def _export_loop(self) -> None:
+        # Metrics have their own cadence; queued logs and spans wake this task immediately.
         next_metrics = time.monotonic() + self.config.interval
         while True:
             if self._queue:

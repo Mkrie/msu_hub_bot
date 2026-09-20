@@ -98,6 +98,10 @@ Do not send raw exception objects, `repr`, messages, notes, causes or formatted 
 
 ## Metrics and volume
 
+Metrics export every 60 seconds by default. `HUB_TELEMETRY_METRICS_INTERVAL_SECONDS` accepts 10–300 seconds; invalid values disable remote telemetry under the configuration contract. Logs and traces wake the exporter immediately and do not wait for this interval. Shutdown requests a final metric collection within its existing deadline.
+
+Counters and histograms remain cumulative, retaining handler outcomes, durations and provider usage across collections. An unchanged series is still exported, so collection frequency directly affects quota use. A longer interval reduces measurement volume without sampling operations or failures; it also reduces gauge resolution and can miss short queue peaks. Read polling age together with sample freshness, and adjust dashboard freshness thresholds when overriding the default cadence. Rate charts need multiple samples per time bucket.
+
 Use counters for handler outcomes, provider attempts/failures and job results; histograms for handler, provider, queue and execution duration; gauges for active workers, queue depth and age of the last successful poll. Metric attributes come from small enumerations. Never label metrics by trace, task, destination, exception text or personal identifier; IDs belong only to bounded trace/log records.
 
 Measure polling health through aggregate counters and outage/recovery transitions, not per-poll logs. Record metrics independently of trace sampling. Set an explicit trace budget; sample whole traces consistently. A retained failure log may refer to a trace that was not sampled. Bounded queues and failed exports still allow loss, so do not promise complete incident retention. A collector or service mesh is not required for this design.

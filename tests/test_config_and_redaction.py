@@ -379,7 +379,9 @@ def test_cli_fatal_error_uses_credential_formatter_and_suppresses_raw_traceback(
 def test_example_and_deployment_cover_current_settings():
     root = Path(__file__).resolve().parents[1]
     configured = {"HUB_" + name.upper() for name in Settings.model_fields}
-    configured.update({"HUB_TELEMETRY_ENABLED", "HUB_TELEMETRY_SAMPLE_RATE", "HUB_ENVIRONMENT", "HUB_RELEASE"})
+    configured.update(
+        {"HUB_TELEMETRY_ENABLED", "HUB_TELEMETRY_SAMPLE_RATE", "HUB_TELEMETRY_METRICS_INTERVAL_SECONDS", "HUB_ENVIRONMENT", "HUB_RELEASE"}
+    )
     example = set(re.findall(r"^(HUB_[A-Z0-9_]+)=", (root / ".env.example").read_text(), re.MULTILINE))
     deployed = set(re.findall(r"^\s+(HUB_[A-Z0-9_]+):", (root / ".github/workflows/deploy.yml").read_text(), re.MULTILINE))
     assert example == configured
@@ -431,6 +433,7 @@ def test_telemetry_workflow_is_opt_in_and_token_stays_out_of_build_steps():
     assert "LOGFIRE_API_KEY" not in workflow and "OTEL_" not in workflow
     assert "HUB_TELEMETRY_ENABLED: ${{ vars.HUB_TELEMETRY_ENABLED || 'false' }}" in deployment
     assert "HUB_TELEMETRY_SAMPLE_RATE: ${{ vars.HUB_TELEMETRY_SAMPLE_RATE || '0.1' }}" in deployment
+    assert "HUB_TELEMETRY_METRICS_INTERVAL_SECONDS: ${{ vars.HUB_TELEMETRY_METRICS_INTERVAL_SECONDS || '60' }}" in deployment
     assert "HUB_ENVIRONMENT: production" in deployment
     assert "HUB_RELEASE: ${{ github.sha }}" in deployment
     assert "LOGFIRE_TOKEN: ${{ secrets.LOGFIRE_TOKEN }}" in deployment
