@@ -20,7 +20,7 @@
           "spec": {
             "display": {
               "name": "Preview outcomes per minute",
-              "description": "Unsampled terminal counters: one result per considered link, including disabled/policy skips. At most two candidates per message; this is not a count of all shared URLs."
+              "description": "Unsampled terminal counter rate estimates, including disabled/policy skips. Rates need successive samples; isolated first events appear in the totals and detail panels. At most two candidates per message."
             },
             "plugin": {
               "kind": "TimeSeriesChart",
@@ -55,7 +55,7 @@
                   "plugin": {
                     "kind": "LogfireTimeSeriesQuery",
                     "spec": {
-                      "query": "WITH streams AS (\n    SELECT time_bucket($resolution, recorded_timestamp) AS x,\n        service_version, service_instance_id, process_pid,\n        attributes->>'provider' AS provider,\n        attributes->>'link.stage' AS stage,\n        attributes->>'link.reason' AS reason,\n        attributes->>'outcome' AS outcome,\n        metric_rate(value, recorded_timestamp) AS n\n    FROM metrics\n    WHERE service_name = 'msu-hub-bot' AND deployment_environment = 'production'\n      AND metric_name = 'bot.links.attempts'\n    GROUP BY x, service_version, service_instance_id, process_pid, provider, stage, reason, outcome\n)\nSELECT x, outcome, 60 * SUM(n) AS previews_per_minute FROM streams GROUP BY x, outcome ORDER BY x, outcome",
+                      "query": "WITH streams AS (\n    SELECT time_bucket($resolution, recorded_timestamp) AS x,\n        service_version, service_instance_id, process_pid,\n        CASE WHEN aggregation_temporality = 'cumulative' THEN start_timestamp END AS counter_epoch,\n        aggregation_temporality,\n        attributes->>'provider' AS provider,\n        attributes->>'link.stage' AS stage,\n        attributes->>'link.reason' AS reason,\n        attributes->>'outcome' AS outcome,\n        metric_rate(value, recorded_timestamp) AS n\n    FROM metrics\n    WHERE service_name = 'msu-hub-bot' AND deployment_environment = 'production'\n      AND metric_name = 'bot.links.attempts'\n    GROUP BY x, service_version, service_instance_id, process_pid, counter_epoch, aggregation_temporality, provider, stage, reason, outcome\n)\nSELECT x, outcome, 60 * SUM(n) AS previews_per_minute FROM streams GROUP BY x, outcome ORDER BY x, outcome",
                       "groupBy": "outcome",
                       "metrics": [
                         "previews_per_minute"
@@ -72,7 +72,7 @@
           "spec": {
             "display": {
               "name": "Delivered previews per minute",
-              "description": "Successful terminal previews by provider. Retries and individual assets cannot inflate deliveries. Empty or stale telemetry is not evidence of zero traffic."
+              "description": "Estimated successful-preview rate by provider. Rates need successive samples; use totals for isolated first events. Retries and assets do not inflate deliveries; empty or stale telemetry is not evidence of zero traffic."
             },
             "plugin": {
               "kind": "TimeSeriesChart",
@@ -107,7 +107,7 @@
                   "plugin": {
                     "kind": "LogfireTimeSeriesQuery",
                     "spec": {
-                      "query": "WITH streams AS (\n    SELECT time_bucket($resolution, recorded_timestamp) AS x,\n        service_version, service_instance_id, process_pid,\n        attributes->>'provider' AS provider,\n        attributes->>'link.stage' AS stage,\n        attributes->>'link.reason' AS reason,\n        attributes->>'outcome' AS outcome,\n        metric_rate(value, recorded_timestamp) AS n\n    FROM metrics\n    WHERE service_name = 'msu-hub-bot' AND deployment_environment = 'production'\n      AND metric_name = 'bot.links.attempts'\n    GROUP BY x, service_version, service_instance_id, process_pid, provider, stage, reason, outcome\n)\nSELECT x, provider, 60 * SUM(n) AS delivered_per_minute FROM streams WHERE outcome = 'success' GROUP BY x, provider ORDER BY x, provider",
+                      "query": "WITH streams AS (\n    SELECT time_bucket($resolution, recorded_timestamp) AS x,\n        service_version, service_instance_id, process_pid,\n        CASE WHEN aggregation_temporality = 'cumulative' THEN start_timestamp END AS counter_epoch,\n        aggregation_temporality,\n        attributes->>'provider' AS provider,\n        attributes->>'link.stage' AS stage,\n        attributes->>'link.reason' AS reason,\n        attributes->>'outcome' AS outcome,\n        metric_rate(value, recorded_timestamp) AS n\n    FROM metrics\n    WHERE service_name = 'msu-hub-bot' AND deployment_environment = 'production'\n      AND metric_name = 'bot.links.attempts'\n    GROUP BY x, service_version, service_instance_id, process_pid, counter_epoch, aggregation_temporality, provider, stage, reason, outcome\n)\nSELECT x, provider, 60 * SUM(n) AS delivered_per_minute FROM streams WHERE outcome = 'success' GROUP BY x, provider ORDER BY x, provider",
                       "groupBy": "provider",
                       "metrics": [
                         "delivered_per_minute"
@@ -124,7 +124,7 @@
           "spec": {
             "display": {
               "name": "How each provider is doing",
-              "description": "Delivery % = delivered / (delivered + failed + declined). Ignored and cancelled previews are separate: unsupported generic yt-dlp links and disabled settings do not reduce delivery %. Counts are unsampled; export loss is still possible."
+              "description": "Delivery % = delivered / (delivered + failed + declined). Ignored and cancelled previews are separate: unsupported generic yt-dlp links and disabled settings do not reduce delivery %. Counts are unsampled; export loss is still possible. Initial cumulative values count only when their stream starts inside the selected window."
             },
             "plugin": {
               "kind": "Table",
@@ -137,7 +137,7 @@
                   "plugin": {
                     "kind": "LogfireNonTimeSeriesQuery",
                     "spec": {
-                      "query": "WITH streams AS (\n    SELECT \n        service_version, service_instance_id, process_pid,\n        attributes->>'provider' AS provider,\n        attributes->>'link.stage' AS stage,\n        attributes->>'link.reason' AS reason,\n        attributes->>'outcome' AS outcome,\n        metric_increase(value, recorded_timestamp) AS n\n    FROM metrics\n    WHERE service_name = 'msu-hub-bot' AND deployment_environment = 'production'\n      AND metric_name = 'bot.links.attempts'\n    GROUP BY service_version, service_instance_id, process_pid, provider, stage, reason, outcome\n)\nSELECT provider, SUM(n) AS previews,\n    SUM(CASE WHEN outcome = 'success' THEN n ELSE 0 END) AS delivered,\n    SUM(CASE WHEN outcome IN ('unavailable', 'timeout', 'unexpected') THEN n ELSE 0 END) AS failed,\n    SUM(CASE WHEN outcome = 'rejected' THEN n ELSE 0 END) AS declined,\n    SUM(CASE WHEN outcome = 'ignored' THEN n ELSE 0 END) AS skipped,\n    SUM(CASE WHEN outcome = 'cancelled' THEN n ELSE 0 END) AS cancelled,\n    100.0 * SUM(CASE WHEN outcome = 'success' THEN n ELSE 0 END)\n      / NULLIF(SUM(CASE WHEN outcome IN ('success', 'rejected', 'unavailable', 'timeout', 'unexpected') THEN n ELSE 0 END), 0) AS delivered_percent\nFROM streams GROUP BY provider HAVING SUM(n) > 0\nORDER BY failed DESC, declined DESC, previews DESC, provider\n"
+                      "query": "WITH streams AS (\n    SELECT \n        service_version, service_instance_id, process_pid,\n        CASE WHEN aggregation_temporality = 'cumulative' THEN start_timestamp END AS counter_epoch,\n        aggregation_temporality,\n        attributes->>'provider' AS provider,\n        attributes->>'link.stage' AS stage,\n        attributes->>'link.reason' AS reason,\n        attributes->>'outcome' AS outcome,\n        metric_increase(value, recorded_timestamp)\n            + CASE WHEN aggregation_temporality = 'cumulative'\n                AND MIN(start_timestamp) >= CAST($__from_iso_string AS TIMESTAMPTZ)\n                AND MIN(start_timestamp) <= CAST($__to_iso_string AS TIMESTAMPTZ)\n                THEN COALESCE(MIN(scalar_value), 0) ELSE 0 END AS n\n    FROM metrics\n    WHERE service_name = 'msu-hub-bot' AND deployment_environment = 'production'\n      AND metric_name = 'bot.links.attempts'\n    GROUP BY service_version, service_instance_id, process_pid, counter_epoch, aggregation_temporality, provider, stage, reason, outcome\n)\nSELECT provider, SUM(n) AS previews,\n    SUM(CASE WHEN outcome = 'success' THEN n ELSE 0 END) AS delivered,\n    SUM(CASE WHEN outcome IN ('unavailable', 'timeout', 'unexpected') THEN n ELSE 0 END) AS failed,\n    SUM(CASE WHEN outcome = 'rejected' THEN n ELSE 0 END) AS declined,\n    SUM(CASE WHEN outcome = 'ignored' THEN n ELSE 0 END) AS skipped,\n    SUM(CASE WHEN outcome = 'cancelled' THEN n ELSE 0 END) AS cancelled,\n    100.0 * SUM(CASE WHEN outcome = 'success' THEN n ELSE 0 END)\n      / NULLIF(SUM(CASE WHEN outcome IN ('success', 'rejected', 'unavailable', 'timeout', 'unexpected') THEN n ELSE 0 END), 0) AS delivered_percent\nFROM streams GROUP BY provider HAVING SUM(n) > 0\nORDER BY failed DESC, declined DESC, previews DESC, provider\n"
                     }
                   }
                 }
@@ -174,7 +174,7 @@
                   "plugin": {
                     "kind": "LogfireNonTimeSeriesQuery",
                     "spec": {
-                      "query": "WITH streams AS (\n    SELECT \n        service_version, service_instance_id, process_pid,\n        attributes->>'provider' AS provider,\n        attributes->>'link.stage' AS stage,\n        attributes->>'link.reason' AS reason,\n        attributes->>'outcome' AS outcome,\n        metric_increase(value, recorded_timestamp) AS n\n    FROM metrics\n    WHERE service_name = 'msu-hub-bot' AND deployment_environment = 'production'\n      AND metric_name = 'bot.links.attempts'\n    GROUP BY service_version, service_instance_id, process_pid, provider, stage, reason, outcome\n)\nSELECT provider || ' · ' || stage || ' · ' || reason AS cause, SUM(n) AS previews FROM streams WHERE outcome IN ('rejected', 'unavailable', 'timeout', 'unexpected') GROUP BY provider, stage, reason HAVING SUM(n) > 0 ORDER BY previews DESC, cause LIMIT 15"
+                      "query": "WITH streams AS (\n    SELECT \n        service_version, service_instance_id, process_pid,\n        CASE WHEN aggregation_temporality = 'cumulative' THEN start_timestamp END AS counter_epoch,\n        aggregation_temporality,\n        attributes->>'provider' AS provider,\n        attributes->>'link.stage' AS stage,\n        attributes->>'link.reason' AS reason,\n        attributes->>'outcome' AS outcome,\n        metric_increase(value, recorded_timestamp)\n            + CASE WHEN aggregation_temporality = 'cumulative'\n                AND MIN(start_timestamp) >= CAST($__from_iso_string AS TIMESTAMPTZ)\n                AND MIN(start_timestamp) <= CAST($__to_iso_string AS TIMESTAMPTZ)\n                THEN COALESCE(MIN(scalar_value), 0) ELSE 0 END AS n\n    FROM metrics\n    WHERE service_name = 'msu-hub-bot' AND deployment_environment = 'production'\n      AND metric_name = 'bot.links.attempts'\n    GROUP BY service_version, service_instance_id, process_pid, counter_epoch, aggregation_temporality, provider, stage, reason, outcome\n)\nSELECT provider || ' · ' || stage || ' · ' || reason AS cause, SUM(n) AS previews FROM streams WHERE outcome IN ('rejected', 'unavailable', 'timeout', 'unexpected') GROUP BY provider, stage, reason HAVING SUM(n) > 0 ORDER BY previews DESC, cause LIMIT 15"
                     }
                   }
                 }
@@ -200,7 +200,7 @@
                   "plugin": {
                     "kind": "LogfireNonTimeSeriesQuery",
                     "spec": {
-                      "query": "WITH streams AS (\n    SELECT \n        service_version, service_instance_id, process_pid,\n        attributes->>'provider' AS provider,\n        attributes->>'link.stage' AS stage,\n        attributes->>'link.reason' AS reason,\n        attributes->>'outcome' AS outcome,\n        metric_increase(value, recorded_timestamp) AS n\n    FROM metrics\n    WHERE service_name = 'msu-hub-bot' AND deployment_environment = 'production'\n      AND metric_name = 'bot.links.steps'\n    GROUP BY service_version, service_instance_id, process_pid, provider, stage, reason, outcome\n)\nSELECT provider, stage, reason, outcome, SUM(n) AS steps FROM streams WHERE outcome IN ('rejected', 'unavailable', 'timeout', 'unexpected') GROUP BY provider, stage, reason, outcome HAVING SUM(n) > 0 ORDER BY steps DESC, provider, stage, reason LIMIT 30"
+                      "query": "WITH streams AS (\n    SELECT \n        service_version, service_instance_id, process_pid,\n        CASE WHEN aggregation_temporality = 'cumulative' THEN start_timestamp END AS counter_epoch,\n        aggregation_temporality,\n        attributes->>'provider' AS provider,\n        attributes->>'link.stage' AS stage,\n        attributes->>'link.reason' AS reason,\n        attributes->>'outcome' AS outcome,\n        metric_increase(value, recorded_timestamp)\n            + CASE WHEN aggregation_temporality = 'cumulative'\n                AND MIN(start_timestamp) >= CAST($__from_iso_string AS TIMESTAMPTZ)\n                AND MIN(start_timestamp) <= CAST($__to_iso_string AS TIMESTAMPTZ)\n                THEN COALESCE(MIN(scalar_value), 0) ELSE 0 END AS n\n    FROM metrics\n    WHERE service_name = 'msu-hub-bot' AND deployment_environment = 'production'\n      AND metric_name = 'bot.links.steps'\n    GROUP BY service_version, service_instance_id, process_pid, counter_epoch, aggregation_temporality, provider, stage, reason, outcome\n)\nSELECT provider, stage, reason, outcome, SUM(n) AS steps FROM streams WHERE outcome IN ('rejected', 'unavailable', 'timeout', 'unexpected') GROUP BY provider, stage, reason, outcome HAVING SUM(n) > 0 ORDER BY steps DESC, provider, stage, reason LIMIT 30"
                     }
                   }
                 }

@@ -11,8 +11,10 @@ DASHBOARD = json.loads((Path(__file__).resolve().parents[1] / "tools/observabili
 PANELS = DASHBOARD["definition"]["spec"]["panels"]
 
 
-def query(panel):
-    return PANELS[panel]["spec"]["queries"][0]["spec"]["plugin"]["spec"]["query"]
+def query(panel, *, since=0, until=60):
+    sql = PANELS[panel]["spec"]["queries"][0]["spec"]["plugin"]["spec"]["query"]
+    # SQLite uses integer fixture timestamps in place of Logfire's UTC timestamps.
+    return sql.replace("CAST($__from_iso_string AS TIMESTAMPTZ)", str(since)).replace("CAST($__to_iso_string AS TIMESTAMPTZ)", str(until))
 
 
 class CounterIncrease:
@@ -21,20 +23,62 @@ class CounterIncrease:
     def __init__(self):
         self.streams = set()
         self.readings = []
+        self.temporality = None
 
     def step(self, value, timestamp):
         sample = json.loads(value)
         self.streams.add(sample["stream"])
         self.readings.append(sample["value"])
+        self.temporality = sample["temporality"]
 
     def finalize(self):
         assert len(self.streams) == 1, "Counter streams must be aggregated independently"
+        if self.temporality == "delta":
+            return sum(self.readings)
         return max(self.readings) - min(self.readings)
 
 
 class CounterRate(CounterIncrease):
     def finalize(self):
         return super().finalize() / 60
+
+
+def insert_readings(
+    db,
+    provider,
+    stage,
+    reason,
+    outcome,
+    readings,
+    *,
+    epoch=0,
+    temporality="cumulative",
+    name="bot.links.attempts",
+    version="a",
+    instance="one",
+    pid=1,
+    **scope,
+):
+    attributes = {"provider": provider, "link.stage": stage, "link.reason": reason, "outcome": outcome}
+    stream = repr((version, instance, pid, attributes, epoch if temporality == "cumulative" else None, temporality))
+    for timestamp, value in readings:
+        db.execute(
+            "INSERT INTO metrics VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                scope.get("service", "msu-hub-bot"),
+                scope.get("environment", "production"),
+                version,
+                instance,
+                pid,
+                name,
+                json.dumps(attributes),
+                json.dumps({"stream": stream, "value": value, "temporality": temporality}),
+                timestamp,
+                epoch,
+                temporality,
+                value,
+            ),
+        )
 
 
 @pytest.fixture
@@ -50,7 +94,8 @@ def database():
         CREATE TABLE metrics (
             service_name TEXT, deployment_environment TEXT, service_version TEXT,
             service_instance_id TEXT, process_pid INTEGER, metric_name TEXT,
-            attributes TEXT, value TEXT, recorded_timestamp INTEGER
+            attributes TEXT, value TEXT, recorded_timestamp INTEGER,
+            start_timestamp INTEGER, aggregation_temporality TEXT, scalar_value REAL
         );
         CREATE TABLE records (
             service_name TEXT, deployment_environment TEXT, kind TEXT,
@@ -60,23 +105,9 @@ def database():
     """)
 
     def metric(provider, stage, reason, outcome, count, *, name="bot.links.attempts", version="a", instance="one", pid=1, **scope):
-        attributes = {"provider": provider, "link.stage": stage, "link.reason": reason, "outcome": outcome}
-        stream = repr((version, instance, pid, attributes))
-        for timestamp, value in ((0, 0), (30, count)):
-            db.execute(
-                "INSERT INTO metrics VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    scope.get("service", "msu-hub-bot"),
-                    scope.get("environment", "production"),
-                    version,
-                    instance,
-                    pid,
-                    name,
-                    json.dumps(attributes),
-                    json.dumps({"stream": stream, "value": value}),
-                    timestamp,
-                ),
-            )
+        insert_readings(
+            db, provider, stage, reason, outcome, ((0, 0), (30, count)), name=name, version=version, instance=instance, pid=pid, **scope
+        )
 
     metric("youtube", "delivery", "ready", "success", 15)
     metric("youtube", "delivery", "ready", "success", 5, version="b")
@@ -135,6 +166,37 @@ def test_failure_causes_count_posts_and_steps_separately(database):
     steps = [dict(row) for row in database.execute(query("step-causes"))]
     assert [row["steps"] for row in steps] == [7, 2]
     assert all(row["provider"] == "fxembed" for row in steps)
+
+
+def test_new_cumulative_streams_include_first_events_without_recounting_older_lifetimes(database):
+    database.execute("DELETE FROM metrics")
+    insert_readings(database, "instagram", "delivery", "ready", "success", ((111, 1), (120, 1)), epoch=110)
+    insert_readings(database, "tiktok", "delivery", "ready", "success", ((105, 100), (115, 103)), epoch=0)
+    # A counter can restart within the same process; its new epoch must remain separate.
+    insert_readings(database, "tiktok", "delivery", "ready", "success", ((126, 2), (140, 4)), epoch=125)
+    insert_readings(database, "fxembed", "delivery", "ready", "success", ((151, 1),), epoch=150)
+    rows = {row["provider"]: dict(row) for row in database.execute(query("providers", since=100, until=200))}
+    assert rows["instagram"]["delivered"] == 1
+    assert rows["tiktok"]["delivered"] == 7
+    assert rows["fxembed"]["delivered"] == 1
+
+    database.execute("DELETE FROM metrics WHERE recorded_timestamp < 112")
+    later = {row["provider"]: dict(row) for row in database.execute(query("providers", since=112, until=200))}
+    assert "instagram" not in later  # Its flat lifetime value predates this window.
+    assert later["tiktok"]["delivered"] == 4  # Only the new epoch belongs to this window.
+    assert later["fxembed"]["delivered"] == 1
+
+
+@pytest.mark.parametrize(
+    "name,panel,count_column", [("bot.links.attempts", "terminal-causes", "previews"), ("bot.links.steps", "step-causes", "steps")]
+)
+def test_first_failure_counts_and_delta_samples_are_not_corrected_twice(database, name, panel, count_column):
+    database.execute("DELETE FROM metrics")
+    insert_readings(database, "youtube", "image", "http_error", "unavailable", ((110, 1),), epoch=105, name=name)
+    insert_readings(database, "youtube", "request", "timeout", "timeout", ((120, 2),), epoch=110, name=name, temporality="delta")
+    insert_readings(database, "youtube", "request", "timeout", "timeout", ((130, 3),), epoch=120, name=name, temporality="delta")
+    rows = [dict(row) for row in database.execute(query(panel, since=100, until=200))]
+    assert sorted(row[count_column] for row in rows) == [1, 5]
 
 
 @pytest.mark.parametrize(
