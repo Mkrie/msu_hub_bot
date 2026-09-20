@@ -8,8 +8,10 @@ import importlib
 import importlib.util
 import io
 import json
+import os
 import shutil
 import socket
+import stat
 import struct
 import subprocess
 import tempfile
@@ -348,6 +350,27 @@ def check_background():
         assert cutout.getpixel((5, 5))[3] <= 10, "Background remains opaque"
 
 
+async def check_membership_journal():
+    from unittest.mock import AsyncMock
+
+    from msu_hub_bot.storage.models import MembershipBatch
+    from msu_hub_bot.telegram.membership_inbox import MembershipInbox
+
+    directory = Path("/data")
+    assert directory.stat().st_uid == os.geteuid() == 10001
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+    with tempfile.TemporaryDirectory(prefix="membership-smoke-", dir=directory) as temporary:
+        path = Path(temporary) / "inbox.sqlite3"
+        inbox = MembershipInbox(path, 999, AsyncMock())
+        await inbox.open()
+        await inbox.enqueue([MembershipBatch(update_id=123)])
+        await inbox.close()
+        replay = MembershipInbox(path, 999, AsyncMock())
+        await replay.open()
+        assert await replay.pending() == 1, "Membership journal did not survive reopening"
+        await replay.close()
+
+
 async def main():
     socket.socket.connect = blocked
     socket.socket.connect_ex = blocked
@@ -364,6 +387,7 @@ async def main():
     check_youtube_runtime()
     check_chess()
     check_background()
+    await check_membership_journal()
     from msu_hub_bot.web import server as web_server
 
     static = Path(web_server.__file__).with_name("static")

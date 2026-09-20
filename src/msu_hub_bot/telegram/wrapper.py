@@ -12,10 +12,11 @@ from aiogram.client.session.middlewares.base import BaseRequestMiddleware, NextR
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.methods import Response, TelegramMethod
 from aiogram.methods.base import TelegramType
-from aiogram.types import InputMediaPhoto, InputMediaVideo, Message, ReplyParameters
+from aiogram.types import InputMediaPhoto, InputMediaVideo, Message, ReplyParameters, Update
 
 from msu_hub_bot.telegram.constants import TELEGRAM_CAPTION_MAX_LEN
 from msu_hub_bot.telegram.delivery import AlbumMedia, send_album
+from msu_hub_bot.telegram.membership_inbox import MembershipInbox, MembershipInboxError
 from msu_hub_bot.telegram.utils import send_super_message
 from msu_hub_bot.health import mark_poll_success
 from msu_hub_bot.telemetry import Boundary, Operation, Outcome, Provider, Telemetry, failure_outcome
@@ -24,8 +25,16 @@ from msu_hub_bot.telemetry import Boundary, Operation, Outcome, Provider, Teleme
 class TelegramRequestPolicy(BaseRequestMiddleware):
     """Retry rejected requests and reads; never replay an ambiguous mutation."""
 
-    def __init__(self, attempts: int = 3, max_retry_after: int = 30, *, telemetry: Telemetry | None = None) -> None:
+    def __init__(
+        self,
+        attempts: int = 3,
+        max_retry_after: int = 30,
+        *,
+        telemetry: Telemetry | None = None,
+        membership_inbox: MembershipInbox | None = None,
+    ) -> None:
         self.telemetry = telemetry or Telemetry()
+        self.membership_inbox = membership_inbox
         self.attempts = attempts
         self.max_retry_after = max_retry_after
 
@@ -92,6 +101,10 @@ class TelegramRequestPolicy(BaseRequestMiddleware):
                 raise
             else:
                 if method.__api_method__ == "getUpdates":
+                    if self.membership_inbox is not None:
+                        if not isinstance(result, list) or not all(isinstance(update, Update) for update in result):
+                            raise MembershipInboxError("Membership polling response is invalid")
+                        await self.membership_inbox.capture(result)
                     mark_poll_success()
                     self.telemetry.record_poll(Outcome.SUCCESS)
                 return result
@@ -105,9 +118,17 @@ class _ChatSend:
 
 
 class BotWrapper(Bot):
-    def __init__(self, token: str, *, session: BaseSession, telemetry: Telemetry | None = None, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        token: str,
+        *,
+        session: BaseSession,
+        telemetry: Telemetry | None = None,
+        membership_inbox: MembershipInbox | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(token, session=session, **kwargs)
-        self.session.middleware(TelegramRequestPolicy(telemetry=telemetry))
+        self.session.middleware(TelegramRequestPolicy(telemetry=telemetry, membership_inbox=membership_inbox))
         self._chat_sends: dict[int, _ChatSend] = {}
 
     @asynccontextmanager

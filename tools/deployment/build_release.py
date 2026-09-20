@@ -61,6 +61,8 @@ def main():
             "/tmp:mode=1777",
             "--tmpfs",
             "/work:mode=1777",
+            "--mount",
+            "type=volume,target=/data",
             "--entrypoint",
             "python",
             "-i",

@@ -12,13 +12,14 @@ from telegram_helpers import RecordingSession
 
 
 @pytest.fixture
-def app_settings():
+def app_settings(tmp_path):
     return Settings(
         bot_token="123456789:" + "a" * 35,
         supabase_url="http://supabase.invalid",
         supabase_key="synthetic-publishable-key",
         supabase_email="bot@example.invalid",
         supabase_password="synthetic-password",
+        membership_inbox_path=tmp_path / "membership-inbox.sqlite3",
     )
 
 
@@ -47,6 +48,7 @@ async def test_composition_startup_and_idempotent_shutdown(app_settings, boundar
     assert [type(method) for method in session.methods] == [GetMe, DeleteWebhook]
     assert session.methods[-1].drop_pending_updates is False
     assert application._feature_task is not None
+    assert application._membership_task is not None
     assert application.dispatcher.workflow_data["quiz"] is application.quiz
     assert application.dispatcher.workflow_data["chess_matches"] is application.chess_matches
     await application.close()
@@ -54,6 +56,7 @@ async def test_composition_startup_and_idempotent_shutdown(app_settings, boundar
     db.close.assert_awaited_once()
     assert session.closed
     assert application._feature_task.done()
+    assert application._membership_task.done()
 
 
 async def test_partial_allocation_failure_closes_opened_clients(app_settings, boundaries, monkeypatch):
@@ -81,6 +84,7 @@ async def test_startup_failure_runs_owned_cleanup(app_settings, boundaries):
         await application.run()
     assert session.closed
     assert session.methods == []
+    assert not app_settings.membership_inbox_path.exists()
 
 
 async def test_missing_feature_schema_stops_startup_before_telegram(app_settings, boundaries):
@@ -93,6 +97,7 @@ async def test_missing_feature_schema_stops_startup_before_telegram(app_settings
     with pytest.raises(FeatureProtocolError):
         await application.run()
     assert session.closed and session.methods == []
+    assert not app_settings.membership_inbox_path.exists()
     db.close.assert_awaited_once()
 
 

@@ -23,7 +23,7 @@ FROM python:3.14.7-slim-trixie@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48
 RUN apt-get update && apt-get install --no-install-recommends -y ffmpeg tesseract-ocr tesseract-ocr-rus ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 hubbot && useradd --uid 10001 --gid 10001 --no-create-home hubbot \
-    && mkdir /work && chown 10001:10001 /work
+    && mkdir /work && mkdir -m 0700 /data && chown 10001:10001 /work /data
 COPY --from=build /opt/msu_hub_bot/.venv /opt/msu_hub_bot/.venv
 COPY --from=build /opt/msu_hub_bot/LICENSE /opt/msu_hub_bot/THIRD_PARTY_NOTICES.md /opt/msu_hub_bot/
 COPY --from=build /opt/msu_hub_bot/licenses /opt/msu_hub_bot/licenses

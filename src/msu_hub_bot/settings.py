@@ -7,6 +7,7 @@ redaction. Optional providers are checked when used; imports need no credentials
 import json
 import os
 import re
+from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -60,6 +61,7 @@ class Settings(BaseSettings):
     cert: str = ""
     pkey: str = Field(default="", repr=False)
     logs_file: str = ".local/logs/{name}.log"
+    membership_inbox_path: Path = Path(".local/runtime/membership-inbox.sqlite3")
     health_check_url: str = Field(default="", repr=False)
     web_app_url: str = ""
     web_port: int = Field(default=8081, ge=1, le=65535)

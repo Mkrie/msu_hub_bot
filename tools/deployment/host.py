@@ -186,6 +186,7 @@ def compose_document(image, env_path, *, web=False):
                 "pull_policy": "never",
                 "container_name": CONTAINER,
                 "env_file": [{"path": str(env_path), "format": "raw"}],
+                "environment": {"HUB_MEMBERSHIP_INBOX_PATH": "/data/membership-inbox.sqlite3"},
                 "restart": "unless-stopped",
                 "init": True,
                 "cpus": 3.0,
@@ -195,6 +196,7 @@ def compose_document(image, env_path, *, web=False):
                 "networks": ["msu_db", *(["msu_hub_web"] if web else [])],
                 "read_only": True,
                 "tmpfs": ["/tmp:mode=1777,size=512m", "/work:mode=1777,size=512m"],
+                "volumes": [{"type": "volume", "source": "membership_inbox", "target": "/data"}],
                 "security_opt": ["no-new-privileges:true"],
                 "cap_drop": ["ALL"],
                 "ulimits": {"core": 0},
@@ -203,6 +205,7 @@ def compose_document(image, env_path, *, web=False):
             }
         },
         "networks": {name: {"external": True} for name in ["msu_db", *(["msu_hub_web"] if web else [])]},
+        "volumes": {"membership_inbox": {"name": "msu_hub_bot_membership_inbox"}},
     }
 
 

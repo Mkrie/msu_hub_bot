@@ -203,9 +203,19 @@ def test_compose_only_manages_the_bot_and_literal_configuration(tmp_path):
     assert set(document["services"]) == {"bot"}
     assert document["networks"] == {"msu_db": {"external": True}}
     assert document["services"]["bot"]["env_file"][0]["format"] == "raw"
-    assert "volumes" not in document
+    assert document["volumes"] == {"membership_inbox": {"name": "msu_hub_bot_membership_inbox"}}
+    assert document["services"]["bot"]["volumes"] == [{"type": "volume", "source": "membership_inbox", "target": "/data"}]
+    assert document["services"]["bot"]["environment"]["HUB_MEMBERSHIP_INBOX_PATH"] == "/data/membership-inbox.sqlite3"
     assert "ports" not in document["services"]["bot"]
     assert document["services"]["bot"]["pull_policy"] == "never"
+
+
+def test_membership_volume_identity_survives_release_and_rollback_paths(tmp_path):
+    previous = deployment.compose_document("sha256:" + "a" * 64, tmp_path / "previous" / "runtime.env")
+    candidate = deployment.compose_document("sha256:" + "b" * 64, tmp_path / "candidate" / "runtime.env", web=True)
+    assert previous["volumes"] == candidate["volumes"]
+    assert previous["services"]["bot"]["volumes"] == candidate["services"]["bot"]["volumes"]
+    assert previous["services"]["bot"]["read_only"] and candidate["services"]["bot"]["read_only"]
 
 
 def test_generated_release_bounds_cpu_memory_processes_and_temporary_storage(tmp_path):

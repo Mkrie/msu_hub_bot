@@ -1,10 +1,15 @@
-from unittest.mock import AsyncMock
+import asyncio
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from aiogram.client.default import DefaultBotProperties
+from aiogram import Dispatcher
 from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.methods import GetMe, GetUpdates, SendMessage
+from aiogram.types import Update
+from aiogram.utils.backoff import BackoffConfig
 
+from msu_hub_bot.telegram.membership_inbox import MembershipInbox, MembershipInboxError
 from msu_hub_bot.telegram.wrapper import BotWrapper
 from telegram_helpers import RecordingSession, make_message
 
@@ -102,3 +107,89 @@ async def test_poll_telemetry_uses_metrics_without_traces(monkeypatch):
     assert "bot.poll.requests" in output
     assert "success" in output
     assert "123456789" not in output
+
+
+async def test_poll_returns_and_marks_healthy_only_after_durable_capture(monkeypatch):
+    entered, release = asyncio.Event(), asyncio.Event()
+    marked = Mock()
+    monkeypatch.setattr("msu_hub_bot.telegram.wrapper.mark_poll_success", marked)
+
+    async def capture(updates):
+        entered.set()
+        await release.wait()
+
+    inbox = Mock(spec=MembershipInbox)
+    inbox.capture = AsyncMock(side_effect=capture)
+    bot = BotWrapper("123456789:" + "a" * 35, session=RecordingSession(), membership_inbox=inbox)
+    polling = asyncio.create_task(bot(GetUpdates(timeout=0)))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    assert not polling.done()
+    marked.assert_not_called()
+    release.set()
+    assert await polling == []
+    inbox.capture.assert_awaited_once_with([])
+    marked.assert_called_once_with()
+
+
+async def test_aiogram_keeps_offset_after_inbox_failure_and_retries_before_yield(monkeypatch):
+    marked = Mock()
+    monkeypatch.setattr("msu_hub_bot.telegram.wrapper.mark_poll_success", marked)
+
+    class PollSession(RecordingSession):
+        def __init__(self):
+            super().__init__()
+            self.offsets = []
+
+        async def make_request(self, bot, method, timeout=None):
+            self.offsets.append(method.offset)
+            return [Update(update_id=100 if len(self.offsets) < 3 else 101)]
+
+    session = PollSession()
+    inbox = Mock(spec=MembershipInbox)
+    inbox.capture = AsyncMock(side_effect=[MembershipInboxError("Membership inbox persistence failed"), None, None])
+    bot = BotWrapper("123456789:" + "a" * 35, session=session, membership_inbox=inbox)
+    updates = Dispatcher._listen_updates(
+        bot, polling_timeout=0, backoff_config=BackoffConfig(min_delay=0.001, max_delay=0.01, factor=2, jitter=0)
+    )
+    try:
+        first = await asyncio.wait_for(anext(updates), timeout=1)
+        assert first.update_id == 100 and session.offsets == [None, None]
+        assert marked.call_count == 1
+        second = await asyncio.wait_for(anext(updates), timeout=1)
+        assert second.update_id == 101 and session.offsets == [None, None, 101]
+        assert marked.call_count == 2
+    finally:
+        await updates.aclose()
+
+
+async def test_real_journal_is_committed_when_getupdates_returns(tmp_path):
+    update = Update(update_id=123, message=make_message(new_chat_members=[{"id": 42, "is_bot": False, "first_name": "Synthetic"}]))
+
+    class PollSession(RecordingSession):
+        async def make_request(self, bot, method, timeout=None):
+            return [update]
+
+    inbox = MembershipInbox(tmp_path / "inbox.sqlite3", 999, AsyncMock())
+    await inbox.open()
+    bot = BotWrapper("123456789:" + "a" * 35, session=PollSession(), membership_inbox=inbox)
+    try:
+        assert await bot(GetUpdates(timeout=0)) == [update]
+        assert await inbox.pending() == 1
+    finally:
+        await inbox.close()
+
+
+async def test_invalid_poll_result_cannot_be_acknowledged(monkeypatch):
+    marked = Mock()
+    monkeypatch.setattr("msu_hub_bot.telegram.wrapper.mark_poll_success", marked)
+
+    class InvalidSession(RecordingSession):
+        async def make_request(self, bot, method, timeout=None):
+            return [{"update_id": 123}]
+
+    inbox = Mock(spec=MembershipInbox)
+    bot = BotWrapper("123456789:" + "a" * 35, session=InvalidSession(), membership_inbox=inbox)
+    with pytest.raises(MembershipInboxError, match="invalid"):
+        await bot(GetUpdates(timeout=0))
+    inbox.capture.assert_not_called()
+    marked.assert_not_called()

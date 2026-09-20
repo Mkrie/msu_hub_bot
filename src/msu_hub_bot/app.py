@@ -17,6 +17,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode, UpdateType
 from aiogram.filters import Command
 from aiogram.types import MenuButtonWebApp, WebAppInfo
+from aiogram.utils.token import extract_bot_id
 from ccxt.async_support import binance
 
 from msu_hub_bot.storage.base import BotRepository
@@ -48,6 +49,7 @@ from msu_hub_bot.telegram.state import (
 )
 from msu_hub_bot.telegram.fsm_storage import FeatureFSMStorage
 from msu_hub_bot.telegram.deletions import MessageDeletions
+from msu_hub_bot.telegram.membership_inbox import MembershipInbox
 from msu_hub_bot.telegram.wrapper import BotWrapper
 from msu_hub_bot.providers.vk.api import VkApi
 from msu_hub_bot.events import EcosystemManager, EventsMiddleware
@@ -87,8 +89,10 @@ class Application:
     chess_matches: ChessMatchService
     reminders: ReminderService
     web_apps: WebAppLinks
+    membership_inbox: MembershipInbox
     web: WebServer | None = None
     _feature_task: asyncio.Task[None] | None = None
+    _membership_task: asyncio.Task[None] | None = None
     _closed: bool = False
 
     @classmethod
@@ -101,12 +105,20 @@ class Application:
             stack.push_async_callback(telemetry.close)
             session = AiohttpSession(proxy=settings.proxy or None, timeout=90)
             stack.push_async_callback(session.close)
-            bot = BotWrapper(
-                token=settings.bot_token, session=session, telemetry=telemetry, default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-            )
             supervisor = Supervisor(telemetry=telemetry)
             database = create_repository(settings, telemetry=telemetry)
             stack.push_async_callback(database.close)
+            membership_inbox = MembershipInbox(
+                settings.membership_inbox_path, extract_bot_id(settings.bot_token), database, telemetry=telemetry
+            )
+            stack.push_async_callback(membership_inbox.close)
+            bot = BotWrapper(
+                token=settings.bot_token,
+                session=session,
+                telemetry=telemetry,
+                membership_inbox=membership_inbox,
+                default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+            )
             features = FeatureStore(database)
             feature_worker = FeatureWorker(features, telemetry=telemetry)
             storage = FeatureFSMStorage(features)
@@ -241,6 +253,7 @@ class Application:
                 chess_matches,
                 reminders,
                 web_apps,
+                membership_inbox,
                 web,
             )
         except BaseException:
@@ -251,6 +264,7 @@ class Application:
         await self.telemetry.start()
         await self.database.check()
         await self.features.check()
+        await self.membership_inbox.open()
         identity = await self.bot.me()
         self.web_apps.username = identity.username or ""
         if self.web is not None:
@@ -260,6 +274,7 @@ class Application:
             )
         await self.bot.delete_webhook(drop_pending_updates=False)
         await self.health.start()
+        self._membership_task = self.supervisor.create_job(self.membership_inbox.run, trace=False)
         self._feature_task = self.supervisor.create_job(self.feature_worker.run, trace=False)
 
     async def close(self, *, hard_exit: Callable[[int], Any] = os._exit) -> None:
@@ -271,6 +286,7 @@ class Application:
         watchdog.daemon = True
         watchdog.start()
         self.supervisor.close_updates()
+        self.membership_inbox.stop()
         self.feature_worker.stop()
         drain_deadline = asyncio.get_running_loop().time() + DRAIN_SECONDS
         try:

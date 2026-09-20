@@ -71,6 +71,7 @@ jobs:
           HUB_CERT: ${{ secrets.HUB_CERT }}
           HUB_PKEY: ${{ secrets.HUB_PKEY }}
           HUB_LOGS_FILE: ${{ secrets.HUB_LOGS_FILE }}
+          HUB_MEMBERSHIP_INBOX_PATH: /data/membership-inbox.sqlite3
           HUB_HEALTH_CHECK_URL: ${{ secrets.HUB_HEALTH_CHECK_URL }}
           HUB_WEB_APP_URL: ${{ vars.HUB_WEB_APP_URL }}
           HUB_WEB_PORT: '8081'
