@@ -131,6 +131,18 @@ async def test_native_policy_long_caption_uses_photo_then_complete_text_with_one
     assert [method.reply_parameters.message_id for method in session.methods] == [71, 101, 102]
 
 
+@pytest.mark.parametrize("length,methods", [(8000, ["sendPhoto", "sendMessage", "sendMessage"]), (10000, ["sendPhoto", "sendDocument"])])
+async def test_soft_budget_counts_separate_media_before_choosing_complete_file(rig, length, methods):
+    _, session, target = rig
+    text = "x" * length
+    await send_response(target, text, photo=b"photo", policy=ResponsePolicy(rich=False))
+    assert [method.__api_method__ for method in session.methods] == methods
+    if methods[-1] == "sendDocument":
+        assert session.methods[-1].document.data.decode() == text
+    else:
+        assert "".join(method.text for method in session.methods[1:]) == text
+
+
 async def test_unsupported_rich_entity_uses_native_caption_without_losing_language(rig):
     _, session, target = rig
     await send_response(target, Pre("print('literal')", language="python"), photo=b"image")

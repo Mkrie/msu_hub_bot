@@ -350,7 +350,10 @@ async def _plan(
         return [native(value)]
     if not value.text:
         return [native()]
-    parts = _chunks(value, 4096, policy.soft_messages)
+    # A separate media message consumes one slot; Rich includes its photo in
+    # the first text-bearing message. Media + complete file may require two
+    # messages even when soft_messages=1, so no supplied content is discarded.
+    parts = _chunks(value, 4096, policy.soft_messages - int(bool(selected)))
     if parts is None:
         return _file_plan(value, media_bytes, policy, [native()] if selected else [])
     return ([native()] if selected else []) + [_text_method(part) for part in parts]
