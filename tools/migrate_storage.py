@@ -647,6 +647,10 @@ def transform_update(row: dict[str, Any], as_of: str) -> dict[str, Any]:
     )
     archive.id = UUID(row["id"])
     result = decode_object(archive.model_dump_json(exclude_unset=True))
+    # Historical restores deliberately target schema 5, before status clocks.
+    # Preserve observation times and sparse fields while projecting that RPC.
+    membership_fields = {"chat_id", "user_id", "observed_at", "status", "permissions"}
+    result["memberships"] = [{key: value for key, value in item.items() if key in membership_fields} for item in result["memberships"]]
     result["data"] = reference_payload(raw)
     message_sources: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
     pending: deque[Any] = deque([raw])

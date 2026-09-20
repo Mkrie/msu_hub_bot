@@ -27,11 +27,14 @@ from msu_hub_bot.storage.features import FeatureStore
 from msu_hub_bot.storage.models import (
     ArchivedUpdate,
     ChatObservation,
+    ChatMemberPage,
     ChatRecord,
     DirectoryCreate,
     DirectoryPatch,
     DirectoryRecord,
+    MembershipBatch,
     MembershipObservation,
+    MembershipState,
     MessageObservation,
     TopicObservation,
     UsageStats,
@@ -63,6 +66,7 @@ class _Health(BaseModel):
     schema_version: StrictInt
     bot_id: StrictInt = Field(gt=0, le=2**63 - 1)
     application_documents: StrictInt
+    memberships: StrictInt
 
 
 def _record(model: type[_Record], value: JsonValue) -> _Record:
@@ -266,7 +270,7 @@ class SupabaseRepository:
     async def check(self) -> None:
         def validate(value: JsonValue) -> None:
             result = _record(_Health, value)
-            if result.schema_version != 1 or result.bot_id != self._bot_id or result.application_documents != 1:
+            if result.schema_version != 1 or result.bot_id != self._bot_id or result.application_documents != 1 or result.memberships != 1:
                 raise RepositoryProtocolError()
 
         await self._rpc("health", {}, validate, operation="database.check")
@@ -311,6 +315,34 @@ class SupabaseRepository:
             messages=[_observation(value) for value in update.messages],
         )
         await self._rpc("archive_update", {"p_update": payload}, _void, operation="database.write", trace=False)
+
+    async def observe_memberships(self, batch: MembershipBatch) -> None:
+        payload: dict[str, JsonValue] = {
+            "update_id": batch.update_id,
+            "received_at": batch.received_at.isoformat(),
+            "users": [_observation(value) for value in batch.users],
+            "chats": [_observation(value) for value in batch.chats],
+            "memberships": [_observation(value) for value in batch.memberships],
+        }
+        await self._rpc("observe_memberships", {"p_observation": payload}, _void, operation="database.write", trace=False)
+
+    async def list_chat_members(
+        self, chat_id: int, *, state: MembershipState | None = "present", after_user_id: int | None = None, limit: int = 50
+    ) -> ChatMemberPage:
+        if type(chat_id) is not int or chat_id == 0 or not -(2**63) <= chat_id < 2**63:
+            raise ValueError("Membership queries require a valid chat identifier")
+        if state not in {None, "present", "absent", "unknown"}:
+            raise ValueError("Membership queries require a supported state")
+        if after_user_id is not None and (type(after_user_id) is not int or not -(2**63) <= after_user_id < 2**63):
+            raise ValueError("Membership queries require a valid pagination cursor")
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("Membership queries require a bounded limit")
+        return await self._rpc(
+            "list_chat_members",
+            {"p_chat_id": chat_id, "p_state": state, "p_after_user_id": after_user_id, "p_limit": limit},
+            lambda value: _record(ChatMemberPage, value),
+            trace=False,
+        )
 
     async def statistics(self, since: datetime) -> UsageStats:
         if since.tzinfo is None or since.utcoffset() is None:

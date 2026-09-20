@@ -145,3 +145,51 @@ def test_count_snapshot_deduplicates_without_adding_or_guessing_conflicting_tota
         reaction_observation(reactions=[{"key": "e:👍"}] * 257)
     with pytest.raises(ValidationError):
         reaction_observation(event_at="2026-09-18T00:00:00")
+
+
+def test_membership_sparse_candidates_keep_status_evidence_separate():
+    from msu_hub_bot.storage.models import MembershipBatch, MembershipObservation
+
+    row = MembershipObservation(chat_id=-1, user_id=1, observation_source="reply")
+    assert row.model_dump(exclude_unset=True) == {"chat_id": -1, "user_id": 1, "observation_source": "reply"}
+    legacy = MembershipObservation(chat_id=-1, user_id=1, status="administrator")
+    assert legacy.status_observed_at is None
+    batch = MembershipBatch(update_id=1, memberships=[row])
+    assert set(batch.model_dump()) == {"update_id", "received_at", "users", "chats", "memberships"}
+    with pytest.raises(ValidationError):
+        MembershipBatch(update_id=1, memberships=[row] * 513)
+    with pytest.raises(ValidationError):
+        MembershipBatch.model_validate({"update_id": 1, "data": {"text": "private-synthetic"}})
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"status": None},
+        {"status": "invented"},
+        {"status_observed_at": None},
+        {"status_event_id": None},
+        {"status_event_id": True},
+        {"status_event_id": 2**63},
+        {"status_source": "invented"},
+        {"status_source": None},
+        {"status_observed_at": "2026-01-01T00:00:00"},
+        {"observation_source": "invented"},
+        {"admin_lost_at": "2026-01-01T00:00:00Z"},
+    ],
+)
+def test_explicit_membership_evidence_requires_complete_typed_clock(changes):
+    from msu_hub_bot.storage.models import MembershipObservation
+
+    with pytest.raises(ValidationError):
+        MembershipObservation.model_validate(
+            {
+                "chat_id": -1,
+                "user_id": 1,
+                "status": "member",
+                "status_source": "chat_member",
+                "status_observed_at": "2026-01-01T00:00:00Z",
+                "status_event_id": 1,
+                **changes,
+            }
+        )

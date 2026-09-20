@@ -653,3 +653,26 @@ def test_target_command_never_embeds_credentials(tmp_path, command):
             tmp_path,
             999,
         )
+
+
+def test_historical_normalization_projects_memberships_to_schema5_without_changing_evidence():
+    records = message_records()
+    original = records["updates"][0]
+    user = original["data"]["message"]["from"]
+    stamp = original["data"]["message"]["date"]
+    event = {
+        "chat": original["data"]["message"]["chat"],
+        "from": user,
+        "date": stamp,
+        "old_chat_member": {"user": user, "status": "member"},
+        "new_chat_member": {"user": user, "status": "left"},
+    }
+    source = {**original, "data": {"update_id": 123, "chat_member": event}}
+    result = migration.transform_update(source, AS_OF)
+    subject = next(row for row in result["memberships"] if row["user_id"] == user["id"])
+    assert subject["status"] == "left"
+    assert subject["permissions"] == {"status": "left"}
+    assert datetime.fromisoformat(subject["observed_at"]) == datetime.fromtimestamp(stamp, UTC)
+    assert all(set(row) <= {"chat_id", "user_id", "observed_at", "status", "permissions"} for row in result["memberships"])
+    assert result["data"] == source["data"]
+    assert result["data"]["chat_member"]["new_chat_member"] == {"user": user, "status": "left"}

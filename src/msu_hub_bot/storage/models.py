@@ -10,6 +10,9 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, Str
 
 BigInt = Annotated[int, Field(strict=True, ge=-(2**63), lt=2**63)]
 PositiveBigInt = Annotated[int, Field(strict=True, gt=0, lt=2**63)]
+MembershipState = Literal["present", "absent", "unknown"]
+MembershipObservationSource = Literal["message", "reply", "callback", "reaction", "join_request", "membership"]
+MembershipStatusSource = Literal["chat_member", "my_chat_member", "service_join", "service_leave"]
 
 
 def utc_now() -> datetime:
@@ -20,9 +23,12 @@ class DatabaseModel(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
 
-class StoredRecord(DatabaseModel):
+class StoredResponse(DatabaseModel):
     # SELECT responses may gain columns before an older application is replaced.
     model_config = ConfigDict(extra="ignore", hide_input_in_errors=True)
+
+
+class StoredRecord(StoredResponse):
     id: UUID
     created: AwareDatetime
 
@@ -91,8 +97,81 @@ class MembershipObservation(DatabaseModel):
     chat_id: BigInt
     user_id: BigInt
     observed_at: AwareDatetime = Field(default_factory=utc_now)
+    observation_source: MembershipObservationSource | None = None
     status: str | None = None
+    status_observed_at: AwareDatetime | None = None
+    status_source: MembershipStatusSource | None = None
+    status_event_id: BigInt | None = None
+    admin_lost_at: AwareDatetime | None = None
     permissions: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def status_evidence(self) -> Self:
+        has_clock = any(value is not None for value in (self.status_source, self.status_observed_at, self.status_event_id))
+        if has_clock and (
+            self.status_source is None
+            or self.status not in {"creator", "administrator", "member", "restricted", "left", "kicked"}
+            or self.status_observed_at is None
+            or self.status_event_id is None
+        ):
+            raise ValueError("Explicit membership evidence requires a complete status clock")
+        if self.status is None and (self.status_observed_at is not None or self.status_event_id is not None):
+            raise ValueError("A membership status clock requires status evidence")
+        if self.admin_lost_at is not None and self.status_source != "my_chat_member":
+            raise ValueError("Admin loss requires the bot's membership evidence")
+        return self
+
+
+class MembershipBatch(DatabaseModel):
+    """Durable membership evidence without raw updates, messages or receipts."""
+
+    update_id: BigInt
+    received_at: AwareDatetime = Field(default_factory=utc_now)
+    users: list[UserObservation] = Field(default_factory=list, max_length=512)
+    chats: list[ChatObservation] = Field(default_factory=list, max_length=512)
+    memberships: list[MembershipObservation] = Field(default_factory=list, max_length=512)
+
+
+class ChatMemberRecord(StoredResponse):
+    chat_id: BigInt
+    user_id: BigInt
+    is_bot: StrictBool
+    first_name: str
+    last_name: str | None
+    username: str | None
+    state: MembershipState
+    status: str | None
+    status_observed_at: AwareDatetime | None
+    status_source: MembershipStatusSource | Literal["legacy"] | None
+    status_event_id: BigInt | None
+    is_member: StrictBool | None
+    observation_source: MembershipObservationSource | None
+    first_seen_at: AwareDatetime
+    last_seen_at: AwareDatetime
+
+
+class MembershipCoverage(StoredResponse):
+    """Observed bot availability cannot establish a complete Telegram roster."""
+
+    complete: Literal[False]
+    observed_count: Annotated[int, Field(strict=True, ge=0, lt=2**63)]
+    present_count: Annotated[int, Field(strict=True, ge=0, lt=2**63)]
+    absent_count: Annotated[int, Field(strict=True, ge=0, lt=2**63)]
+    unknown_count: Annotated[int, Field(strict=True, ge=0, lt=2**63)]
+    bot_state: MembershipState
+    bot_status: str | None
+    bot_status_observed_at: AwareDatetime | None
+    bot_status_source: MembershipStatusSource | Literal["legacy"] | None
+    bot_is_admin: StrictBool | None
+    admin_lost_at: AwareDatetime | None
+
+
+class ChatMemberPage(StoredResponse):
+    chat_id: BigInt
+    state: MembershipState | None
+    members: list[ChatMemberRecord] = Field(max_length=100)
+    next_after_user_id: BigInt | None
+    coverage: MembershipCoverage
 
 
 class TopicObservation(DatabaseModel):

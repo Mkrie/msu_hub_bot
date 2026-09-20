@@ -730,7 +730,8 @@ def test_retention_is_bounded_and_never_deletes_durable_entities(db):
     assert db.value("SELECT count(*) FROM msu_hub_private.mutation_journal WHERE relation_name IN ('updates','messages');") == 0
 
 
-def test_reply_does_not_extend_near_expiry_body_through_receipt_or_parent(db):
+def test_reply_does_not_extend_near_expiry_body_through_receipt_or_parent(application_db):
+    db = application_db
     now = datetime.now(UTC)
     older = Message.model_validate(
         {

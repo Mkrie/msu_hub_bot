@@ -16,7 +16,14 @@ from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import ExportM
 
 from msu_hub_bot.storage import supabase as module
 from msu_hub_bot.storage.features import FeatureProtocolError
-from msu_hub_bot.storage.models import ArchivedUpdate, ChatObservation, DirectoryPatch, UserObservation
+from msu_hub_bot.storage.models import (
+    ArchivedUpdate,
+    ChatObservation,
+    DirectoryPatch,
+    MembershipBatch,
+    MembershipObservation,
+    UserObservation,
+)
 from msu_hub_bot.storage.observations import archive_observation
 from msu_hub_bot.telegram.middlewares.settings import SettingsMiddleware
 from msu_hub_bot.telegram.middlewares.updates import UpdatesMiddleware
@@ -27,7 +34,7 @@ from telemetry_helpers import Capture, config
 CANARY = "synthetic-private-value"
 NOW = datetime(2026, 9, 17, tzinfo=UTC)
 BOT_ID = 123456789
-HEALTH = {"schema_version": 1, "bot_id": BOT_ID, "application_documents": 1}
+HEALTH = {"schema_version": 1, "bot_id": BOT_ID, "application_documents": 1, "memberships": 1}
 
 
 def token(name="one", expires=3600):
@@ -475,9 +482,13 @@ async def test_cancellation_propagates_and_closes_response(configured):
         {**HEALTH, "application_documents": 2},
         {**HEALTH, "application_documents": True},
         {**HEALTH, "application_documents": "1"},
+        {key: value for key, value in HEALTH.items() if key != "memberships"},
+        {**HEALTH, "memberships": 0},
+        {**HEALTH, "memberships": True},
+        {**HEALTH, "memberships": "1"},
     ],
 )
-async def test_health_rejects_wrong_contract_principal_or_missing_document_capability(configured, value):
+async def test_health_rejects_wrong_contract_principal_or_missing_storage_capability(configured, value):
     repo, _ = configured([Response(token()), Response(value)])
     try:
         with pytest.raises(module.RepositoryProtocolError):
@@ -766,5 +777,99 @@ async def test_reaction_scoreboard_rejects_malformed_or_unbounded_responses(conf
     try:
         with pytest.raises(module.RepositoryProtocolError):
             await repo.reaction_scoreboard(-100)
+    finally:
+        await repo.close()
+
+
+def membership_page(**changes):
+    return {
+        "chat_id": -100,
+        "state": "present",
+        "members": [],
+        "next_after_user_id": None,
+        "coverage": {
+            "complete": False,
+            "observed_count": 0,
+            "present_count": 0,
+            "absent_count": 0,
+            "unknown_count": 0,
+            "bot_state": "unknown",
+            "bot_status": None,
+            "bot_status_observed_at": None,
+            "bot_status_source": None,
+            "bot_is_admin": None,
+            "admin_lost_at": None,
+        },
+        **changes,
+    }
+
+
+async def test_membership_batch_has_no_raw_update_or_receipt_and_keeps_sparse_fields(configured):
+    repo, session = configured([Response(token()), Response(None, status=204, raw=b"")])
+    value = MembershipBatch(
+        update_id=42,
+        received_at=NOW,
+        users=[UserObservation(user_id=101, is_bot=False, first_name="Synthetic", observed_at=NOW)],
+        chats=[ChatObservation(chat_id=-100, type="supergroup", observed_at=NOW)],
+        memberships=[MembershipObservation(chat_id=-100, user_id=101, observed_at=NOW, observation_source="message")],
+    )
+    try:
+        await repo.observe_memberships(value)
+        url, request = session.calls[-1]
+        assert url.endswith("/rest/v1/rpc/observe_memberships_v1")
+        payload = request["json"]["p_observation"]
+        assert set(payload) == {"update_id", "received_at", "users", "chats", "memberships"}
+        assert payload["memberships"] == [
+            {"chat_id": -100, "user_id": 101, "observed_at": NOW.isoformat(), "observation_source": "message"}
+        ]
+        assert request["headers"]["Content-Profile"] == "msu_hub_api"
+    finally:
+        await repo.close()
+
+
+async def test_membership_reader_returns_typed_coverage_and_explicit_pagination(configured):
+    repo, session = configured([Response(token()), Response(membership_page(state=None))])
+    try:
+        result = await repo.list_chat_members(-100, state=None, after_user_id=101, limit=5)
+        assert result.members == [] and result.coverage.complete is False and result.coverage.bot_state == "unknown"
+        url, request = session.calls[-1]
+        assert url.endswith("/rest/v1/rpc/list_chat_members_v1")
+        assert request["json"] == {"p_chat_id": -100, "p_state": None, "p_after_user_id": 101, "p_limit": 5}
+    finally:
+        await repo.close()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"chat_id": True},
+        {"chat_id": 0},
+        {"chat_id": 2**63},
+        {"chat_id": "-100"},
+        {"state": "invented"},
+        {"limit": 0},
+        {"limit": 101},
+        {"limit": True},
+        {"after_user_id": True},
+        {"after_user_id": 2**63},
+        {"after_user_id": "101"},
+    ],
+)
+async def test_membership_query_bounds_are_validated_before_auth_or_network(configured, changes):
+    repo, session = configured([])
+    try:
+        with pytest.raises(ValueError):
+            await repo.list_chat_members(**{"chat_id": -100, **changes})
+        assert session.calls == []
+    finally:
+        await repo.close()
+
+
+@pytest.mark.parametrize("value", [None, [], membership_page(members=[{}]), membership_page(coverage={"complete": True})])
+async def test_membership_reader_rejects_incomplete_or_false_coverage_contract(configured, value):
+    repo, _ = configured([Response(token()), Response(value)])
+    try:
+        with pytest.raises(module.RepositoryProtocolError):
+            await repo.list_chat_members(-100)
     finally:
         await repo.close()
