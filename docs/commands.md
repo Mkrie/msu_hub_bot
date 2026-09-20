@@ -30,7 +30,7 @@ telemetry.
 
 ## Arguments and source selection
 
-- `str`, `int`, `float`, `bool`, enum and literal parameters consume positional
+- `str`, `int`, `float`, `bool`, enum and string-literal parameters consume positional
   tokens. Optional scalar types and Pydantic `Annotated` constraints are supported.
   An absent or invalid value uses the signature default. Without a default it
   produces usage guidance. `Argument(strict=True)` rejects invalid supplied
@@ -119,8 +119,11 @@ string semantics. Network failures never trigger an automatic alternate send.
 
 The default soft budget is three messages. If text needs more, its complete
 UTF-8 content becomes a `.txt` attachment; accompanying media is retained.
-`soft_messages=1` keeps figlet output to one message/file. `max_output_bytes`
-bounds the total known bytes of text and media (default 20 MiB, up to 50 MiB);
+`soft_messages=1` keeps figlet output to one message/file. A response containing
+media and overflowing text still needs two messages to preserve both the media
+and complete text file, even with a soft budget of one. `max_output_bytes`
+bounds the total known bytes of text, entity metadata and media (default 20 MiB,
+up to 50 MiB);
 Telegram's smaller per-kind limits still apply. Input/work limits such as
 figlet's 200 characters protect processing before output exists. Splitting
 respects entity boundaries and UTF-16 offsets. Text-file fallback contains
@@ -144,12 +147,14 @@ Replies preserve chat, topic, business context and reply threading. Each complet
 response uses the shared per-chat send lane. Local planning errors give guidance;
 `ResponseDeliveryError` records confirmed message IDs, attempted part and whether
 delivery is uncertain. Never retry an uncertain publication blindly. Cancellation
-propagates, and managed resources close after their worker stops using them.
+propagates, and managed acquisition/delivery resources close after the platform
+worker stops using them. Arbitrary executor jobs still require immutable snapshots
+or worker-owned resources; see [media execution](media-execution.md).
 
 Media strings normally mean Telegram `file_id`. A trusted provider URL can opt
 into `allow_remote_media=True`; Telegram then fetches it, as in GeoGuess. The bot
-cannot account for remote bytes locally, so only Telegram's limits apply to that
-media. General user-supplied URLs belong in the bounded provider download layer.
+cannot account for remote or reused `file_id` bytes locally, so only Telegram's
+limits apply to that media. General user-supplied URLs belong in the bounded provider download layer.
 Other specialized Telegram operations remain available through native aiogram.
 
 ## Optional argument resolution
@@ -170,5 +175,7 @@ Recent context is a bounded in-memory window of preceding human messages in the
 same chat and topic, excluding the current message and duplicate reply. It starts
 empty after restart and expires after 24 hours. Up to five messages plus the
 request/reply can inform translation; it is not a proactive chat classifier.
+Language inference samples up to 2,000 characters of selected text and 1,000
+characters per recent snippet. The full selected text still reaches translation.
 Model failures or unresolved choices produce usage guidance. Provider telemetry
 records bounded numeric usage and failures, never prompts or conversation text.
