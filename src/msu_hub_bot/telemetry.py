@@ -71,6 +71,7 @@ class Environment(StrEnum):
 
 class Provider(StrEnum):
     TELEGRAM = "telegram"
+    JEV = "jev"
     JDOODLE = "jdoodle"
     WIT = "wit"
     WOLFRAM = "wolfram"
@@ -135,6 +136,8 @@ OPERATIONS = frozenset(
         "http.request",
         "web.request",
         "jdoodle.execute",
+        "jev.classify",
+        "intent.execute",
         "wit.recognize",
         "wolfram.query",
         "fxembed.fetch",
@@ -188,6 +191,7 @@ UPDATE_KINDS = frozenset(
 METRIC_KEYS = {"boundary", "operation", "outcome", "provider", "backend", "update.kind", *JOB_METRIC_KEYS}
 MEDIA_METRIC_KEYS = {"provider", "media.kind", "media.reason", "outcome"}
 LINK_METRIC_KEYS = {"provider", "link.stage", "link.reason", "outcome"}
+_INTENT_COMMANDS = frozenset({"pdf", "text", "bg", "song", "anime", "none"})
 _MEDIA_SIZE_BUCKETS = (0, 65536, 1048576, 4194304, 16777216, 67108864, 134217728, 1073741824)
 _MEDIA_READY = frozenset({MediaReason.READY, MediaReason.READY_REDUCED})
 
@@ -567,15 +571,18 @@ class Operation:
         *,
         media_record: Callable[[MediaKind, MediaReason, int, int, float], None] | None = None,
         link_record: Callable[[LinkDiagnostic], None] | None = None,
+        intent_record: Callable[[int | None, int | None, float | None], None] | None = None,
     ) -> None:
         self.owner, self._span = owner, span
         self.outcome = Outcome.SUCCESS
         self.active = True
         self.failure: dict[str, str | int] = {}
-        self.details: dict[str, str | int] = {}
+        self.details: dict[str, str | int | float] = {}
         self._link_record = link_record
         self._media_record = media_record
         self._media = _MediaSummary() if media_record is not None else None
+        self._intent_record = intent_record
+        self._intent_recorded = False
 
     def _owned(self) -> bool:
         try:
@@ -589,6 +596,42 @@ class Operation:
             self.set_outcome(_link_outcome(reason))
             if self._span is not None:
                 self._span.set_attributes(self.details)
+
+    def intent_result(
+        self,
+        command: str,
+        confidence: float,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        cost: float | None = None,
+    ) -> None:
+        """Record one classifier result and its reported usage without request content."""
+        if not self._owned() or self._intent_record is None or self._intent_recorded:
+            return
+        if (
+            type(command) is not str
+            or command not in _INTENT_COMMANDS
+            or type(confidence) not in {int, float}
+            or not 0 <= confidence <= 1
+            or not math.isfinite(confidence)
+            or any(value is not None and (type(value) is not int or not 0 <= value <= 10**12) for value in (input_tokens, output_tokens))
+            or (cost is not None and (type(cost) not in {int, float} or not 0 <= cost <= 10**6 or not math.isfinite(cost)))
+        ):
+            return
+        self._intent_recorded = True
+        self.details.update({"intent.command": command, "intent.confidence": float(confidence)})
+        if input_tokens is not None:
+            self.details["gen_ai.usage.input_tokens"] = input_tokens
+        if output_tokens is not None:
+            self.details["gen_ai.usage.output_tokens"] = output_tokens
+        if cost is not None:
+            self.details["intent.cost_usd"] = float(cost)
+        try:
+            if self._span is not None:
+                self._span.set_attributes(self.details)
+            self._intent_record(input_tokens, output_tokens, float(cost) if cost is not None else None)
+        except Exception:
+            logger.warning("Telemetry intent diagnostics failed")
 
     def link_diagnostics(self, diagnostics: Sequence[LinkDiagnostic]) -> None:
         if not self._owned() or self._link_record is None:
@@ -811,7 +854,7 @@ class Telemetry:
             attributes["handler"] = handler
         if isinstance(command, str) and command.casefold() in self.command_keys:
             attributes["command"] = command.casefold()
-            if command_kind in {"slash", "hashtag"}:
+            if command_kind in {"slash", "hashtag", "mention"}:
                 attributes["command.kind"] = command_kind
         token = _request.set(_RequestContext(tuple(attributes.items())))
         try:
@@ -924,6 +967,10 @@ class Telemetry:
                     View(instrument_name="bot.media.assets", meter_name="msu_hub_bot.telemetry", attribute_keys=MEDIA_METRIC_KEYS),
                     View(instrument_name="bot.links.attempts", meter_name="msu_hub_bot.telemetry", attribute_keys=LINK_METRIC_KEYS),
                     View(instrument_name="bot.links.steps", meter_name="msu_hub_bot.telemetry", attribute_keys=LINK_METRIC_KEYS),
+                    *[
+                        View(instrument_name=name, meter_name="msu_hub_bot.telemetry", attribute_keys={"provider"})
+                        for name in ("bot.intent.input_tokens", "bot.intent.output_tokens", "bot.intent.cost")
+                    ],
                     View(
                         instrument_name="bot.media.download.attempts", meter_name="msu_hub_bot.telemetry", attribute_keys=MEDIA_METRIC_KEYS
                     ),
@@ -961,6 +1008,9 @@ class Telemetry:
             self._media_assets = meter.create_counter("bot.media.assets", unit="1")
             self._link_attempts = meter.create_counter("bot.links.attempts", unit="1")
             self._link_steps = meter.create_counter("bot.links.steps", unit="1")
+            self._intent_input_tokens = meter.create_counter("bot.intent.input_tokens", unit="{token}")
+            self._intent_output_tokens = meter.create_counter("bot.intent.output_tokens", unit="{token}")
+            self._intent_cost = meter.create_counter("bot.intent.cost", unit="USD")
             self._media_attempts = meter.create_counter("bot.media.download.attempts", unit="1")
             self._media_duration = meter.create_histogram("bot.media.download.duration", unit="s")
             self._media_size = meter.create_histogram("bot.media.download.size", unit="By")
@@ -1033,7 +1083,9 @@ class Telemetry:
     def _operation_log(self, boundary: Boundary, handle: Operation, attributes: dict[str, str | int], duration: float) -> None:
         failed = handle.outcome not in {Outcome.SUCCESS, Outcome.IGNORED, Outcome.CANCELLED}
         span = handle._span
-        if attributes.get("operation") == "links.preview":
+        if boundary is Boundary.PROVIDER and attributes.get("operation") == "jev.classify" and attributes.get("provider") == "jev":
+            event = "bot.intent.classified"
+        elif attributes.get("operation") == "links.preview":
             event = "bot.link.completed"
         elif attributes.get("operation") == "links.step":
             if not failed:
@@ -1092,6 +1144,17 @@ class Telemetry:
             attributes = {"boundary": boundary.value, "operation": operation, "outcome": outcome.value, **labels}
             self._count.add(1, attributes)
             self._duration.record(max(0, duration), attributes)
+
+    def _record_intent_usage(self, input_tokens: int | None, output_tokens: int | None, cost: float | None) -> None:
+        if not self._available():
+            return
+        attributes = {"provider": Provider.JEV.value}
+        if input_tokens is not None:
+            self._intent_input_tokens.add(input_tokens, attributes)
+        if output_tokens is not None:
+            self._intent_output_tokens.add(output_tokens, attributes)
+        if cost is not None:
+            self._intent_cost.add(cost, attributes)
 
     def _record_link_step(
         self, diagnostic: LinkDiagnostic, provider: Provider | None, parent: Operation, attributes: dict[str, str | int]
@@ -1221,7 +1284,14 @@ class Telemetry:
                     attributes,
                 )
 
-        handle = Operation(owner, span, media_record=record_asset if boundary is Boundary.MEDIA and key == "x.media.prepare" else None)
+        handle = Operation(
+            owner,
+            span,
+            media_record=record_asset if boundary is Boundary.MEDIA and key == "x.media.prepare" else None,
+            intent_record=self._record_intent_usage
+            if boundary is Boundary.PROVIDER and key == "jev.classify" and provider is Provider.JEV
+            else None,
+        )
         if key == "links.preview":
             handle._link_record = lambda diagnostic: self._record_link_step(diagnostic, provider, handle, attributes)
         token = _current.set(handle)
@@ -1268,7 +1338,7 @@ class Telemetry:
                     span.set_attribute("outcome", handle.outcome.value)
                     if handle.outcome is Outcome.UNEXPECTED:
                         span.set_status(StatusCode.ERROR)
-                if boundary is not Boundary.DISPATCH:
+                if boundary is not Boundary.DISPATCH or key == "intent.execute":
                     self._measure(boundary, key, handle.outcome, duration, **labels)
                 if key == "links.preview":
                     self._link_attempts.add(

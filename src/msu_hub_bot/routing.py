@@ -45,6 +45,8 @@ from msu_hub_bot.commands.chess import Chess
 from msu_hub_bot.commands.chess_play import ChessPlay, ChessRating, RatingCallback
 from msu_hub_bot.commands.chess_play_view import PlayCallback
 from msu_hub_bot.commands.help import HelpMessage
+from msu_hub_bot.commands.intents import process_intent
+from msu_hub_bot.telegram.mentions import IntentMention
 from msu_hub_bot.commands.infra import (
     process_create_infra_chat,
     process_delete_infra_chat,
@@ -206,6 +208,12 @@ def build_router(*, wit: Wit, wolfram: WolframAPI, config: Settings) -> Router:
         SlashCommand("cancel"),
         F.content_type == ContentType.TEXT,
         flags={"handler_key": "process_cancel", "fsm_release": False},
+    )
+    group("intents").message.register(
+        process_intent,
+        StateFilter(None),
+        IntentMention(enabled=settings.jev_enabled),
+        flags={"handler_key": "process_intent", "fsm_release": True, "automatic_previews": False},
     )
     group("errors").message.register(
         process_donate,

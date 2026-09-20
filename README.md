@@ -8,6 +8,26 @@ The runtime uses aiogram 3, Pydantic 2 and Supabase. Dependencies are locked for
 reproducible builds. External tools depend on their providers' availability
 and configuration; see the bot's `/help` for commands.
 
+## Ask with a reply
+
+Reply to an attachment and mention the bot: `@msu_hub_bot сделай PDF`,
+`@msu_hub_bot вытащи текст` or `@msu_hub_bot убери фон`. Russian and English
+requests can select one of `/pdf`, `/text`, `/bg`, `/song` and `/anime`.
+Clear requests run the existing command; uncertain requests get a hint.
+PDF conversion accepts documents, OCR/background/anime accept images, and
+song identification accepts audio or video. Files remain subject to command limits.
+
+This entry requires both a mention and a reply; it does not inspect chat history.
+Active conversations retain their `/cancel` behavior. Ordinary commands work as before.
+Only the instruction and coarse attachment types go to Jev through OpenRouter;
+the replied-to text, files, filenames and Telegram identities stay out of classification.
+
+Operators enable it with `HUB_JEV_ENABLED=true` and `HUB_OPENROUTER_API_KEY`.
+`HUB_JEV_CONFIDENCE` controls the execution threshold (default `0.8`);
+confidence is a routing signal, not a guarantee of correctness.
+The provider is optional and does not run when disabled. Each user can have one
+request in flight, with a five-second cooldown; four requests can run concurrently.
+
 ## Chat quizzes
 
 `/geoguess` asks you to locate a photo; `/chess` asks for the best move in a

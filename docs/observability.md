@@ -30,7 +30,7 @@ The preparation span summarizes asset counts, attempts, omission categories and 
 | Storage boundary | Add a `storage.operation` child span with a named application operation, backend and outcome. |
 | Background job | Own a bounded `job.run` span and failure handling. Link to the initiating trace when useful; do not keep an update span open for a delayed job. |
 
-Callbacks and FSM steps use explicit handler keys, not callback payloads or state data. Command context comes from matched `MetaInfo` or `CommandObject`: only a registered keyword and its slash/hashtag kind, never arguments or a bot mention. Dispatch failures before handler selection use a small, sanitized `bot.dispatch` failure span. Do not create a trace for each `getUpdates` request, empty poll, readiness heartbeat or ignored chat message.
+Callbacks and FSM steps use explicit handler keys, not callback payloads or state data. Command context comes from matched `MetaInfo` or `CommandObject`: only a registered keyword and its slash/hashtag kind, never arguments or a bot username. On-demand intent execution binds its chosen registered keyword with kind `mention`. Dispatch failures before handler selection use a small, sanitized `bot.dispatch` failure span. Do not create a trace for each `getUpdates` request, empty poll, readiness heartbeat or ignored chat message.
 
 Polling explicitly subscribes to every update kind supported by the installed Telegram client, including passive reaction and membership events. Successful reaction archival contributes storage and dispatch metrics without a per-reaction trace. Reactions never enter conversation state; their channel actor, if present, is distinct from a human user.
 
@@ -43,7 +43,7 @@ Construct telemetry from an allowlist before calling the SDK. The following fiel
 | Allowed | Constraints |
 | --- | --- |
 | Service, environment and release | Fixed service name, deployment environment enum and public release identifier. No hostnames, filesystem roots or private repository metadata. |
-| Handler, command, update kind and operation | Names chosen from application registrations or fixed enums. Command kind is slash or hashtag. No arguments or dynamically generated names. |
+| Handler, command, update kind and operation | Names chosen from application registrations or fixed enums. Command kind is slash, hashtag or mention. No arguments or dynamically generated names. |
 | Telegram identity | Numeric `telegram.user_id`, `telegram.actor_chat_id`, `telegram.chat_id`, `telegram.message_id`, `telegram.update_id`, `telegram.thread_id` and `telegram.reply_to_message_id` when available. A reaction's channel actor remains separate from a human user. Outgoing requests may add `telegram.target_chat_id` and `telegram.target_message_id`. Never metric labels. |
 | Outcome and failure category | Fixed values such as success, rejected, unavailable, timeout, cancelled or unexpected; a vetted exception class or provider error category. |
 | Provider and backend | Configured type/name enum, not account, endpoint or instance identifiers. |
@@ -56,6 +56,23 @@ Numeric Telegram IDs deliberately support investigations across requests and hel
 Never export message text, captions, command arguments, prompts, speech/transcripts, replies, names, usernames, Telegram file IDs, callback data, reaction emoji or custom emoji IDs, locations, file contents or user-provided filenames. Hashing a prohibited value does not make it permitted.
 
 Never export credentials, environment snapshots, connection strings, headers, cookies, resolved media URLs, HTTP bodies, SQL text or arbitrary query parameters. The sole URL exception is the link source contract below. Telegram credentials can appear in URL paths; provider keys can appear in query strings. Allowing a field called `url` is therefore insufficient protection.
+
+### On-demand intent routing
+
+An explicit mention with a reply owns one `process_intent` handler span. `jev.classify`
+is its provider operation; `bot.intent.classified` logs its fixed result or failure
+even when the trace is unsampled. Allowed result fields are `intent.command` from the
+five-command catalogue or `none`, finite `intent.confidence`, provider-reported
+`gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` and `intent.cost_usd`.
+Missing usage remains unknown. `bot.intent.input_tokens`, `bot.intent.output_tokens`
+and `bot.intent.cost` count reported usage independently of sampling, with only the
+fixed provider label. They exclude upstream charges for responses with no valid usage.
+
+Selected execution uses `intent.execute` under the original request identity and
+chosen command context. It measures execution separately without counting a second
+handler. No instruction, replied-to contents, filename, full API response or history
+is exported. An uncertain classification is not proof that a command ran; inspect
+the execution operation and its outcome.
 
 ### Link extraction
 

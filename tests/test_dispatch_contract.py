@@ -75,6 +75,7 @@ def is_added_route(handler):
         "Remind.process_cb",
         "process_app",
         "process_app_start",
+        "process_intent",
     }
 
 
@@ -83,7 +84,7 @@ def test_every_route_preserves_order_and_aliases():
     counts = Counter(route["event"] for route in CONTRACT["routes"])
     for kind, count in counts.items():
         actual = routes(root, "error" if kind == "errors" else kind)
-        extra = {"message": 10, "edited_message": 1, "callback_query": 5}.get(kind, 0)
+        extra = {"message": 11, "edited_message": 1, "callback_query": 5}.get(kind, 0)
         assert len(actual) == count + extra
         retained = [handler for handler in actual if not is_added_route(handler)]
         expected = [route for route in CONTRACT["routes"] if route["event"] == kind]
