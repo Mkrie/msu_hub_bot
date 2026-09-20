@@ -111,10 +111,9 @@ async def acquire_media(meta: MetaInfo, declaration: MediaDeclaration, annotatio
     cache_media(meta, declaration, source, media)
     if media is None:
         return source, None
-    if (media.file_size or 0) > declaration.max_bytes:
-        raise InputError("Файл слишком большой. Пришли файл поменьше.")
     meta._input_limits[media.file_id] = declaration.max_bytes
     requested = representation(annotation)
+    # Metadata consumers own their branch-specific admission, download and failure policy.
     if requested not in (bytes, io.BytesIO, Path, Image.Image):
         return source, media
     stream = await bounded_download(media, meta, declaration.max_bytes, resources)
@@ -130,27 +129,36 @@ async def acquire_media(meta: MetaInfo, declaration: MediaDeclaration, annotatio
         path.write_bytes(stream.getvalue())
         return source, path
 
+    payload = stream.getvalue()
+
     def decode() -> Image.Image:
-        image = Image.open(stream)
-        try:
-            validate_dimensions(*image.size)
-            image.load()
-        except BaseException:
-            image.close()
-            raise
-        return image
+        # The worker owns an independent stream even if event-loop shutdown cancels its Task.
+        with io.BytesIO(payload) as owned:
+            image = Image.open(owned)
+            try:
+                validate_dimensions(*image.size)
+                image.load()
+            except BaseException:
+                image.close()
+                raise
+            return image
 
     task = asyncio.create_task(asyncio.to_thread(decode))
     try:
         image = await asyncio.shield(task)
     except asyncio.CancelledError:
-        # The worker still owns its stream: join before closing invocation resources.
-        try:
-            image = await task
-        except Exception:
-            pass
-        else:
-            image.close()
+        # A second cancellation must not abandon the worker's returned image.
+        while True:
+            try:
+                image = await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if task.cancelled():
+                    break
+            except Exception:
+                break
+            else:
+                image.close()
+                break
         raise
     except UnidentifiedImageError, OSError, Image.DecompressionBombError, MediaDimensionsError:
         raise InputError("Не удалось открыть изображение. Пришли картинку поменьше.") from None
@@ -159,6 +167,15 @@ async def acquire_media(meta: MetaInfo, declaration: MediaDeclaration, annotatio
 
 
 async def bounded_download(media: DownloadableMedia, meta: MetaInfo, limit: int, resources: ExitStack) -> io.BytesIO:
+    if cached := meta._downloads.get(media.file_id):
+        if cached.closed:
+            raise RuntimeError("Command input was closed before its invocation completed")
+        if cached.getbuffer().nbytes > limit:
+            raise InputError("Файл слишком большой. Пришли файл поменьше.")
+        cached.seek(0)
+        return cached
+    if (media.file_size or 0) > limit:
+        raise InputError("Файл слишком большой. Пришли файл поменьше.")
     try:
         stream = await download(media, bot_for(meta.message), max_bytes=limit)
     except DownloadTooLarge:

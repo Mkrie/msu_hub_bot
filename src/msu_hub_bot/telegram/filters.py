@@ -80,6 +80,8 @@ class MetaInfo:
         duration: int | None = None,
         supports_streaming: bool | None = None,
         allow_sending_without_reply: bool = False,
+        allow_remote_media: bool = False,
+        request_timeout: int | None = None,
     ) -> Message: ...
 
     @overload
@@ -100,6 +102,8 @@ class MetaInfo:
         duration: int | None = None,
         supports_streaming: bool | None = None,
         allow_sending_without_reply: bool = False,
+        allow_remote_media: bool = False,
+        request_timeout: int | None = None,
     ) -> list[Message]: ...
 
     @overload
@@ -120,6 +124,8 @@ class MetaInfo:
         duration: int | None = None,
         supports_streaming: bool | None = None,
         allow_sending_without_reply: bool = False,
+        allow_remote_media: bool = False,
+        request_timeout: int | None = None,
     ) -> Message | list[Message]: ...
 
     async def reply(
@@ -139,6 +145,8 @@ class MetaInfo:
         duration: int | None = None,
         supports_streaming: bool | None = None,
         allow_sending_without_reply: bool = False,
+        allow_remote_media: bool = False,
+        request_timeout: int | None = None,
     ) -> Message | list[Message]:
         """Send prepared output using this invocation's policy and selected input source."""
         from msu_hub_bot.telegram.responses import ResponsePolicy, send_response
@@ -159,6 +167,8 @@ class MetaInfo:
             duration=duration,
             supports_streaming=supports_streaming,
             allow_sending_without_reply=allow_sending_without_reply,
+            allow_remote_media=allow_remote_media,
+            request_timeout=request_timeout,
         )
 
     def extract_text(self) -> tuple[Message, str]:

@@ -535,6 +535,9 @@ async def test_cancelled_image_decode_keeps_stream_alive_until_worker_exits(bot,
         task.cancel()
         await asyncio.sleep(0)
         assert not task.done() and not payload.closed
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done() and not payload.closed
         release.set()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -542,3 +545,42 @@ async def test_cancelled_image_decode_keeps_stream_alive_until_worker_exits(bot,
     finally:
         release.set()
         await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_text_and_local_document_reuse_one_bounded_download(bot, monkeypatch):
+    stream = io.BytesIO(b"document contents")
+    mocked = AsyncMock(return_value=stream)
+    monkeypatch.setattr(acquisition, "download", mocked)
+    seen = []
+
+    @MetaCommand("text", text=TextInput(document=True), document=DocumentInput())
+    async def command(text: str, document: Path) -> None:
+        seen.append((text, document.read_text()))
+
+    await invoke_command(
+        command, make_message(bot, caption="/text", document=Document(file_id="doc", file_unique_id="d", mime_type="text/plain"))
+    )
+    assert seen == [("document contents", "document contents")]
+    mocked.assert_awaited_once()
+    assert stream.closed
+
+
+async def test_metadata_limits_remain_with_consumer_but_download_limits_apply_before_fetch(bot, monkeypatch):
+    mocked = AsyncMock()
+    monkeypatch.setattr(acquisition, "download", mocked)
+    seen = []
+
+    @MetaCommand("meta", document=DocumentInput(max_bytes=10))
+    async def metadata(document: Document) -> None:
+        seen.append(document.file_size)
+
+    @MetaCommand("local", document=DocumentInput(max_bytes=10))
+    async def local(document: Path) -> None:
+        pytest.fail("Oversized download reached the handler")
+
+    document = Document(file_id="doc", file_unique_id="d", file_size=11)
+    await invoke_command(metadata, make_message(bot, caption="/meta", document=document))
+    await invoke_command(local, make_message(bot, caption="/local", document=document))
+    assert seen == [11]
+    mocked.assert_not_awaited()
+    assert "слишком большой" in bot.session.methods[0].text
