@@ -20,7 +20,7 @@
           "spec": {
             "display": {
               "name": "Telemetry age",
-              "description": "Seconds since the newest production metric. Amber after 60s, red after 180s; empty means no observation in the selected window."
+              "description": "Seconds since the newest production metric. With 60s collection: amber after 90s, red after 180s; empty means no observation in the selected window."
             },
             "plugin": {
               "kind": "Values",
@@ -31,7 +31,7 @@
                   "decimalPlaces": 1
                 },
                 "statusThresholds": {
-                  "warning": 60,
+                  "warning": 90,
                   "critical": 180
                 }
               }

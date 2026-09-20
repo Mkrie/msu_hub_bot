@@ -20,7 +20,7 @@
           "spec": {
             "display": {
               "name": "Queue snapshot age",
-              "description": "Seconds since the worker last read queue state. Stale or missing evidence requires attention."
+              "description": "Seconds since the worker last read queue state, including sample age. With 60s metric collection: amber after 120s, red after 180s."
             },
             "plugin": {
               "kind": "Values",
@@ -30,8 +30,8 @@
                   "decimalPlaces": 0
                 },
                 "statusThresholds": {
-                  "warning": 60,
-                  "critical": 90
+                  "warning": 120,
+                  "critical": 180
                 }
               }
             },
