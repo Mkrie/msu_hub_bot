@@ -279,6 +279,38 @@ async def test_lazy_network_media_is_rejected_before_transport(rig, source):
     assert session.methods == []
 
 
+async def test_explicit_native_remote_media_preserves_url_and_request_timeout(rig, monkeypatch):
+    _, session, target = rig
+    original = session.make_request
+    timeouts = []
+
+    async def request(bot, method, timeout=None):
+        timeouts.append(timeout)
+        return await original(bot, method, timeout)
+
+    monkeypatch.setattr(session, "make_request", request)
+    await send_response(
+        target,
+        "caption",
+        photo="https://upload.wikimedia.org/approved.jpg",
+        allow_remote_media=True,
+        request_timeout=15,
+        fixed=True,
+    )
+    assert session.methods[0].photo == "https://upload.wikimedia.org/approved.jpg"
+    assert timeouts == [15]
+
+
+@pytest.mark.parametrize(
+    "source", ["file:///private/file", "https://user:password@example.test/photo", URLInputFile("https://example.test")]
+)
+async def test_remote_opt_in_does_not_allow_local_fetch_streams_or_non_web_urls(rig, source):
+    _, session, target = rig
+    with pytest.raises(ResponseError):
+        await send_response(target, photo=source, allow_remote_media=True, fixed=True)
+    assert session.methods == []
+
+
 async def test_oversize_path_and_invalid_combination_fail_without_sends(rig, tmp_path):
     _, session, target = rig
     path = tmp_path / "large"

@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from itertools import islice
 from pathlib import Path
 from typing import Literal, overload
+from urllib.parse import urlsplit
 from weakref import WeakKeyDictionary
 
 from aiogram import Bot
@@ -173,12 +174,22 @@ async def _prepare_bytes(prepare: Callable[[], bytes]) -> bytes:
         raise
 
 
-async def _media(source: MediaSource, kind: OutputKind, limit: int) -> tuple[str | InputFile, int]:
+async def _media(source: MediaSource, kind: OutputKind, limit: int, *, allow_remote_media: bool) -> tuple[str | InputFile, int]:
     limit = min(limit, (10 if kind == "photo" else 50) * 1024 * 1024)
     name = {"photo": "image.png", "video": "video.mp4", "document": "document.bin", "audio": "audio.mp3"}[kind]
     if isinstance(source, str):
-        if not source or len(source) > 4096 or "://" in source or any(char.isspace() for char in source):
+        if not source or len(source) > 4096 or any(char.isspace() for char in source):
             raise ResponseError("Передайте Telegram file_id или уже загруженный файл вместо URL.")
+        if "://" in source:
+            try:
+                url = urlsplit(source)
+                valid = url.scheme in {"http", "https"} and bool(url.hostname) and url.username is None and url.password is None
+            except ValueError:
+                valid = False
+            if not allow_remote_media or not valid:
+                raise ResponseError("Передайте Telegram file_id или уже загруженный файл вместо URL.")
+            # Telegram fetches an already-approved provider URL. Its native
+            # limits apply; local byte accounting cannot measure remote media.
         return source, 0
     if isinstance(source, Image.Image):
         if kind not in {"photo", "document"}:
@@ -283,6 +294,7 @@ async def _plan(
     height: int | None,
     duration: int | None,
     supports_streaming: bool | None,
+    allow_remote_media: bool,
 ) -> list[TelegramMethod[Message]]:
     if target.ephemeral_message_id is not None or target.message_id <= 0:
         raise ResponseError("На это сообщение нельзя отправить обычный ответ.")
@@ -306,7 +318,7 @@ async def _plan(
     kind: OutputKind | None = None
     if selected:
         kind, source = selected[0]
-        media, media_bytes = await _media(source, kind, policy.max_output_bytes)
+        media, media_bytes = await _media(source, kind, policy.max_output_bytes, allow_remote_media=allow_remote_media)
     if value.size_bytes + media_bytes > policy.max_output_bytes:
         raise ResponseLimitError("Результат слишком большой. Уменьшите объём запроса.")
 
@@ -371,6 +383,8 @@ async def send_response(
     duration: int | None = ...,
     supports_streaming: bool | None = ...,
     allow_sending_without_reply: bool = ...,
+    allow_remote_media: bool = ...,
+    request_timeout: int | None = ...,
     progress: ResponseProgress | None = ...,
 ) -> Message: ...
 
@@ -393,6 +407,8 @@ async def send_response(
     duration: int | None = ...,
     supports_streaming: bool | None = ...,
     allow_sending_without_reply: bool = ...,
+    allow_remote_media: bool = ...,
+    request_timeout: int | None = ...,
     progress: ResponseProgress | None = ...,
 ) -> list[Message]: ...
 
@@ -415,6 +431,8 @@ async def send_response(
     duration: int | None = ...,
     supports_streaming: bool | None = ...,
     allow_sending_without_reply: bool = ...,
+    allow_remote_media: bool = ...,
+    request_timeout: int | None = ...,
     progress: ResponseProgress | None = ...,
 ) -> Message | list[Message]: ...
 
@@ -436,9 +454,15 @@ async def send_response(
     duration: int | None = None,
     supports_streaming: bool | None = None,
     allow_sending_without_reply: bool = False,
+    allow_remote_media: bool = False,
+    request_timeout: int | None = None,
     progress: ResponseProgress | None = None,
 ) -> Message | list[Message]:
     """Plan before sending; fixed sends never change the requested native kind."""
+    if type(allow_remote_media) is not bool or (
+        request_timeout is not None and (type(request_timeout) is not int or not 1 <= request_timeout <= 300)
+    ):
+        raise ResponseError("Некорректные параметры доставки ответа.")
     bot = bot_for(target)
     state = progress if progress is not None else ResponseProgress()
     if state.phase != "preparing" or state.confirmed or state.attempted_part is not None:
@@ -457,6 +481,7 @@ async def send_response(
                 height=height,
                 duration=duration,
                 supports_streaming=supports_streaming,
+                allow_remote_media=allow_remote_media,
             )
             state.total_parts, state.phase = len(plan), "waiting"
             async with _send_lane(bot, target.chat.id):
@@ -476,7 +501,7 @@ async def send_response(
                     )
                     state.attempted_part, state.phase, state.uncertain = index, "sending", True
                     try:
-                        result = await bot(method)
+                        result = await bot(method, request_timeout=request_timeout)
                     except Exception as error:
                         state.uncertain = not isinstance(
                             error,

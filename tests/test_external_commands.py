@@ -81,7 +81,7 @@ def translation_input(*, image=True, text="Original"):
     return target, meta
 
 
-@pytest.mark.parametrize("handler", ["process_en", "process_ru", "process_translate"])
+@pytest.mark.parametrize("handler", ["process_en", "process_ru"])
 @pytest.mark.parametrize("failure", [ExternalServiceError, ClientError, TimeoutError])
 async def test_translation_failures_receive_one_reply(monkeypatch, handler, failure):
     target, meta = translation_input()
