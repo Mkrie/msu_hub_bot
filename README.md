@@ -141,6 +141,8 @@ database history and operational contracts live in `dbschema/` and `docs/`.
 For contributor-owned persistence, use the [typed feature store](docs/feature-persistence.md).
 It provides versioned documents, atomic changes and durable jobs; chess and geoguess
 share a quiz service that keeps rounds, votes and daily scores across process restarts.
+The [membership reader](docs/memberships.md) exposes known chat participants with
+status evidence and coverage limits, without periodic membership checks.
 
 Ruff exceptions are limited to specific files. Strict mypy coverage expands
 monotonically as modules are typed; new application modules must be included.

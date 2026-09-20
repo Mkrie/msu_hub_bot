@@ -8,4 +8,5 @@
 - [Rich input](rich_input.py) exposes nested text/media to explicit reply tools; keep attribution and quoted links out of automatic command/URL dispatch.
 - Check callback state ownership, expiry and concurrent updates when changing interactive flows.
 - Keep reply formatting, cancellation and middleware ordering explicit when adapting Telegram APIs.
+- [Membership ingestion](../../../docs/memberships.md) commits direct status evidence before polling acknowledgement; preserve its persistent inbox and independent archive receipt lifecycle.
 - Treat command parsing, state eligibility, callback formats and delivery context as compatibility contracts. Verify aiogram behavior in `references/aiogram` and Telegram semantics in `references/telegram-bot-api` from the repository root before choosing adapters or defaults.

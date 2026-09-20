@@ -44,7 +44,8 @@ def test_archive_extracts_reply_forward_entity_and_membership_users():
     assert {item.chat_id for item in row.chats} == {-1001, -1002}
     memberships = {item.user_id: item for item in row.memberships}
     assert memberships[50].status == "member" and memberships[60].status == "left"
-    assert "status" not in memberships[10].model_fields_set
+    assert 10 not in memberships  # sender_chat owns this message; from is a compatibility sender.
+    assert "status" not in memberships[20].model_fields_set
     assert row.topics[0].title == "Synthetic topic" and row.topics[0].is_closed is False
     assert {item.message_id for item in row.messages} == {1, 2}
     assert row.messages[0].reply_to_message_id == 2
@@ -210,7 +211,11 @@ def test_reaction_receipts_preserve_event_fields_without_inventing_message_bodie
         42,
         NOW,
     )
-    assert row.memberships == [] and row.topics == []
+    assert row.topics == []
+    assert len(row.memberships) == (1 if kind == "message_reaction" else 0)
+    if row.memberships:
+        assert row.memberships[0].observation_source == "reaction"
+        assert "status" not in row.memberships[0].model_fields_set
 
 
 @pytest.mark.parametrize("actor", ["user", "actor_chat"])
@@ -237,7 +242,12 @@ def test_reaction_actor_snapshots_use_new_selection_and_clamp_profile_dates(acto
     assert row.reaction.event_at == changed
     assert row.reaction.previous_active is True
     assert all(profile.observed_at == changed for profile in row.users + row.chats)
-    assert row.messages == [] and row.topics == [] and row.memberships == []
+    assert row.messages == [] and row.topics == []
+    assert len(row.memberships) == (1 if actor == "user" else 0)
+    if row.memberships:
+        assert row.memberships[0].user_id == 10
+        assert row.memberships[0].observed_at == changed
+        assert "status" not in row.memberships[0].model_fields_set
     assert row.data["message_reaction"]["old_reaction"] == [{"type": "emoji", "emoji": "❤"}]
 
 

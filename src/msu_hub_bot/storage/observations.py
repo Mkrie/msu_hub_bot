@@ -9,8 +9,10 @@ from typing import Any, cast
 
 from aiogram.client.default import Default
 from aiogram.types import (
+    CallbackQuery,
     Chat,
     ChatFullInfo,
+    ChatJoinRequest,
     ChatMemberUpdated,
     Message,
     MessageOriginChannel,
@@ -30,6 +32,7 @@ from pydantic import JsonValue, TypeAdapter
 from msu_hub_bot.storage.models import (
     ArchivedUpdate,
     ChatObservation,
+    MembershipBatch,
     MembershipObservation,
     MessageObservation,
     ReactionObservation,
@@ -207,16 +210,53 @@ def archive_observation(
         observed_at: datetime,
         status: str | None = None,
         permissions: dict[str, JsonValue] | None = None,
+        *,
+        observation_source: str = "membership",
+        status_observed_at: datetime | None = None,
+        status_source: str | None = None,
+        status_event_id: int | None = None,
+        admin_lost_at: datetime | None = None,
     ) -> None:
         key = (chat_id, user_id)
         previous = memberships.get(key)
-        if previous is None or observed_at > previous.observed_at or (observed_at == previous.observed_at and status is not None):
-            values: dict[str, Any] = {"chat_id": chat_id, "user_id": user_id, "observed_at": observed_at}
-            if status is not None:
-                values["status"] = status
-            if permissions is not None:
-                values["permissions"] = permissions
-            memberships[key] = MembershipObservation.model_validate(values)
+        values: dict[str, Any] = (
+            previous.model_dump(exclude_unset=True)
+            if previous is not None
+            else {
+                "chat_id": chat_id,
+                "user_id": user_id,
+            }
+        )
+        if (
+            previous is None
+            or observed_at > previous.observed_at
+            or (observed_at == previous.observed_at and previous.observation_source == "reply" and observation_source != "reply")
+        ):
+            values.update(observed_at=observed_at, observation_source=observation_source)
+        if admin_lost_at is not None and (previous is None or previous.admin_lost_at is None or admin_lost_at > previous.admin_lost_at):
+            values["admin_lost_at"] = admin_lost_at
+        if status is not None:
+            stamp = status_observed_at or observed_at
+
+            # Activity and status have independent clocks. A fresh reply must not
+            # erase an older join notice discovered inside the same update.
+            def order(timestamp: datetime, source: str | None, event_id: int | None) -> tuple[datetime, int, int]:
+                return timestamp, 2 if source in {"chat_member", "my_chat_member"} else 1, event_id or 0
+
+            if (
+                previous is None
+                or previous.status_observed_at is None
+                or order(stamp, status_source, status_event_id)
+                >= order(previous.status_observed_at, previous.status_source, previous.status_event_id)
+            ):
+                values.update(
+                    status=status,
+                    permissions=permissions or {},
+                    status_observed_at=stamp,
+                    status_source=status_source,
+                    status_event_id=status_event_id,
+                )
+        memberships[key] = MembershipObservation.model_validate(values)
 
     while queue and len(visited) < 512:
         value, depth, observed_at = queue.popleft()
@@ -233,6 +273,7 @@ def archive_observation(
             value,
             (
                 ChatMemberUpdated,
+                ChatJoinRequest,
                 MessageOriginUser,
                 MessageOriginChat,
                 MessageOriginChannel,
@@ -248,16 +289,61 @@ def archive_observation(
             if value.id not in chats or observed_at > chats[value.id].observed_at:
                 chats[value.id] = chat_observation(value, observed_at)
         elif isinstance(value, ChatMemberUpdated):
-            permissions = _payload(value.new_chat_member)
-            permissions.pop("user", None)
-            membership(value.chat.id, value.new_chat_member.user.id, observed_at, value.new_chat_member.status, permissions)
+            permissions = {
+                key: item
+                for key, item in _payload(value.new_chat_member).items()
+                if key != "user" and key in type(value.new_chat_member).model_fields
+            }
+            membership(
+                value.chat.id,
+                value.new_chat_member.user.id,
+                observed_at,
+                value.new_chat_member.status,
+                permissions,
+                status_source="my_chat_member" if value is update.my_chat_member else "chat_member",
+                status_event_id=update.update_id,
+                admin_lost_at=observed_at
+                if value is update.my_chat_member
+                and value.old_chat_member.status in {"creator", "administrator"}
+                and value.new_chat_member.status not in {"creator", "administrator"}
+                else None,
+            )
+        elif isinstance(value, CallbackQuery):
+            if value.message is not None:
+                membership(value.message.chat.id, value.from_user.id, observed_at, observation_source="callback")
+        elif isinstance(value, MessageReactionUpdated):
+            if value.user is not None:
+                membership(value.chat.id, value.user.id, observed_at, observation_source="reaction")
+        elif isinstance(value, ChatJoinRequest):
+            membership(value.chat.id, value.from_user.id, observed_at, observation_source="join_request")
         elif isinstance(value, Message):
-            if value.from_user is not None:
-                membership(value.chat.id, value.from_user.id, observed_at)
+            if value.from_user is not None and value.sender_chat is None:
+                membership(
+                    value.chat.id,
+                    value.from_user.id,
+                    observed_at,
+                    observation_source="message" if depth == 1 else "reply",
+                )
             for user in value.new_chat_members or []:
-                membership(value.chat.id, user.id, observed_at, "member")
+                membership(
+                    value.chat.id,
+                    user.id,
+                    observed_at,
+                    "member",
+                    status_observed_at=min(received_at, value.date),
+                    status_source="service_join",
+                    status_event_id=value.message_id,
+                )
             if value.left_chat_member is not None:
-                membership(value.chat.id, value.left_chat_member.id, observed_at, "left")
+                membership(
+                    value.chat.id,
+                    value.left_chat_member.id,
+                    observed_at,
+                    "left",
+                    status_observed_at=min(received_at, value.date),
+                    status_source="service_leave",
+                    status_event_id=value.message_id,
+                )
             if value.message_thread_id is not None:
                 topic_values: dict[str, Any] = {
                     "chat_id": value.chat.id,
@@ -328,4 +414,86 @@ def archive_observation(
         topics=list(topics.values()),
         messages=list(messages.values()),
         reaction=_reaction_observation(update),
+    )
+
+
+def membership_batch(update: Update, *, received_at: datetime | None = None) -> MembershipBatch | None:
+    """Extract only direct status evidence for the durable polling inbox.
+
+    Message bodies, nested replies, arbitrary profiles and receipt payloads
+    stay out of the inbox. Ordinary archival retains their separate lifecycle.
+    """
+    event = update.chat_member or update.my_chat_member
+    message = update.message or update.edited_message or update.channel_post or update.edited_channel_post
+    received_at = received_at or datetime.now(UTC)
+    memberships: dict[int, MembershipObservation] = {}
+    if event is not None:
+        new = event.new_chat_member
+        subjects = {new.user.id: new.user}
+        source_chat = event.chat
+        stamp = min(received_at, event.date)
+        permissions = _JSON_OBJECT.validate_python(
+            _wire(new.model_dump(mode="python", include=set(type(new).model_fields) - {"user"}), None)
+        )
+        memberships[new.user.id] = MembershipObservation(
+            chat_id=source_chat.id,
+            user_id=new.user.id,
+            observed_at=stamp,
+            observation_source="membership",
+            status=new.status,
+            permissions=permissions,
+            status_observed_at=stamp,
+            status_source="my_chat_member" if update.my_chat_member is not None else "chat_member",
+            status_event_id=update.update_id,
+            admin_lost_at=stamp
+            if update.my_chat_member is not None
+            and event.old_chat_member.status in {"creator", "administrator"}
+            and new.status not in {"creator", "administrator"}
+            else None,
+        )
+    elif message is not None:
+        source_chat = message.chat
+        stamp = min(received_at, message.date)
+        subjects = {user.id: user for user in message.new_chat_members or []}
+        for user in subjects.values():
+            memberships[user.id] = MembershipObservation(
+                chat_id=source_chat.id,
+                user_id=user.id,
+                observed_at=stamp,
+                observation_source="membership",
+                status="member",
+                permissions={},
+                status_observed_at=stamp,
+                status_source="service_join",
+                status_event_id=message.message_id,
+            )
+        if message.left_chat_member is not None:
+            user = message.left_chat_member
+            subjects[user.id] = user
+            memberships[user.id] = MembershipObservation(
+                chat_id=source_chat.id,
+                user_id=user.id,
+                observed_at=stamp,
+                observation_source="membership",
+                status="left",
+                permissions={},
+                status_observed_at=stamp,
+                status_source="service_leave",
+                status_event_id=message.message_id,
+            )
+    else:
+        return None
+    if not subjects:
+        return None
+    chat = Chat.model_validate(source_chat.model_dump(include={"id", *_CHAT_FIELDS}))
+    users = [
+        _user_observation(User.model_validate(user.model_dump(include={"id", *_USER_FIELDS})), stamp).model_copy(update={"profile": {}})
+        for user in subjects.values()
+    ]
+    return MembershipBatch(
+        update_id=update.update_id,
+        received_at=received_at,
+        users=users,
+        chats=[chat_observation(chat, stamp).model_copy(update={"profile": {}})],
+        memberships=list(memberships.values()),
     )
