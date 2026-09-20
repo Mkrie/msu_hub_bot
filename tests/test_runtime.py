@@ -96,7 +96,7 @@ async def test_missing_feature_schema_stops_startup_before_telegram(app_settings
     db.close.assert_awaited_once()
 
 
-async def test_polling_explicitly_subscribes_to_all_kinds_and_preserves_backlog(app_settings, boundaries, monkeypatch):
+async def test_polling_excludes_inline_mode_and_preserves_backlog(app_settings, boundaries, monkeypatch):
     from msu_hub_bot.app import Application
 
     session, _ = boundaries
@@ -108,11 +108,15 @@ async def test_polling_explicitly_subscribes_to_all_kinds_and_preserves_backlog(
         application.bot,
         polling_timeout=60,
         handle_as_tasks=True,
-        allowed_updates=[kind.value for kind in UpdateType],
+        allowed_updates=[kind.value for kind in UpdateType if kind not in {UpdateType.INLINE_QUERY, UpdateType.CHOSEN_INLINE_RESULT}],
         close_bot_session=False,
     )
     subscribed = start_polling.call_args.kwargs["allowed_updates"]
-    assert {"message_reaction", "message_reaction_count", "chat_member", "business_message", "poll_answer"} <= set(subscribed)
+    assert {"callback_query", "message_reaction", "message_reaction_count", "chat_member", "business_message", "poll_answer"} <= set(
+        subscribed
+    )
+    assert not {"inline_query", "chosen_inline_result"} & set(subscribed)
+    assert not {"inline_query", "chosen_inline_result"} & set(application.dispatcher.resolve_used_update_types())
     assert next(method for method in session.methods if isinstance(method, DeleteWebhook)).drop_pending_updates is False
     assert session.closed
 

@@ -6779,31 +6779,6 @@
     }
   },
   {
-    "type": "register_inline_handler",
-    "handler": "process_inline",
-    "aliases": [],
-    "routing": {
-      "key": "inline_query:process_inline",
-      "event": "inline_query",
-      "event_order": 0,
-      "registration_order": 429,
-      "filters": [
-        {
-          "type": "StateFilter",
-          "states": [
-            null
-          ]
-        }
-      ],
-      "runtime_aliases": []
-    },
-    "registration": {
-      "handler": "process_inline",
-      "filters": [],
-      "options": {}
-    }
-  },
-  {
     "type": "register_message_handler",
     "handler": "process_echo",
     "aliases": [],

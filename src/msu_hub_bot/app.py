@@ -62,10 +62,10 @@ from msu_hub_bot.telemetry import Backend, Telemetry, TelemetryConfig
 
 logger = logging.getLogger(__name__)
 
-# Subscribe to every supported kind, including passive history and reactions.
+# Retain passive history and reactions while excluding disabled inline mode.
 # Handler-derived defaults omit middleware-only events; Telegram's empty-list
 # default also excludes reaction and membership changes.
-ALLOWED_UPDATES: list[str] = [kind.value for kind in UpdateType]
+ALLOWED_UPDATES: list[str] = [kind.value for kind in UpdateType if kind not in {UpdateType.INLINE_QUERY, UpdateType.CHOSEN_INLINE_RESULT}]
 SHUTDOWN_SECONDS = 85.0
 DRAIN_SECONDS = 65.0
 

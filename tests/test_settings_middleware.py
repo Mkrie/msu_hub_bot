@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from aiogram.types import CallbackQuery, Chat, InlineQuery, Message, User
+from aiogram.types import CallbackQuery, Chat, Message, PollAnswer, User
 from pydantic import ValidationError
 
 from msu_hub_bot.telegram.middlewares.settings import Settings, SettingsMiddleware
@@ -76,15 +76,17 @@ async def test_concurrent_callbacks_share_preferences_and_preserve_extras(storag
     db.load_settings.assert_awaited_once()
 
 
-async def test_inline_query_has_no_previous_chat_preferences(storage):
+async def test_poll_answer_has_no_previous_chat_preferences(storage):
     db, _, _ = storage
     seen = []
 
     async def handler(event, data):
         seen.append(dict(data))
 
-    inline = InlineQuery(id="inline", query="text", offset="", from_user=User(id=10, is_bot=False, first_name="Friend"))
-    await SettingsMiddleware(db)(handler, inline, {"settings": Settings()})
+    answer = PollAnswer(
+        poll_id="poll", option_ids=[0], option_persistent_ids=["option"], user=User(id=10, is_bot=False, first_name="Friend")
+    )
+    await SettingsMiddleware(db)(handler, answer, {"settings": Settings()})
     assert seen == [{}]
     db.load_settings.assert_not_awaited()
 

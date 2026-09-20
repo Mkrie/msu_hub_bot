@@ -19,6 +19,8 @@ song identification accepts audio or video. Files remain subject to command limi
 
 This entry requires both a mention and a reply; it does not inspect chat history.
 Active conversations retain their `/cancel` behavior. Ordinary commands work as before.
+Keep Telegram's inline mode disabled in BotFather so typing the bot's username
+does not open inline search.
 Only the instruction and coarse attachment types go to Jev through OpenRouter;
 the replied-to text, files, filenames and Telegram identities stay out of classification.
 

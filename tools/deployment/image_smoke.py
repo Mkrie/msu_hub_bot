@@ -389,6 +389,7 @@ async def main():
         assert count("message") == 272
         assert count("callback_query") == 24
         assert count("edited_message") == 149
+        assert count("inline_query") == count("chosen_inline_result") == 0
         from PIL import ImageFont
 
         from msu_hub_bot.execution.sed import sed_calc

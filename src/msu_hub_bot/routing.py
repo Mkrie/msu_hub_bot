@@ -50,7 +50,6 @@ from msu_hub_bot.telegram.mentions import IntentMention
 from msu_hub_bot.commands.infra import (
     process_create_infra_chat,
     process_delete_infra_chat,
-    process_inline,
     process_links,
     process_pin,
     process_pin_all,
@@ -1008,7 +1007,6 @@ def build_router(*, wit: Wit, wolfram: WolframAPI, config: Settings) -> Router:
         StateFilter(None),
         flags={"handler_key": "process_pookie_pook", "fsm_release": True},
     )
-    group("infra").inline_query.register(process_inline, flags={"handler_key": "process_inline", "fsm_release": True})
     group("control").message.register(
         process_echo, F.chat.id == settings.echo_chat_id, StateFilter(None), flags={"handler_key": "process_echo", "fsm_release": True}
     )

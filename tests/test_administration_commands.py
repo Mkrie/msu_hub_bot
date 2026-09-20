@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.methods import AnswerInlineQuery, ForwardMessage, GetChatMember
-from aiogram.types import Chat, ChatMemberAdministrator, ChatMemberMember, ChatMemberOwner, InlineQuery, Message, User
+from aiogram.methods import ForwardMessage, GetChatMember
+from aiogram.types import Chat, ChatMemberAdministrator, ChatMemberMember, ChatMemberOwner, Message, User
 
 from msu_hub_bot.commands import admin, debug, infra
 from msu_hub_bot.settings import settings
@@ -149,19 +149,6 @@ async def test_status_uses_native_member_variants_and_bad_request_marker(monkeyp
     text = replies.call_args.args[0]
     assert "Chat 1: ✅ ✅" in text and "Chat 2: ✅ ❌" in text
     assert "Chat 3: ❌ ❌" in text and "Chat 4: 💔 💔" in text
-
-
-async def test_inline_directory_uses_valid_nested_content_and_handles_expired_query(monkeypatch):
-    query = InlineQuery(id="synthetic", from_user=user(), query="", offset="")
-    answer = AsyncMock(return_value=True)
-    monkeypatch.setattr(InlineQuery, "answer", answer)
-    em = SimpleNamespace(text=AsyncMock(return_value="<b>Links</b>"))
-    assert await infra.process_inline(query, em)
-    article = answer.call_args.kwargs["results"][0]
-    assert article.input_message_content.message_text == "<b>Links</b>"
-    assert answer.call_args.kwargs["cache_time"] == 600
-    answer.side_effect = TelegramBadRequest(method=AnswerInlineQuery(inline_query_id="synthetic", results=[]), message="expired")
-    assert await infra.process_inline(query, em)
 
 
 async def test_debug_json_preserves_telegram_aliases_dates_and_redacts_tokens(replies):

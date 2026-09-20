@@ -6,7 +6,6 @@
     "callback_query": 19,
     "edited_message": 148,
     "channel_post": 3,
-    "inline_query": 1,
     "errors": 1
   },
   "routes": [
@@ -19513,32 +19512,6 @@
         }
       },
       "key": "channel_post:process_pookie_pook"
-    },
-    {
-      "registration_order": 429,
-      "event": "inline_query",
-      "event_order": 0,
-      "handler": "process_inline",
-      "module": "commands.infra",
-      "source": {
-        "file": "hub_bot/main.py",
-        "line": 323
-      },
-      "aliases": [],
-      "filters": [
-        {
-          "type": "StateFilter",
-          "states": [
-            null
-          ]
-        }
-      ],
-      "registration": {
-        "handler": "process_inline",
-        "filters": [],
-        "options": {}
-      },
-      "key": "inline_query:process_inline"
     },
     {
       "registration_order": 430,

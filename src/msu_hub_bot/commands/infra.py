@@ -1,8 +1,6 @@
-from contextlib import suppress
-
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import ChatMemberAdministrator, ChatMemberOwner, InlineQuery, InlineQueryResultArticle, InputTextMessageContent, Message
+from aiogram.types import ChatMemberAdministrator, ChatMemberOwner, Message
 from aiogram.utils.markdown import hbold
 
 from msu_hub_bot.storage.base import BotRepository
@@ -109,12 +107,3 @@ async def process_status(message: Message, bot: BotWrapper, db: BotRepository) -
     for chat_id, first, second in completed:
         text += f"— {chats[chat_id].name}: {first} {second}\n"
     return await message.reply(text)
-
-
-async def process_inline(inline_query: InlineQuery, em: EcosystemManager) -> bool:
-    text = await em.text()
-    content = InputTextMessageContent(message_text=text)
-    item = InlineQueryResultArticle(id="0", title="Все чаты МГУ", input_message_content=content)
-    with suppress(TelegramBadRequest):
-        return await inline_query.answer(results=[item], is_personal=False, cache_time=10 * 60)
-    return True
