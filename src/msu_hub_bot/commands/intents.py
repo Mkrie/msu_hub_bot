@@ -82,7 +82,7 @@ class IntentCommands:
         )
         if not (metadata.image or metadata.document or metadata.audio or metadata.video):
             return await message.reply("В ответе нужен файл, картинка или запись со звуком.\n\n" + HELP)
-        # The old handlers prefer invocation media. This entry only accepts a
+        # Command handlers prefer invocation media. This entry only accepts a
         # text request, so their real reply remains the single possible source.
         if (
             await SimpleExtractor.image(message) is not None

@@ -378,13 +378,15 @@ async def main():
     settings.supabase_key = "synthetic-publishable-key"
     settings.supabase_email = "bot@example.invalid"
     settings.supabase_password = "synthetic-password"
+    settings.jev_enabled = True
+    settings.openrouter_api_key = "synthetic-openrouter-key"
     app = await Application.create(settings)
     try:
 
         def count(event):
             return sum(len(router.observers[event].handlers) for router in app.dispatcher.chain_tail)
 
-        assert count("message") == 271
+        assert count("message") == 272
         assert count("callback_query") == 24
         assert count("edited_message") == 149
         from PIL import ImageFont

@@ -90,10 +90,12 @@ Required reviewers are intentionally not enabled.
 
 | Setting | Storage |
 | --- | --- |
-| `HUB_*` application configuration from `.env.example`, except telemetry controls below | Production environment secrets |
+| `HUB_*` application configuration from `.env.example`, except overrides below | Production environment secrets |
 | `LOGFIRE_TOKEN` (optional project write token) | Production environment secret; sent only when export is enabled |
 | `HUB_TELEMETRY_ENABLED`, `HUB_TELEMETRY_SAMPLE_RATE` | Production environment variables; defaults `false` and `0.1` |
 | `HUB_WEB_APP_URL` | Production environment variable; HTTPS origin, empty disables the Mini App |
+| `OPENROUTER_API_KEY` | Production environment secret; mapped to `HUB_OPENROUTER_API_KEY` only in the deployment step |
+| `HUB_JEV_ENABLED`, `HUB_JEV_CONFIDENCE` | Production environment variables; defaults `false` and `0.8` |
 | `HUB_STORAGE_CONTRACT` | Workflow-owned data compatibility marker; do not override for rollback |
 | `HUB_ENVIRONMENT`, `HUB_RELEASE` | Set by the workflow to `production` and the public release revision |
 | `DEPLOY_SSH_KEY` | Production environment secret; dedicated private deployment key |
