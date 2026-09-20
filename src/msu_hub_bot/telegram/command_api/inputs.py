@@ -1,6 +1,7 @@
 """Explicit acquisition rules for typed command parameters."""
 
 from dataclasses import dataclass
+from typing import Literal
 
 from msu_hub_bot.media.limits import MAX_DOWNLOAD_BYTES
 
@@ -66,15 +67,20 @@ class DocumentInput:
 
 @dataclass(frozen=True, slots=True)
 class MediaInput:
-    """Prefer any attached media over reply media; profile photos are an opt-in fallback."""
+    """Prefer allowed attached media over reply media; profile photos are an opt-in fallback."""
 
     reply: bool = True
     avatar: bool = False
     max_bytes: int = MAX_DOWNLOAD_BYTES
+    kinds: tuple[Literal["image", "video", "document", "audio"], ...] = ("image", "video", "document", "audio")
 
     def __post_init__(self) -> None:
         if self.max_bytes <= 0:
             raise ValueError("max_bytes must be positive")
+        if not self.kinds or any(kind not in {"image", "video", "document", "audio"} for kind in self.kinds):
+            raise ValueError("MediaInput kinds must select image, video, document or audio")
+        if self.avatar and "image" not in self.kinds:
+            raise ValueError("Avatar fallback requires the image kind")
 
 
 type MediaDeclaration = ImageInput | VideoInput | DocumentInput | MediaInput

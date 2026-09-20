@@ -56,21 +56,21 @@ async def select_media(meta: MetaInfo, declaration: MediaDeclaration) -> tuple[M
         meta.message, Extractor.ReplyPolicy.prefer_origin if declaration.reply else Extractor.ReplyPolicy.only_origin
     )
     for target in targets:
-        if isinstance(declaration, (VideoInput, MediaInput)):
+        if isinstance(declaration, VideoInput) or isinstance(declaration, MediaInput) and "video" in declaration.kinds:
             video = await SimpleExtractor.video(target)
             if video is not None:
                 return target, video
             if target.document is not None and (target.document.mime_type or "").startswith("video/"):
                 return target, target.document
-        if isinstance(declaration, (ImageInput, MediaInput)):
+        if isinstance(declaration, ImageInput) or isinstance(declaration, MediaInput) and "image" in declaration.kinds:
             image = await SimpleExtractor.image(target)
             if image is not None:
                 return target, image
-        if isinstance(declaration, (DocumentInput, MediaInput)):
+        if isinstance(declaration, DocumentInput) or isinstance(declaration, MediaInput) and "document" in declaration.kinds:
             document = await SimpleExtractor.document(target)
             if document is not None:
                 return target, document
-        if isinstance(declaration, MediaInput) and (sound := target.audio or target.voice):
+        if isinstance(declaration, MediaInput) and "audio" in declaration.kinds and (sound := target.audio or target.voice):
             return target, sound
     if isinstance(declaration, (ImageInput, MediaInput)) and declaration.avatar:
         for target in reversed(targets):

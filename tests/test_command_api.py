@@ -187,6 +187,48 @@ async def test_origin_media_beats_different_reply_type(bot):
     assert seen == ["photo"]
 
 
+@pytest.mark.parametrize(
+    "unsupported",
+    [
+        {"document": {"file_id": "doc", "file_unique_id": "d", "mime_type": "application/pdf"}},
+        {"audio": {"file_id": "audio", "file_unique_id": "a", "duration": 1}},
+        {"voice": {"file_id": "voice", "file_unique_id": "v", "duration": 1}},
+    ],
+)
+async def test_caption_media_ignores_unsupported_files_and_falls_back_to_avatar(bot, monkeypatch, unsupported):
+    photo = PhotoSize(file_id="avatar", file_unique_id="p", width=10, height=10)
+    avatar = AsyncMock(return_value=photo)
+    monkeypatch.setattr(acquisition.SimpleExtractor, "profile_photo", avatar)
+    seen = []
+
+    @MetaCommand("meme", media=MediaInput(kinds=("image", "video"), avatar=True))
+    async def command(media: DownloadableMedia) -> None:
+        seen.append(media)
+
+    message = make_message(bot, caption="/meme", **unsupported)
+    await invoke_command(command, message)
+    assert seen == [photo]
+    avatar.assert_awaited_once_with(message)
+
+
+async def test_allowed_reply_media_precedes_avatar_when_origin_kind_is_excluded(bot, monkeypatch):
+    avatar = AsyncMock()
+    monkeypatch.setattr(acquisition.SimpleExtractor, "profile_photo", avatar)
+    seen = []
+
+    @MetaCommand("meme", media=MediaInput(kinds=("image", "video"), avatar=True))
+    async def command(media: DownloadableMedia) -> None:
+        seen.append(media.file_id)
+
+    reply = make_message(bot, photo=[PhotoSize(file_id="photo", file_unique_id="p", width=10, height=10)])
+    message = make_message(
+        bot, caption="/meme", document=Document(file_id="doc", file_unique_id="d", mime_type="application/pdf"), reply_to_message=reply
+    )
+    await invoke_command(command, message)
+    assert seen == ["photo"]
+    avatar.assert_not_awaited()
+
+
 async def test_resolver_gets_raw_request_named_di_and_can_change_selected_text(bot):
     marker = object()
     seen = []
