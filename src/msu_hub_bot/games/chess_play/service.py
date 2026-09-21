@@ -198,6 +198,8 @@ class ChessMatchService:
             current = await self.get(row.value.game.chat_id, row.value.game.token)
             if current is None:
                 raise GameError("Приглашение уже недоступно.")
+            if not self._destination_matches(current.value.game, message):
+                raise GameError("Доска появилась вне исходной темы приглашения.")
             if current.value.publication == "bound" and current.value.game.message_id == message.message_id:
                 return
             if current.value.publication != "publishing" or self.clock() >= current.value.publication_due:
@@ -205,6 +207,7 @@ class ChessMatchService:
             value = current.value.model_copy(deep=True)
             value.game.message_id = message.message_id
             value.game.thread_id = message.message_thread_id if message.is_topic_message else None
+            value.game.is_topic_message = bool(message.is_topic_message)
             value.publication = "bound"
             try:
                 await self._transition(current, value)
@@ -256,6 +259,7 @@ class ChessMatchService:
                 bot_id=self.bot.id,
                 chat_id=message.chat.id,
                 thread_id=message.message_thread_id if message.is_topic_message else None,
+                is_topic_message=bool(message.is_topic_message),
                 white=self._player(user),
                 white_rating=INITIAL_RATING if rating is None else rating.value.rating,
                 created_at=now.timestamp(),
@@ -317,13 +321,20 @@ class ChessMatchService:
             )
         return None
 
+    @staticmethod
+    def _destination_matches(game: Game, message: Message) -> bool:
+        # Legacy records may contain a non-forum reply thread in thread_id.
+        # New records distinguish that case from a required forum destination.
+        return (
+            message.chat.id == game.chat_id
+            and (game.is_topic_message is None or bool(message.is_topic_message) == game.is_topic_message)
+            and (not message.is_topic_message or message.message_thread_id is not None and message.message_thread_id == game.thread_id)
+        )
+
     def _message_matches(self, row: Record[SavedMatch], message: Message) -> bool:
         game = row.value.game
-        # Ordinary replies can have their own thread ID; only forum topics
-        # identify the destination. Bot/chat/message checks still bind the board.
         if (
-            message.chat.id != game.chat_id
-            or (message.is_topic_message and message.message_thread_id != game.thread_id)
+            not self._destination_matches(game, message)
             or message.from_user is None
             or message.from_user.id != self.bot.id
             or not message.from_user.is_bot

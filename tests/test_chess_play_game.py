@@ -429,6 +429,9 @@ def test_rejected_atomic_transition_does_not_leave_a_partial_move():
         {"chat_id": 0},
         {"chat_id": False},
         {"thread_id": 0},
+        {"is_topic_message": True, "thread_id": None},
+        {"is_topic_message": False, "thread_id": 17},
+        {"is_topic_message": 1, "thread_id": 17},
         {"message_id": -1},
         {"revision": 2**31},
         {"white_rating": -1_000_001},
@@ -443,6 +446,15 @@ def test_invalid_saved_boundaries_are_rejected_without_defaulting(changes):
     raw.update(changes)
     with pytest.raises(ValueError):
         Game.model_validate(raw)
+
+
+def test_old_game_without_topic_discriminator_retains_legacy_reply_thread():
+    raw = invitation(thread_id=57).model_dump(exclude={"is_topic_message"})
+    restored = Game.model_validate(raw)
+    assert restored.is_topic_message is None and restored.thread_id == 57
+    restored.join(BLACK, 1100)
+    assert restored.is_topic_message is None and restored.thread_id == 57
+    assert restored.black == BLACK
 
 
 def test_bot_cannot_take_black_seat():

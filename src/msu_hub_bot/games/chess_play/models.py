@@ -45,6 +45,8 @@ class Game(Payload):
     bot_id: UserID
     chat_id: int = Field(strict=True, ge=-(2**52 - 1), le=2**52 - 1)
     thread_id: int | None = Field(default=None, strict=True, gt=0, le=2**31 - 1)
+    # None preserves records written before forum topics were distinguished from reply threads.
+    is_topic_message: bool | None = Field(default=None, strict=True)
     message_id: int | None = Field(default=None, strict=True, gt=0, le=2**31 - 1)
     white: Player
     black: Player | None = None
@@ -70,6 +72,10 @@ class Game(Payload):
             raise ValueError("Invitation ends before it was created")
         if self.chat_id == 0:
             raise ValueError("Chat ID must be nonzero")
+        if self.is_topic_message is True and self.thread_id is None:
+            raise ValueError("Forum games require their topic ID")
+        if self.is_topic_message is False and self.thread_id is not None:
+            raise ValueError("Ordinary reply threads are not forum destinations")
         participants = {self.white.user_id}
         if self.black is not None:
             if self.black.user_id == self.white.user_id:

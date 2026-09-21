@@ -210,6 +210,7 @@ async def test_invitation_buttons_accept_ordinary_reply_threads(rig, publication
 async def test_existing_invitation_with_old_reply_thread_can_be_cancelled(rig):
     row = await open_match(rig.service, thread_id=None)
     saved = row.value.model_copy(deep=True)
+    saved.game.is_topic_message = None
     saved.game.thread_id = 57  # Older records also stored non-forum reply threads.
     tx = rig.service._tx()
     tx.expect(row)
@@ -220,6 +221,75 @@ async def test_existing_invitation_with_old_reply_thread_can_be_cancelled(rig):
     await rig.service.callback(callback, data)
     assert (await fresh(rig.service, row)).value.game.result == "cancelled"
     assert (await rig.service.chats.get(SCOPE, "-123")).value.active is None
+
+
+@pytest.mark.parametrize("publication", ["bound", "publishing"])
+@pytest.mark.parametrize("thread_id", [None, 1, 17])
+async def test_forum_invitation_rejects_non_topic_board_without_rebinding(rig, publication, thread_id):
+    if publication == "publishing":
+        rig.bot.session.photo_error = TimeoutError()
+    row = await open_match(rig.service, thread_id=17)
+    restart(rig)
+    callback, data = query(
+        rig.service,
+        row,
+        user_id=43,
+        action="join",
+        message_id=row.value.game.message_id or 200,
+        message_thread_id=thread_id,
+        is_topic_message=False,
+    )
+    await rig.service.callback(callback, data)
+    assert await fresh(rig.service, row) == row
+    assert (await rig.service.chats.get(SCOPE, "-123")).value.active == row.key
+    assert await rig.service.ratings.list(SCOPE) == []
+    assert rig.bot.session.methods[-1].text == "Эта партия уже недоступна."
+
+
+async def test_legacy_unbound_reply_thread_is_normalized_when_board_is_confirmed(rig):
+    rig.bot.session.photo_error = TimeoutError()
+    row = await open_match(rig.service, thread_id=None)
+    saved = row.value.model_copy(deep=True)
+    saved.game.is_topic_message = None
+    saved.game.thread_id = 57
+    tx = rig.service._tx()
+    tx.expect(row)
+    tx.put(rig.service.matches, row.key, saved, parent="-123", status="waiting")
+    await tx.commit()
+    restart(rig)
+    row = await fresh(rig.service, row)
+    callback, data = query(rig.service, row, user_id=43, action="join", message_id=200, message_thread_id=1, is_topic_message=False)
+    await rig.service.callback(callback, data)
+    result = await fresh(rig.service, row)
+    assert result.value.publication == "bound"
+    assert result.value.game.message_id == 200
+    assert result.value.game.thread_id is None
+    assert result.value.game.is_topic_message is False
+    assert result.value.game.black.user_id == 43
+    assert sum(isinstance(method, SendPhoto) for method in rig.bot.session.methods) == 1
+
+
+@pytest.mark.parametrize("changed", ["chat", "topic", "not_topic"])
+async def test_successful_send_acknowledgement_cannot_retarget_invitation(rig, monkeypatch, changed):
+    request = rig.bot.session.make_request
+
+    async def inconsistent(bot, method, timeout=None):
+        response = await request(bot, method, timeout)
+        if not isinstance(method, SendPhoto):
+            return response
+        if changed == "chat":
+            return response.model_copy(update={"chat": response.chat.model_copy(update={"id": -456})})
+        if changed == "topic":
+            return response.model_copy(update={"message_thread_id": 99})
+        return response.model_copy(update={"is_topic_message": False, "message_thread_id": None})
+
+    monkeypatch.setattr(rig.bot.session, "make_request", inconsistent)
+    row = await open_match(rig.service, thread_id=17)
+    assert row.value.publication == "publishing"
+    assert row.value.game.message_id is None
+    assert row.value.game.thread_id == 17
+    assert (await rig.service.chats.get(SCOPE, "-123")).value.active == row.key
+    assert sum(isinstance(method, SendPhoto) for method in rig.bot.session.methods) == 1
 
 
 @pytest.mark.parametrize("publication", ["bound", "publishing"])
