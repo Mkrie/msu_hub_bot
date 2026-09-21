@@ -43,7 +43,8 @@ async def test_photo_has_six_hidden_choices_and_one_chat_slot(rig):
     else:
         assert photo.photo == PHOTO.url and "Угадай страну" in photo.caption
         assert PHOTO.country not in photo.caption and PHOTO.city not in photo.caption
-        assert "Author <name>" in photo.caption and "CC BY 3.0" in photo.caption
+        assert all(hidden not in photo.caption for hidden in ("Фото:", PHOTO.author, PHOTO.license))
+        assert not any(entity.url for entity in photo.caption_entities)
     assert "прошлое задание" in rig.session.methods[-1].text
     assert all(timeout == 15 for timeout in rig.session.timeouts)
 
@@ -62,6 +63,8 @@ async def test_votes_are_immutable_hidden_and_acknowledged_after_durable_commit(
     hidden = text_of(edits(rig)[-1])
     assert "Ответили: 2" in hidden and "User 42 <&>" in hidden and "@user_43" in hidden
     assert all(option not in hidden for option in record.value.question.choices)
+    if rig.feature == "geoguess":
+        assert all(value not in hidden for value in ("Фото:", PHOTO.author, PHOTO.license))
     answers = [method.text for method in rig.session.methods if isinstance(method, AnswerCallbackQuery)]
     assert "Ответ принят" in answers[0] and "Изменить его нельзя" in answers[1]
     commits = [request for operation, request in rig.backend.calls if operation == "commit"]
@@ -88,6 +91,7 @@ async def test_finish_scores_all_players_once_with_floor_and_names(rig):
         assert "Rxc8+" in result and any(isinstance(edit, EditMessageMedia) for edit in edits(rig))
     else:
         assert "Берген" in result and "Норвегия" in result and "Источник фотографии" in result
+        assert f"Фото: {PHOTO.author}, {PHOTO.license}." in result
     await click(rig, record, answer, user_id=44)
     assert len(await votes(rig, record)) == 2
 
@@ -150,6 +154,9 @@ async def test_restart_preserves_answers_options_attribution_and_deadline(rig):
     assert closed.value.closed_at == restored.value.deadline_at
     assert len(await votes(rig, record)) == 2
     assert len([method for method in rig.session.methods if isinstance(method, SendPhoto)]) == 1
+    if rig.feature == "geoguess":
+        result = text_of(edits(rig)[-1])
+        assert f"Фото: {PHOTO.author}, {PHOTO.license}." in result
 
 
 async def test_many_voters_are_paged_on_the_original_message_after_restart(rig):
