@@ -204,6 +204,7 @@ class ChessMatchService:
                 raise GameError("Приглашение уже недоступно.")
             value = current.value.model_copy(deep=True)
             value.game.message_id = message.message_id
+            value.game.thread_id = message.message_thread_id if message.is_topic_message else None
             value.publication = "bound"
             try:
                 await self._transition(current, value)
@@ -254,7 +255,7 @@ class ChessMatchService:
                 token=token,
                 bot_id=self.bot.id,
                 chat_id=message.chat.id,
-                thread_id=message.message_thread_id,
+                thread_id=message.message_thread_id if message.is_topic_message else None,
                 white=self._player(user),
                 white_rating=INITIAL_RATING if rating is None else rating.value.rating,
                 created_at=now.timestamp(),
@@ -318,9 +319,11 @@ class ChessMatchService:
 
     def _message_matches(self, row: Record[SavedMatch], message: Message) -> bool:
         game = row.value.game
+        # Ordinary replies can have their own thread ID; only forum topics
+        # identify the destination. Bot/chat/message checks still bind the board.
         if (
             message.chat.id != game.chat_id
-            or message.message_thread_id != game.thread_id
+            or (message.is_topic_message and message.message_thread_id != game.thread_id)
             or message.from_user is None
             or message.from_user.id != self.bot.id
             or not message.from_user.is_bot
