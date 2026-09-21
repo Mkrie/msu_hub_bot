@@ -31,7 +31,7 @@ def test_invitation_clock_starts_on_first_other_player_join():
     assert game.status == "waiting"
     assert game.remaining(1599) == (600, 600)
     assert game.deadline() == 1600
-    with pytest.raises(GameError, match="другой участник"):
+    with pytest.raises(GameError, match="Вы уже организатор этой игры"):
         game.join(WHITE, 1500)
     assert game.revision == 0
     game.join(BLACK, 1590)
