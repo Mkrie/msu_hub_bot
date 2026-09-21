@@ -110,6 +110,20 @@ async def test_explicit_language_codes_bypass_jev_and_preserve_literal_inline_te
     assert sent.reply_parameters.message_id == 20
 
 
+@pytest.mark.parametrize("source", ["auto", "detect"])
+@pytest.mark.parametrize("body", ["See https://example.com", "Note: keep this prefix", 'He said "hello" to me'])
+async def test_detected_source_preserves_punctuation_in_the_complete_inline_body(translation, source, body):
+    bot, client = translation
+    reply = make_message(bot, text="different replied text", message_id=10)
+    message = make_message(bot, text=f"/tr {source} ru {body}", message_id=20, reply_to_message=reply)
+    await invoke_command(lingvanex.process_translate, message, jev=client)
+    args, kwargs = client.resolve_languages.call_args
+    assert args[0] == f"{source} ru"
+    assert kwargs["text"] == body and kwargs["target"] == "ru_RU"
+    lingvanex.translate.assert_awaited_once_with(body, "en_GB", "ru_RU")
+    assert bot.session.methods[-1].reply_parameters.message_id == 20
+
+
 async def test_natural_reply_request_keeps_exact_content_and_five_prior_human_messages(translation):
     bot, client = translation
     recent = RecentMessages()

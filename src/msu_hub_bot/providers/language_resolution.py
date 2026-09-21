@@ -61,6 +61,16 @@ def translation_body(raw: str, reply_text: str | None, *, known_source: bool, kn
     Natural inline controls need a colon or quoted body. An explicit reply is
     otherwise the source; bare inline text is usable when there is no reply.
     """
+    tokens = list(re.finditer(r"\S+", raw))
+    if (
+        len(tokens) > 2
+        and (known_source or known_target or any(token.group().casefold() in {"auto", "detect"} for token in tokens[:2]))
+        and all(_POSITIONAL_CODE.fullmatch(token.group()) for token in tokens[:2])
+    ):
+        # A positional prefix establishes the body boundary. Its URLs, colons
+        # and quotations are source content, not another translation instruction.
+        return TranslationBody(raw[tokens[2].start() :], raw[: tokens[1].end()])
+
     head, separator, body = raw.partition(":")
     if separator and body.strip() and (_CONTROL.search(head) or known_source or known_target):
         return TranslationBody(body.lstrip(), head)
@@ -71,13 +81,6 @@ def translation_body(raw: str, reply_text: str | None, *, known_source: bool, kn
         if _CONTROL.search(instruction) or known_source or known_target:
             return TranslationBody(next(part for part in match.groups() if part is not None), instruction.strip())
 
-    tokens = list(re.finditer(r"\S+", raw))
-    if (
-        len(tokens) > 2
-        and (known_source or known_target or any(token.group().casefold() in {"auto", "detect"} for token in tokens[:2]))
-        and all(_POSITIONAL_CODE.fullmatch(token.group()) for token in tokens[:2])
-    ):
-        return TranslationBody(raw[tokens[2].start() :], raw[: tokens[1].end()])
     if reply_text is not None:
         return TranslationBody(reply_text, raw, from_reply=True)
     if known_source or known_target:
