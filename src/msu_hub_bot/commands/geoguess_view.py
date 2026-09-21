@@ -52,9 +52,13 @@ def _header(photo: Photo, players: Sequence[Player], *, closed: bool, scored: bo
 
 
 def _footer(photo: Photo, *, closed: bool, page: int, pages: int) -> Text:
-    credit = Text("Фото: ", compact(photo.author, 48), ", ", TextLink(compact(photo.license, 32), url=photo.license_url), ".")
-    source = (
+    credit = (
         Text(
+            "Фото: ",
+            compact(photo.author, 48),
+            ", ",
+            TextLink(compact(photo.license, 32), url=photo.license_url),
+            ".",
             "\n",
             TextLink("Источник фотографии", url=photo.source),
             " · ",
@@ -63,8 +67,8 @@ def _footer(photo: Photo, *, closed: bool, page: int, pages: int) -> Text:
         if closed
         else Text()
     )
-    navigation = f"\nСтраница {page + 1}/{pages}" if pages > 1 else ""
-    return Text(credit, source, navigation)
+    navigation = f"Страница {page + 1}/{pages}" if pages > 1 else ""
+    return Text(credit, "\n" if len(credit) and navigation else "", navigation)
 
 
 def render(photo: Photo, players: Sequence[Player], *, closed: bool, scored: bool | None = True, page: int = 0) -> View:
@@ -89,5 +93,5 @@ def render(photo: Photo, players: Sequence[Player], *, closed: bool, scored: boo
     if not players and not closed:
         participants = Text("Пока никто не ответил. Твой ход!")
     body = Text(header, "\n\n", participants) if len(participants) else header
-    caption, entities = Text(body, "\n\n", footer).render()
+    caption, entities = Text(body, "\n\n" if len(footer) else "", footer).render()
     return View(caption, entities, page, pages)
