@@ -1,4 +1,4 @@
-"""Public YouTube cards and bounded Shorts with their original soundtrack."""
+"""Bounded YouTube Shorts previews only when their video is available."""
 
 from dataclasses import dataclass
 import math
@@ -7,12 +7,11 @@ import time
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlsplit
 
-from msu_hub_bot.providers.link_download import allowed_url, download_image, download_video, extract_info, request_json
+from msu_hub_bot.providers.link_download import allowed_url, download_video, extract_info, request_json
 from msu_hub_bot.providers.link_diagnostics import LinkReason, LinkStage, record_link_diagnostic
-from msu_hub_bot.providers.link_models import LinkAsset, LinkPost
+from msu_hub_bot.providers.link_models import LinkPost
 
 _HOSTS = ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be", "www.youtu.be")
-_THUMBNAIL_HOSTS = ("i.ytimg.com", "i1.ytimg.com", "i2.ytimg.com", "i3.ytimg.com", "i4.ytimg.com")
 _VIDEO_ID = re.compile(r"[a-zA-Z0-9_-]{11}\Z")
 _TIMESTAMP = re.compile(r"(?:\d+(?:\.\d+)?|(?:\d+h)?(?:\d+m)?(?:\d+s)?)\Z")
 _MAX_SECONDS = 75
@@ -62,19 +61,6 @@ def _text(value: object) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
-def _thumbnail(info: dict[str, Any]) -> str | None:
-    direct = info.get("thumbnail") or info.get("thumbnail_url")
-    if isinstance(direct, str) and allowed_url(direct, _THUMBNAIL_HOSTS):
-        return direct
-    alternatives = info.get("thumbnails")
-    if isinstance(alternatives, list):
-        for alternative in reversed(alternatives):
-            value = alternative.get("url") if isinstance(alternative, dict) else None
-            if isinstance(value, str) and allowed_url(value, _THUMBNAIL_HOSTS):
-                return value
-    return None
-
-
 def _short_video(info: dict[str, Any]) -> bool:
     duration = info.get("duration")
     return (
@@ -102,58 +88,47 @@ def _oembed(url: str, deadline: float) -> dict[str, Any]:
 
 
 def fetch_youtube(url: str) -> LinkPost | None:
-    """Keep useful public metadata even when the host cannot obtain video formats."""
+    """Publish only a downloaded video; metadata alone never becomes a preview."""
     link = parse_youtube_url(url)
     if link is None:
         record_link_diagnostic(LinkStage.ADAPTER, LinkReason.UNSUPPORTED)
         return None
+    if not link.shorts:
+        record_link_diagnostic(LinkStage.ADAPTER, LinkReason.POLICY)
+        return None
     deadline = time.monotonic() + _MAX_SECONDS
-    info = extract_info(link.url, provider="youtube", deadline=min(deadline, time.monotonic() + 25)) or {}
+    info = extract_info(link.url, provider="youtube", deadline=min(deadline, time.monotonic() + 25))
+    if not info:
+        record_link_diagnostic(LinkStage.ADAPTER, LinkReason.UNAVAILABLE)
+        return None
     if info.get("id") not in (None, link.id) or info.get("_type") in ("playlist", "multi_video", "compat_list"):
         record_link_diagnostic(LinkStage.ADAPTER, LinkReason.INVALID_RESPONSE)
-        info = {}
+        return None
+    if not _short_video(info):
+        record_link_diagnostic(LinkStage.ADAPTER, LinkReason.POLICY)
+        return None
+    video = download_video(
+        link.url,
+        deadline=min(deadline - 8, time.monotonic() + 40),
+        max_duration=_SHORT_SECONDS,
+        require_audio=True,
+    )
+    if video is None or video.kind != "video" or not video.data:
+        record_link_diagnostic(LinkStage.ADAPTER, LinkReason.EMPTY)
+        return None
+
     title = _text(info.get("title"))
     author = _text(info.get("channel")) or _text(info.get("uploader"))
-    thumbnail = _thumbnail(info)
     author_url = _text(info.get("channel_url")) or _text(info.get("uploader_url"))
-    fallback: dict[str, Any] | None = None
-    if not title or title == link.id or not author or thumbnail is None:
+    if not title or title == link.id or not author:
         fallback = _oembed(link.url, deadline)
         if not title or title == link.id:
             title = _text(fallback.get("title"))
         author = author or _text(fallback.get("author_name"))
         author_url = author_url or _text(fallback.get("author_url"))
-        thumbnail = thumbnail or _thumbnail(fallback)
     if not title or title == link.id:
         record_link_diagnostic(LinkStage.ADAPTER, LinkReason.UNAVAILABLE)
         return None
-    assets: tuple[LinkAsset, ...] = ()
-    if link.shorts and _short_video(info):
-        video = download_video(
-            link.url,
-            deadline=min(deadline - 8, time.monotonic() + 40),
-            max_duration=_SHORT_SECONDS,
-            require_audio=True,
-        )
-        if video is not None:
-            assets = (video,)
-    elif link.shorts:
-        record_link_diagnostic(LinkStage.ADAPTER, LinkReason.POLICY)
-    if not assets and thumbnail is not None:
-        picture = download_image(thumbnail, deadline=deadline, allowed_hosts=_THUMBNAIL_HOSTS)
-        if picture is not None:
-            assets = (picture,)
-    if not assets and time.monotonic() < deadline:
-        # Extractor thumbnails can include guessed, nonexistent resolutions.
-        if fallback is None:
-            fallback = _oembed(link.url, deadline)
-        alternative = _thumbnail(fallback)
-        if alternative and alternative != thumbnail:
-            picture = download_image(alternative, deadline=deadline, allowed_hosts=_THUMBNAIL_HOSTS)
-            if picture is not None:
-                assets = (picture,)
-    if not assets:
-        record_link_diagnostic(LinkStage.ADAPTER, LinkReason.EMPTY)
     description = _text(info.get("description"))
     return LinkPost(
         site="youtube",
@@ -162,5 +137,5 @@ def fetch_youtube(url: str) -> LinkPost | None:
         author_url=author_url if allowed_url(author_url, _HOSTS) else None,
         title=title,
         text=description if description != title else "",
-        assets=assets,
+        assets=(video,),
     )

@@ -241,14 +241,63 @@ def test_head_failure_diagnostics_retain_links_and_omit_signed_download_urls(mon
 def test_song_gets_url_and_viewer_gets_dimensions_with_escaped_text(monkeypatch):
     video = "https://example.test/video?a=1&b=2"
     preview = (video, 640, 480)
-    monkeypatch.setattr(YDL, "extract", lambda url: ("<clip & music>", [(video, "A&B", 640, 480)], preview))
+    extract = MagicMock(return_value=("<clip & music>", [(video, "A&B", 640, 480)], preview))
+    monkeypatch.setattr(YDL, "extract", extract)
     assert YDL.preview("https://example.test/page") == video
+    extract.assert_called_once_with("https://example.test/page")
     result = text_with_preview("https://example.test/page")
+    extract.assert_called_with("https://example.test/page", require_youtube_video=True)
     assert result is not None
     text, returned = result
     assert returned == preview
     assert "&lt;clip &amp; music&gt;" in text and ">A&amp;B</a>" in text
     assert 'href="https://example.test/video?a=1&amp;b=2"' in text
+
+
+@pytest.mark.parametrize("extractor,has_video", [("YouTube", False), ("youtube", True), ("vimeo", False)])
+async def test_generic_route_suppresses_youtube_links_without_video_only(monkeypatch, extractor, has_video):
+    from types import SimpleNamespace
+
+    from aiogram.methods import SendMessage, SendVideo
+
+    from msu_hub_bot.telegram.middlewares.settings import Settings
+    from msu_hub_bot.telegram.middlewares.viewer import ViewerMiddleware
+    from telegram_helpers import make_bot, make_message
+
+    url = "https://www.youtube-nocookie.com/embed/abcdefghijk" if extractor.lower() == "youtube" else "https://vimeo.com/1234"
+    media_url = "https://cdn.example.test/PRIVATE_VIDEO?signature=PRIVATE_SIGNATURE"
+    info = {
+        "extractor": extractor,
+        "title": "Synthetic video",
+        "formats": [{"url": media_url, "format_id": "muxed", "acodec": "aac", "vcodec": "h264", "width": 640, "height": 480}],
+    }
+    monkeypatch.setattr(YDL, "extract_data", lambda *args: info)
+    preview = (media_url, 640, 480) if has_video else None
+    monkeypatch.setattr(YDL, "post_process_links", lambda links: (links, preview))
+    # Default extraction still serves explicit callers and /song's media adapter.
+    assert YDL.extract(url) == ("Synthetic video", [(media_url, "muxed", 640, 480)], preview)
+    assert YDL.preview(url) == (media_url if has_video else None)
+
+    results = []
+
+    async def run(function, *args, timeout=None):
+        result = function(*args)
+        results.append(result)
+        return result, False
+
+    bot = make_bot()
+    message = make_message(bot, text=url, entities=[dict(type="url", offset=0, length=len(url))])
+    viewer = ViewerMiddleware(bot, SimpleNamespace(), SimpleNamespace(run=run))
+    await viewer.view(message, Settings())
+    assert len(results) == 1
+    if extractor.lower() == "youtube" and not has_video:
+        assert results[0].value is None and bot.session.methods == []
+        diagnostic = results[0].diagnostics[-1]
+        assert (diagnostic.stage, diagnostic.reason) == (LinkStage.ADAPTER, LinkReason.UNAVAILABLE)
+        assert "PRIVATE" not in repr(results[0].diagnostics)
+    else:
+        assert len(bot.session.methods) == 1
+        assert isinstance(bot.session.methods[0], SendVideo if has_video else SendMessage)
 
 
 @pytest.mark.parametrize("enabled,timed_out", [(False, False), (True, False), (True, True)])

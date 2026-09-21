@@ -270,9 +270,9 @@ def test_instagram_malformed_post_metadata_has_an_explicit_decline(monkeypatch):
     assert SECRET not in repr(result.diagnostics)
 
 
-def test_youtube_unavailable_fallback_has_no_invented_success(monkeypatch):
+def test_youtube_unavailable_video_has_no_invented_success(monkeypatch):
     monkeypatch.setattr(youtube, "extract_info", lambda *args, **kwargs: None)
     monkeypatch.setattr(youtube, "request_json", lambda *args, **kwargs: None)
-    result = collect_link_diagnostics(youtube.fetch_youtube, URL)
+    result = collect_link_diagnostics(youtube.fetch_youtube, "https://www.youtube.com/shorts/jNQXAC9IVRw")
     assert result.value is None
     assert result.diagnostics == (LinkDiagnostic(LinkStage.ADAPTER, LinkReason.UNAVAILABLE),)

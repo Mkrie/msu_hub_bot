@@ -57,6 +57,8 @@ def render_native_post(post: LinkPost) -> list[InputRichMessage]:
     """Keep captions and source order; do not manufacture unavailable content."""
     if not post.assets or len(post.assets) > 50 or not safe_public_url(post.url):
         return []
+    if post.site == "youtube" and not any(asset.kind == "video" and asset.data for asset in post.assets):
+        return []
     if sum(len(asset.data) for asset in post.assets) > 100 * 1024 * 1024:
         return []
     emoji, emoji_id = _BRANDING[post.site]

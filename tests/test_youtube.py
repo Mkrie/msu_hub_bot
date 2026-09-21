@@ -1,4 +1,4 @@
-"""YouTube cards, native sound and the shared public-download boundary."""
+"""Video-only YouTube previews, native sound and the public-download boundary."""
 
 import io
 import json
@@ -20,7 +20,6 @@ VIDEO_ID = "jNQXAC9IVRw"
 WATCH = f"https://www.youtube.com/watch?v={VIDEO_ID}"
 SHORT = f"https://www.youtube.com/shorts/{VIDEO_ID}"
 THUMB = f"https://i.ytimg.com/vi/{VIDEO_ID}/hqdefault.jpg"
-MAXRES = f"https://i.ytimg.com/vi/{VIDEO_ID}/maxresdefault.jpg"
 PHOTO = LinkAsset("photo", b"jpeg", 480, 360)
 VIDEO = LinkAsset("video", b"mp4", 144, 198, 3)
 
@@ -65,12 +64,11 @@ def test_invalid_or_collection_routes_do_not_start_work(monkeypatch, url):
     extract.assert_not_called()
 
 
-def install(monkeypatch, info=None, fallback=None, video=VIDEO, photo=PHOTO):
+def install(monkeypatch, info=None, fallback=None, video=VIDEO):
     methods = {
         "extract_info": MagicMock(return_value=info),
         "request_json": MagicMock(return_value=fallback),
         "download_video": MagicMock(return_value=video),
-        "download_image": MagicMock(return_value=photo),
     }
     for name, method in methods.items():
         monkeypatch.setattr(youtube, name, method)
@@ -92,30 +90,30 @@ def metadata(**changes):
     }
 
 
-def test_watch_is_a_full_metadata_card_and_never_downloads_video(monkeypatch):
+@pytest.mark.parametrize("url", [WATCH, f"https://youtu.be/{VIDEO_ID}", f"https://youtube.com/embed/{VIDEO_ID}"])
+def test_ordinary_watch_links_stay_quiet_without_thumbnail_or_metadata_work(monkeypatch, url):
     methods = install(monkeypatch, metadata())
-    result = youtube.fetch_youtube(WATCH + "&t=1m2s&list=abc")
-    assert result.url == WATCH + "&t=1m2s"
-    assert result.title == "A useful video"
-    assert result.author == "A channel"
-    assert result.author_url == "https://www.youtube.com/@channel"
-    assert result.text == metadata()["description"]
-    assert result.assets == (PHOTO,)
-    methods["download_video"].assert_not_called()
-    methods["request_json"].assert_not_called()
+    result = collect_link_diagnostics(youtube.fetch_youtube, url)
+    assert result.value is None
+    assert result.diagnostics == (LinkDiagnostic(LinkStage.ADAPTER, LinkReason.POLICY),)
+    for method in methods.values():
+        method.assert_not_called()
 
 
-def test_short_keeps_source_time_sound_and_actual_geometry(monkeypatch):
+def test_short_keeps_metadata_source_time_sound_and_actual_geometry(monkeypatch):
     methods = install(monkeypatch, metadata())
     result = youtube.fetch_youtube(SHORT + "?t=2")
     assert result.assets == (VIDEO,)
     assert (result.assets[0].width, result.assets[0].height) == (144, 198)
     assert result.url == SHORT + "?t=2"
+    assert result.title == "A useful video" and result.author == "A channel"
+    assert result.author_url == "https://www.youtube.com/@channel"
+    assert result.text == metadata()["description"]
     call = methods["download_video"].call_args
     assert call.args == (SHORT + "?t=2",)
     assert call.kwargs["require_audio"] is True
     assert call.kwargs["max_duration"] == 180
-    methods["download_image"].assert_not_called()
+    methods["request_json"].assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -132,20 +130,25 @@ def test_short_keeps_source_time_sound_and_actual_geometry(monkeypatch):
         {"formats": []},
     ],
 )
-def test_unknown_or_unbounded_short_remains_a_card(monkeypatch, fields):
+def test_unknown_or_unbounded_short_stays_quiet(monkeypatch, fields):
     methods = install(monkeypatch, metadata(**fields))
-    assert youtube.fetch_youtube(SHORT).assets == (PHOTO,)
+    assert youtube.fetch_youtube(SHORT) is None
     methods["download_video"].assert_not_called()
+    methods["request_json"].assert_not_called()
 
 
-def test_failed_short_download_keeps_useful_card(monkeypatch):
-    install(monkeypatch, metadata(), video=None)
-    assert youtube.fetch_youtube(SHORT).assets == (PHOTO,)
+@pytest.mark.parametrize("video", [None, PHOTO, LinkAsset("video", b"", 144, 198, 3)])
+def test_failed_or_nonvideo_download_never_becomes_a_card(monkeypatch, video):
+    methods = install(monkeypatch, metadata(channel=""), fallback={"author_name": "Fallback", "thumbnail_url": THUMB}, video=video)
+    assert youtube.fetch_youtube(SHORT) is None
+    methods["download_video"].assert_called_once()
+    methods["request_json"].assert_not_called()
 
 
-def test_official_oembed_card_works_without_playback_metadata(monkeypatch):
+def test_official_oembed_enriches_metadata_only_after_video_download(monkeypatch):
     methods = install(
         monkeypatch,
+        metadata(title="", channel="", channel_url=""),
         fallback={
             "title": "Public title",
             "author_name": "Public author",
@@ -154,119 +157,66 @@ def test_official_oembed_card_works_without_playback_metadata(monkeypatch):
             "html": '<iframe src="https://untrusted.test"></iframe>',
         },
     )
+    methods["request_json"].side_effect = lambda *args, **kwargs: (
+        methods["download_video"].assert_called_once() or methods["request_json"].return_value
+    )
     result = youtube.fetch_youtube(SHORT)
     assert result.title == "Public title" and result.author == "Public author"
-    assert result.text == "" and result.assets == (PHOTO,)
-    methods["download_video"].assert_not_called()
+    assert result.assets == (VIDEO,)
     call = methods["request_json"].call_args
     assert call.args[0].startswith("https://www.youtube.com/oembed?")
     assert call.kwargs["allowed_hosts"] == ("www.youtube.com",)
     assert call.kwargs["max_bytes"] == 65536
 
 
-def test_missing_maxres_uses_official_thumbnail_without_losing_metadata_or_diagnostics(monkeypatch):
-    monkeypatch.setattr(youtube.time, "monotonic", lambda: 100)
-    methods = install(
-        monkeypatch,
-        metadata(thumbnail=MAXRES),
-        fallback={"title": "Short fallback title", "author_name": "Fallback author", "thumbnail_url": THUMB},
-    )
-
-    def image(url, *, deadline, allowed_hosts):
-        assert deadline == 175 and allowed_hosts == youtube._THUMBNAIL_HOSTS
-        if url == MAXRES:
-            record_link_diagnostic(LinkStage.IMAGE, LinkReason.HTTP_ERROR, http_status=404)
-            return None
-        assert url == THUMB
-        record_link_diagnostic(LinkStage.IMAGE, LinkReason.OK)
-        return PHOTO
-
-    methods["download_image"].side_effect = image
-    extracted = collect_link_diagnostics(youtube.fetch_youtube, WATCH)
-    result = extracted.value
-    assert result.assets == (PHOTO,)
-    assert result.title == metadata()["title"] and result.author == metadata()["channel"]
-    assert result.author_url == metadata()["channel_url"] and result.text == metadata()["description"]
-    assert extracted.diagnostics == (
-        LinkDiagnostic(LinkStage.IMAGE, LinkReason.HTTP_ERROR, http_status=404),
-        LinkDiagnostic(LinkStage.IMAGE, LinkReason.OK),
-    )
-    assert [call.args[0] for call in methods["download_image"].call_args_list] == [MAXRES, THUMB]
-    methods["request_json"].assert_called_once()
-    assert methods["request_json"].call_args.kwargs["deadline"] == 108
+def test_oembed_only_metadata_cannot_create_a_preview(monkeypatch):
+    methods = install(monkeypatch, fallback={"title": "Public title", "author_name": "Author", "thumbnail_url": THUMB})
+    result = collect_link_diagnostics(youtube.fetch_youtube, SHORT)
+    assert result.value is None
+    assert result.diagnostics == (LinkDiagnostic(LinkStage.ADAPTER, LinkReason.UNAVAILABLE),)
+    methods["download_video"].assert_not_called()
+    methods["request_json"].assert_not_called()
 
 
-def test_failed_thumbnail_reuses_oembed_already_loaded_for_author(monkeypatch):
-    methods = install(
-        monkeypatch, metadata(channel="", thumbnail=MAXRES), fallback={"author_name": "Fallback author", "thumbnail_url": THUMB}
-    )
-    methods["download_image"].side_effect = [None, PHOTO]
-    result = youtube.fetch_youtube(WATCH)
-    assert result.assets == (PHOTO,) and result.author == "Fallback author"
-    assert result.text == metadata()["description"]
-    methods["request_json"].assert_called_once()
-    assert [call.args[0] for call in methods["download_image"].call_args_list] == [MAXRES, THUMB]
+def test_failed_download_preserves_its_diagnostic_without_metadata_recovery(monkeypatch):
+    methods = install(monkeypatch, metadata())
 
-
-@pytest.mark.parametrize(
-    "fallback_thumbnail,attempts", [(MAXRES, [MAXRES]), ("https://127.0.0.1/private", [MAXRES]), (None, [MAXRES]), (THUMB, [MAXRES, THUMB])]
-)
-def test_failed_thumbnail_is_quiet_and_never_retries_duplicates_unsafe_or_more_variants(monkeypatch, fallback_thumbnail, attempts):
-    methods = install(
-        monkeypatch,
-        metadata(thumbnail=MAXRES, thumbnails=[{"url": THUMB + "?unused=1"}, {"url": THUMB + "?unused=2"}]),
-        fallback={"thumbnail_url": fallback_thumbnail},
-        photo=None,
-    )
-    result = youtube.fetch_youtube(WATCH)
-    assert result.assets == () and result.text == metadata()["description"]
-    methods["request_json"].assert_called_once()
-    assert [call.args[0] for call in methods["download_image"].call_args_list] == attempts
-
-
-def test_failed_official_thumbnail_is_not_fetched_twice(monkeypatch):
-    methods = install(monkeypatch, fallback={"title": "Public title", "author_name": "Public author", "thumbnail_url": THUMB}, photo=None)
-    assert youtube.fetch_youtube(WATCH).assets == ()
-    methods["request_json"].assert_called_once()
-    methods["download_image"].assert_called_once()
-
-
-def test_expired_thumbnail_budget_does_not_start_oembed_recovery(monkeypatch):
-    clock = [100]
-    monkeypatch.setattr(youtube.time, "monotonic", lambda: clock[0])
-    methods = install(monkeypatch, metadata(thumbnail=MAXRES), fallback={"thumbnail_url": THUMB})
-
-    def expired(*args, **kwargs):
-        clock[0] = 175
+    def unavailable(*args, **kwargs):
+        record_link_diagnostic(LinkStage.VIDEO, LinkReason.TIMEOUT)
         return None
 
-    methods["download_image"].side_effect = expired
-    assert youtube.fetch_youtube(WATCH).assets == ()
+    methods["download_video"].side_effect = unavailable
+    result = collect_link_diagnostics(youtube.fetch_youtube, SHORT)
+    assert result.value is None
+    assert result.diagnostics == (
+        LinkDiagnostic(LinkStage.VIDEO, LinkReason.TIMEOUT),
+        LinkDiagnostic(LinkStage.ADAPTER, LinkReason.EMPTY),
+    )
     methods["request_json"].assert_not_called()
-    methods["download_image"].assert_called_once()
 
 
-def test_malformed_optional_metadata_does_not_hide_title(monkeypatch):
-    methods = install(monkeypatch, metadata(channel_url="https://evil.test", thumbnail="https://127.0.0.1/private"), photo=None)
-    result = youtube.fetch_youtube(WATCH)
+def test_malformed_optional_metadata_does_not_hide_video(monkeypatch):
+    install(monkeypatch, metadata(channel_url="https://evil.test", thumbnail="https://127.0.0.1/private"))
+    result = youtube.fetch_youtube(SHORT)
     assert result.title == "A useful video"
-    assert result.assets == () and result.author_url is None
-    methods["download_image"].assert_not_called()
+    assert result.assets == (VIDEO,) and result.author_url is None
 
 
 @pytest.mark.parametrize("info", [None, {"title": VIDEO_ID}, metadata(id="other"), metadata(_type="playlist")])
 def test_failed_or_mismatched_metadata_does_not_invent_a_post(monkeypatch, info):
-    install(monkeypatch, info)
-    assert youtube.fetch_youtube(WATCH) is None
+    methods = install(monkeypatch, info)
+    assert youtube.fetch_youtube(SHORT) is None
+    methods["download_video"].assert_not_called()
+    methods["request_json"].assert_not_called()
 
 
-def test_provider_operations_share_one_deadline_with_reserved_card_fallback(monkeypatch):
+def test_provider_operations_share_one_deadline_with_reserved_attribution_time(monkeypatch):
     monkeypatch.setattr(youtube.time, "monotonic", lambda: 100)
-    methods = install(monkeypatch, metadata(), video=None)
-    youtube.fetch_youtube(SHORT)
+    methods = install(monkeypatch, metadata(channel=""), fallback={"author_name": "Author"})
+    assert youtube.fetch_youtube(SHORT).assets == (VIDEO,)
     assert methods["extract_info"].call_args.kwargs["deadline"] == 125
     assert methods["download_video"].call_args.kwargs["deadline"] == 140
-    assert methods["download_image"].call_args.kwargs["deadline"] == 175
+    assert methods["request_json"].call_args.kwargs["deadline"] == 108
 
 
 @pytest.mark.parametrize(

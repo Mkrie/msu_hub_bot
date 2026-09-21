@@ -91,7 +91,9 @@ class YDL:
             return None
 
     @classmethod
-    def extract(cls, real_url: str, ydl: YoutubeDL | None = None) -> tuple[str, list[MediaLink], Preview | None] | None:
+    def extract(
+        cls, real_url: str, ydl: YoutubeDL | None = None, *, require_youtube_video: bool = False
+    ) -> tuple[str, list[MediaLink], Preview | None] | None:
         info = cls.extract_data(real_url, ydl)
         if not info:
             return None
@@ -124,6 +126,9 @@ class YDL:
             record_link_diagnostic(LinkStage.EXTRACT, LinkReason.EMPTY)
             return None
         links, preview = cls.post_process_links(links)
+        if require_youtube_video and extractor == "youtube" and preview is None:
+            record_link_diagnostic(LinkStage.ADAPTER, LinkReason.UNAVAILABLE)
+            return None
         return str(info.get("title") or "Video"), links, preview
 
     @classmethod

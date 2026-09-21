@@ -5,7 +5,8 @@ from msu_hub_bot.providers.ydl import YDL, Preview
 
 
 def text_with_preview(url: str) -> tuple[str, Preview | None] | None:
-    result = YDL.extract(url)
+    # Mirrors and embedded links can resolve to YouTube through the generic route.
+    result = YDL.extract(url, require_youtube_video=True)
     if result is None:
         return None
     title, links, preview = result

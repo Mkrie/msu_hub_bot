@@ -135,6 +135,20 @@ async def test_new_sites_use_their_provider_and_preserve_source_topic(runtime, s
     assert emoji in emoji_ids(method.rich_message.blocks[0].text)
 
 
+@pytest.mark.parametrize("assets", [(), (LinkAsset("photo", b"thumbnail", 480, 360),)])
+async def test_youtube_without_video_never_sends_or_retries_generic_extraction(runtime, assets):
+    runtime.executor.run.return_value = LinkExtraction(post("youtube", assets=assets), ()), False
+    await runtime.viewer.view(source(runtime, SITES[0][1]), Settings())
+    runtime.executor.run.assert_awaited_once()
+    assert not runtime.session.methods
+
+
+@pytest.mark.parametrize("site", ["instagram", "tiktok"])
+def test_other_native_sites_still_render_photo_posts(site):
+    result = native.render_native_post(post(site, assets=(LinkAsset("photo", b"photo", 480, 360),)))
+    assert any(isinstance(block, InputRichBlockPhoto) for block in blocks(result))
+
+
 @pytest.mark.parametrize("site,url,fetcher,emoji", SITES)
 async def test_disabled_auto_video_links_skips_every_new_provider(runtime, site, url, fetcher, emoji):
     await runtime.viewer.view(source(runtime, url), Settings(auto_video_links=False, auto_x_previews=True))
