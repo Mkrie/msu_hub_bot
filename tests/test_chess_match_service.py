@@ -45,6 +45,7 @@ class MatchSession(RecordingSession):
                 "chat": {"id": chat_id, "type": "private" if chat_id > 0 else "supergroup"},
                 "from_user": {"id": bot.id, "is_bot": True, "first_name": "Test bot"},
                 "message_thread_id": getattr(method, "message_thread_id", None),
+                "is_topic_message": getattr(method, "message_thread_id", None) is not None,
                 "reply_markup": getattr(method, "reply_markup", None),
             }
             if isinstance(method, SendPhoto):
@@ -55,14 +56,14 @@ class MatchSession(RecordingSession):
         return True
 
 
-async def open_match(service, *, chat_id=-123, user_id=42, message_id=1, thread_id=17):
+async def open_match(service, *, chat_id=-123, user_id=42, message_id=1, thread_id=17, is_topic_message=None):
     source = make_message(
         service.bot,
         message_id=message_id,
         chat={"id": chat_id, "type": "supergroup"},
         from_user={"id": user_id, "is_bot": False, "first_name": f"Player {user_id}"},
         message_thread_id=thread_id,
-        is_topic_message=thread_id is not None,
+        is_topic_message=thread_id is not None if is_topic_message is None else is_topic_message,
     )
     await service.start(source)
     return await service.get(chat_id, service.token(service.bot.id, chat_id, message_id))
@@ -77,6 +78,7 @@ def query(service, row, *, user_id, action, value="", revision=None, **message_c
             "message_id": game.message_id,
             "chat": {"id": game.chat_id, "type": "supergroup"},
             "message_thread_id": game.thread_id,
+            "is_topic_message": game.thread_id is not None,
             "from_user": {"id": service.bot.id, "is_bot": True, "first_name": "Test bot"},
             "photo": [{"file_id": "photo", "file_unique_id": "photo", "width": 900, "height": 900}],
             "reply_markup": keyboard(game),
@@ -166,6 +168,84 @@ async def test_join_is_exclusive_and_updates_waiting_image_before_first_move(rig
     assert len(await rig.service.ratings.list(SCOPE)) == 2
     await drain(rig)
     assert any(isinstance(method, EditMessageMedia) for method in rig.bot.session.methods)
+
+
+@pytest.mark.parametrize("publication", ["bound", "publishing"])
+@pytest.mark.parametrize("source_thread", [None, 57])
+@pytest.mark.parametrize("action,user_id", [("join", 42), ("join", 43), ("cancel", 42)])
+async def test_invitation_buttons_accept_ordinary_reply_threads(rig, publication, source_thread, action, user_id):
+    if publication == "publishing":
+        rig.bot.session.photo_error = TimeoutError()
+    row = await open_match(rig.service, thread_id=source_thread, is_topic_message=False)
+    restart(rig)
+    callback, data = query(
+        rig.service,
+        row,
+        user_id=user_id,
+        action=action,
+        message_id=row.value.game.message_id or 200,
+        message_thread_id=1,
+        is_topic_message=False,
+    )
+    await rig.service.callback(callback, data)
+    result = await fresh(rig.service, row)
+    assert result.value.publication == "bound"
+    assert result.value.game.thread_id is None
+    if action == "cancel":
+        assert result.value.game.result == "cancelled"
+        assert (await rig.service.chats.get(SCOPE, "-123")).value.active is None
+        assert await rig.service.ratings.list(SCOPE) == []
+        assert not rig.bot.session.methods[-1].text
+    elif user_id == 42:
+        assert result.value.game.status == "waiting"
+        assert result.value.game.black is None
+        assert result.value.game.revision == 0
+        assert rig.bot.session.methods[-1].text == "Вы уже организатор этой игры. Дождитесь соперника."
+    else:
+        assert result.value.game.status == "playing"
+        assert result.value.game.black.user_id == 43
+        assert not rig.bot.session.methods[-1].text
+
+
+async def test_existing_invitation_with_old_reply_thread_can_be_cancelled(rig):
+    row = await open_match(rig.service, thread_id=None)
+    saved = row.value.model_copy(deep=True)
+    saved.game.thread_id = 57  # Older records also stored non-forum reply threads.
+    tx = rig.service._tx()
+    tx.expect(row)
+    tx.put(rig.service.matches, row.key, saved, parent="-123", status="waiting")
+    await tx.commit()
+    row = await fresh(rig.service, row)
+    callback, data = query(rig.service, row, user_id=42, action="cancel", message_thread_id=1, is_topic_message=False)
+    await rig.service.callback(callback, data)
+    assert (await fresh(rig.service, row)).value.game.result == "cancelled"
+    assert (await rig.service.chats.get(SCOPE, "-123")).value.active is None
+
+
+@pytest.mark.parametrize("publication", ["bound", "publishing"])
+@pytest.mark.parametrize("changed", ["topic", "sender", "forwarded", "reply", "keyboard"])
+async def test_invitation_still_rejects_unrelated_boards(rig, publication, changed):
+    if publication == "publishing":
+        rig.bot.session.photo_error = TimeoutError()
+    row = await open_match(rig.service)
+    changes = {"message_id": row.value.game.message_id or 200}
+    if changed == "topic":
+        changes["message_thread_id"] = 99
+    elif changed == "sender":
+        changes["from_user"] = {"id": 999, "is_bot": True, "first_name": "Other bot"}
+    elif changed == "forwarded":
+        changes["forward_origin"] = {"type": "hidden_user", "date": NOW, "sender_user_name": "Hidden"}
+    elif changed == "reply":
+        changes["reply_to_message"] = make_message(rig.bot, message_id=99)
+    else:
+        changes["reply_markup"] = None
+    if publication == "bound" and changed in {"reply", "keyboard"}:
+        # A bound board is authenticated by its exact ID, not mutable markup.
+        changes["message_id"] += 1
+    callback, data = query(rig.service, row, user_id=43, action="join", **changes)
+    await rig.service.callback(callback, data)
+    assert await fresh(rig.service, row) == row
+    assert rig.bot.session.methods[-1].text == "Эта партия уже недоступна."
 
 
 async def test_moves_revision_topic_and_player_authorization_survive_restart(rig):
