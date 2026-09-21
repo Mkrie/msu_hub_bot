@@ -25,6 +25,13 @@ def entity_text(caption: str, entity: MessageEntity) -> str:
     return raw[entity.offset * 2 : (entity.offset + entity.length) * 2].decode("utf-16-le")
 
 
+def visible_caption(caption: str, entities: list[MessageEntity]) -> str:
+    raw = caption.encode("utf-16-le")
+    for entity in sorted((entity for entity in entities if entity.type == "spoiler"), key=lambda entity: -entity.offset):
+        raw = raw[: entity.offset * 2] + raw[(entity.offset + entity.length) * 2 :]
+    return raw.decode("utf-16-le")
+
+
 def test_active_page_hides_answers_location_and_photo_credit():
     players = [Player(11, "Первый", "first", "Норвегия", True), Player(12, "Второй", None, "Россия")]
     view = render(PHOTO, players, closed=False)
@@ -33,22 +40,44 @@ def test_active_page_hides_answers_location_and_photo_credit():
     assert "10 минут" in view.caption and "может любой" in view.caption
     assert "Выбор каждого покажу в конце" in view.caption
     assert all(hidden not in view.caption for hidden in ("Норвегия", "Россия", "Берген", "✓", "✗"))
-    assert all(hidden not in view.caption for hidden in ("Фото:", PHOTO.author, PHOTO.license, "Источник фотографии", "OpenStreetMap"))
+    visible = visible_caption(view.caption, view.entities)
+    assert all(hidden not in visible for hidden in ("Фото:", PHOTO.author, PHOTO.license, "Источник фотографии", "OpenStreetMap"))
+    spoilers = [entity for entity in view.entities if entity.type == "spoiler"]
+    assert len(spoilers) == 1
+    assert entity_text(view.caption, spoilers[0]).startswith(f"Фото: {PHOTO.author}, {PHOTO.license}.")
     assert {entity.url for entity in view.entities if entity.url} == {
         "tg://user?id=11",
         "tg://user?id=12",
+        PHOTO.source,
+        PHOTO.license_url,
+        "https://www.openstreetmap.org/copyright",
     }
+    for entity in view.entities:
+        if entity.url and not entity.url.startswith("tg://"):
+            assert spoilers[0].offset <= entity.offset
+            assert entity.offset + entity.length <= spoilers[0].offset + spoilers[0].length
     assert view.caption == view.caption.rstrip()
     assert (view.page, view.pages) == (0, 1)
 
 
-def test_active_pages_never_expose_photo_attribution_and_keep_navigation():
+def test_active_pages_hide_photo_attribution_by_default_and_keep_navigation_visible():
     players = [Player(index, f"Игрок {index}", None, "Норвегия", True) for index in range(9)]
     for page in range(3):
         view = render(PHOTO, players, closed=False, page=page)
-        assert f"Страница {page + 1}/3" in view.caption
-        assert all(hidden not in view.caption for hidden in ("Фото:", PHOTO.author, PHOTO.license, PHOTO.city, PHOTO.country))
-        assert all(entity.url.startswith("tg://user?id=") for entity in view.entities if entity.url)
+        visible = visible_caption(view.caption, view.entities)
+        assert f"Страница {page + 1}/3" in visible
+        assert all(hidden not in visible for hidden in ("Фото:", PHOTO.author, PHOTO.license, PHOTO.city, PHOTO.country))
+        assert PHOTO.author in view.caption and PHOTO.license in view.caption
+
+
+def test_location_in_photo_credit_is_inside_native_spoiler_with_unicode_offsets():
+    photo = replace(PHOTO, author="🌍 Берген, Норвегия <&>")
+    view = render(photo, [Player(1, "🧑 Игрок", None)], closed=False)
+    visible = visible_caption(view.caption, view.entities)
+    assert "Берген" not in visible and "Норвегия" not in visible
+    assert "🧑 Игрок" in visible and "Угадай страну" in visible
+    spoiler = next(entity for entity in view.entities if entity.type == "spoiler")
+    assert photo.author in entity_text(view.caption, spoiler)
 
 
 @pytest.mark.parametrize("scored,expected", [(True, "Верно: +1, ошибка: −1"), (False, "Не удалось подтвердить"), (None, "Записываю")])
@@ -67,6 +96,7 @@ def test_finished_page_reveals_each_answer_and_scoring_status(scored, expected):
         "https://www.openstreetmap.org/copyright",
     }
     assert PHOTO.author in view.caption and PHOTO.license in view.caption
+    assert not any(entity.type == "spoiler" for entity in view.entities)
 
 
 @pytest.mark.parametrize("closed", [False, True])
@@ -78,7 +108,7 @@ def test_long_metadata_and_unicode_fit_the_caption_and_have_valid_entities(close
     for page in range((len(players) + PAGE_SIZE - 1) // PAGE_SIZE):
         view = render(photo, players, closed=closed, scored=scored, page=page)
         assert len(Text(view.caption)) <= CAPTION_LIMIT
-        assert len(view.entities) <= 8
+        assert len(view.entities) <= (8 if closed else 9)
         for entity in view.entities:
             assert entity.length > 0
             assert entity.offset + entity.length <= len(Text(view.caption))

@@ -3,7 +3,7 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from aiogram.utils.formatting import Bold, Text, TextLink
+from aiogram.utils.formatting import Bold, Spoiler, Text, TextLink
 
 from msu_hub_bot.commands.quiz_view import CAPTION_LIMIT as CAPTION_LIMIT
 from msu_hub_bot.commands.quiz_view import PAGE_SIZE as PAGE_SIZE
@@ -52,21 +52,20 @@ def _header(photo: Photo, players: Sequence[Player], *, closed: bool, scored: bo
 
 
 def _footer(photo: Photo, *, closed: bool, page: int, pages: int) -> Text:
-    credit = (
-        Text(
-            "Фото: ",
-            compact(photo.author, 48),
-            ", ",
-            TextLink(compact(photo.license, 32), url=photo.license_url),
-            ".",
-            "\n",
-            TextLink("Источник фотографии", url=photo.source),
-            " · ",
-            TextLink("© OpenStreetMap", url="https://www.openstreetmap.org/copyright"),
-        )
-        if closed
-        else Text()
+    credit = Text(
+        "Фото: ",
+        compact(photo.author, 48),
+        ", ",
+        TextLink(compact(photo.license, 32), url=photo.license_url),
+        ".",
+        "\n",
+        TextLink("Источник фотографии", url=photo.source),
+        " · ",
+        TextLink("© OpenStreetMap", url="https://www.openstreetmap.org/copyright"),
     )
+    if not closed:
+        # Attribution stays accessible even if the final caption edit cannot be delivered.
+        credit = Spoiler(credit)
     navigation = f"Страница {page + 1}/{pages}" if pages > 1 else ""
     return Text(credit, "\n" if len(credit) and navigation else "", navigation)
 

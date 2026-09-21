@@ -23,6 +23,19 @@ async def votes(rig, record):
     return await rig.quiz.votes(rig.feature, record.scope, record.key)
 
 
+def assert_photo_credit_hidden(caption, entities):
+    spoiler = next(entity for entity in entities if entity.type == "spoiler")
+    raw = caption.encode("utf-16-le")
+    hidden = raw[spoiler.offset * 2 : (spoiler.offset + spoiler.length) * 2].decode("utf-16-le")
+    assert f"Фото: {PHOTO.author}, {PHOTO.license}." in hidden
+    credit_links = {entity.url for entity in entities if entity.url and not entity.url.startswith("tg://")}
+    assert credit_links == {PHOTO.source, PHOTO.license_url, "https://www.openstreetmap.org/copyright"}
+    for entity in entities:
+        if entity.url in credit_links:
+            assert spoiler.offset <= entity.offset
+            assert entity.offset + entity.length <= spoiler.offset + spoiler.length
+
+
 async def test_photo_has_six_hidden_choices_and_one_chat_slot(rig):
     record = await start(rig)
     await start(rig)
@@ -43,8 +56,7 @@ async def test_photo_has_six_hidden_choices_and_one_chat_slot(rig):
     else:
         assert photo.photo == PHOTO.url and "Угадай страну" in photo.caption
         assert PHOTO.country not in photo.caption and PHOTO.city not in photo.caption
-        assert all(hidden not in photo.caption for hidden in ("Фото:", PHOTO.author, PHOTO.license))
-        assert not any(entity.url for entity in photo.caption_entities)
+        assert_photo_credit_hidden(photo.caption, photo.caption_entities)
     assert "прошлое задание" in rig.session.methods[-1].text
     assert all(timeout == 15 for timeout in rig.session.timeouts)
 
@@ -64,7 +76,7 @@ async def test_votes_are_immutable_hidden_and_acknowledged_after_durable_commit(
     assert "Ответили: 2" in hidden and "User 42 <&>" in hidden and "@user_43" in hidden
     assert all(option not in hidden for option in record.value.question.choices)
     if rig.feature == "geoguess":
-        assert all(value not in hidden for value in ("Фото:", PHOTO.author, PHOTO.license))
+        assert_photo_credit_hidden(hidden, edits(rig)[-1].caption_entities)
     answers = [method.text for method in rig.session.methods if isinstance(method, AnswerCallbackQuery)]
     assert "Ответ принят" in answers[0] and "Изменить его нельзя" in answers[1]
     commits = [request for operation, request in rig.backend.calls if operation == "commit"]
