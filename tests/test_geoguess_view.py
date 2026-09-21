@@ -25,7 +25,7 @@ def entity_text(caption: str, entity: MessageEntity) -> str:
     return raw[entity.offset * 2 : (entity.offset + entity.length) * 2].decode("utf-16-le")
 
 
-def test_active_page_hides_answers_and_location_but_keeps_photo_credit():
+def test_active_page_hides_answers_location_and_photo_credit():
     players = [Player(11, "Первый", "first", "Норвегия", True), Player(12, "Второй", None, "Россия")]
     view = render(PHOTO, players, closed=False)
     assert "Ответили: 2" in view.caption
@@ -33,13 +33,22 @@ def test_active_page_hides_answers_and_location_but_keeps_photo_credit():
     assert "10 минут" in view.caption and "может любой" in view.caption
     assert "Выбор каждого покажу в конце" in view.caption
     assert all(hidden not in view.caption for hidden in ("Норвегия", "Россия", "Берген", "✓", "✗"))
-    assert PHOTO.author in view.caption and PHOTO.license in view.caption
+    assert all(hidden not in view.caption for hidden in ("Фото:", PHOTO.author, PHOTO.license, "Источник фотографии", "OpenStreetMap"))
     assert {entity.url for entity in view.entities if entity.url} == {
         "tg://user?id=11",
         "tg://user?id=12",
-        PHOTO.license_url,
     }
+    assert view.caption == view.caption.rstrip()
     assert (view.page, view.pages) == (0, 1)
+
+
+def test_active_pages_never_expose_photo_attribution_and_keep_navigation():
+    players = [Player(index, f"Игрок {index}", None, "Норвегия", True) for index in range(9)]
+    for page in range(3):
+        view = render(PHOTO, players, closed=False, page=page)
+        assert f"Страница {page + 1}/3" in view.caption
+        assert all(hidden not in view.caption for hidden in ("Фото:", PHOTO.author, PHOTO.license, PHOTO.city, PHOTO.country))
+        assert all(entity.url.startswith("tg://user?id=") for entity in view.entities if entity.url)
 
 
 @pytest.mark.parametrize("scored,expected", [(True, "Верно: +1, ошибка: −1"), (False, "Не удалось подтвердить"), (None, "Записываю")])
