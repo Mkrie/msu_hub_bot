@@ -253,7 +253,7 @@ class Game(Payload):
         if self.black is not None:
             raise GameError("Место соперника уже занято.")
         if player.user_id == self.white.user_id:
-            raise GameError("Нужен другой участник: вы играете белыми.")
+            raise GameError("Вы уже организатор этой игры. Дождитесь соперника.")
         if player.user_id == self.bot_id:
             raise GameError("За чёрных ждём человека.")
         self._update(black=player, turn_started=now, revision=self.revision + 1)
