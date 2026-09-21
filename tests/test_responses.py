@@ -3,8 +3,11 @@
 import asyncio
 import io
 import json
+import subprocess
+import sys
 import threading
 import traceback
+from pathlib import Path
 
 import pytest
 from aiogram import Bot
@@ -281,6 +284,71 @@ async def test_cancelled_preparation_finishes_before_borrowed_resource_scope_end
         await task
     assert finished.is_set() and session.methods == []
     path.unlink()
+
+
+@pytest.mark.parametrize("worker_cancelled", [False, True])
+def test_shutdown_cancellation_joins_preparation_before_closing_borrowed_stream(worker_cancelled):
+    # A cancelled worker Task made the cancellation join spin without yielding.
+    # Isolate that regression so its timeout cannot hang the pytest event loop.
+    program = """
+import asyncio
+import io
+import sys
+import threading
+from contextvars import ContextVar
+
+sys.path.insert(0, sys.argv[1])
+from msu_hub_bot.telegram.responses import _prepare_bytes
+
+context = ContextVar("preparation_context")
+
+async def main():
+    context.set("caller")
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release, finished = threading.Event(), threading.Event()
+    stream = io.BytesIO(b"synthetic")
+    read = []
+
+    def prepare():
+        loop.call_soon_threadsafe(entered.set)
+        try:
+            assert release.wait(2)
+            assert context.get() == "caller"
+            read.append(stream.getvalue())
+            if sys.argv[2] == "True":
+                raise asyncio.CancelledError
+            return read[-1]
+        finally:
+            finished.set()
+
+    async def deliver():
+        with stream:
+            try:
+                await _prepare_bytes(prepare)
+            finally:
+                assert finished.is_set()
+
+    task = asyncio.create_task(deliver())
+    await asyncio.wait_for(entered.wait(), 2)
+    # asyncio.Runner shutdown also cancels all pending Tasks before gathering.
+    pending = asyncio.all_tasks() - {asyncio.current_task()}
+    for pending_task in pending:
+        pending_task.cancel()
+    release.set()
+    await asyncio.gather(*pending, return_exceptions=True)
+    assert task.cancelled()
+    assert stream.closed and finished.is_set() and read == [b"synthetic"]
+
+asyncio.run(main())
+"""
+    subprocess.run(
+        [sys.executable, "-c", program, str(Path(responses.__file__).resolve().parents[2]), str(worker_cancelled)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=8,
+    )
 
 
 @pytest.mark.parametrize("source", ["https://example.test/image", URLInputFile("https://example.test/image")])

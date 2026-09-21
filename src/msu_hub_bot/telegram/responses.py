@@ -5,6 +5,7 @@ import io
 import math
 from collections.abc import AsyncIterator, Buffer, Callable, Sequence
 from contextlib import asynccontextmanager
+from contextvars import copy_context
 from dataclasses import dataclass, field
 from itertools import islice
 from pathlib import Path
@@ -156,7 +157,10 @@ def _image_bytes(image: Image.Image, limit: int) -> bytes:
 
 
 async def _prepare_bytes(prepare: Callable[[], bytes]) -> bytes:
-    worker = asyncio.create_task(asyncio.to_thread(prepare))
+    # Loop shutdown cancels every Task, including a to_thread wrapper. Keep the
+    # executor Future itself so cancellation cannot erase our join handle.
+    context = copy_context()
+    worker = asyncio.get_running_loop().run_in_executor(None, lambda: context.run(prepare))
     try:
         return await asyncio.shield(worker)
     except asyncio.CancelledError:
@@ -166,6 +170,8 @@ async def _prepare_bytes(prepare: Callable[[], bytes]) -> bytes:
             try:
                 await asyncio.shield(worker)
             except asyncio.CancelledError:
+                if worker.done():
+                    break
                 continue
             except Exception:
                 break
