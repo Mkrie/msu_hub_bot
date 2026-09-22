@@ -2,11 +2,12 @@
 
 import asyncio
 from collections.abc import Sequence
-from dataclasses import dataclass
-from typing import Any, TypedDict, Unpack
+from dataclasses import replace
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, Unpack, overload
 
 from aiogram import Bot
-from aiogram.methods import AnswerCallbackQuery
+from aiogram.fsm.context import FSMContext
+from aiogram.methods import AnswerCallbackQuery, TelegramMethod
 from aiogram.types import (
     CallbackQuery,
     Chat,
@@ -36,6 +37,11 @@ from .delivery import (
     send_response,
 )
 from .formatting import ResponseError, units
+from .isolation import IsolationError, IsolationScope, ScopedStorage
+from .outcome import Acknowledgement, InputIssue, InvocationOutcome, Presentation, attach_outcome
+
+if TYPE_CHECKING:
+    from .inputs import InputError
 
 
 class ReplyOptions(TypedDict, total=False):
@@ -47,7 +53,6 @@ class ReplyOptions(TypedDict, total=False):
     animation: MediaSource | None
     entities: Sequence[MessageEntity] | None
     reply_markup: ReplyMarkupUnion | None
-    fixed: bool
     width: int | None
     height: int | None
     duration: int | None
@@ -93,6 +98,22 @@ class Context:
         self.response_target: Target | None = self.message
         self.delivery_progress: DeliveryProgress | None = None
         self.has_effects = False
+        self._handler_returned = False
+        self._presentations: list[tuple[Literal["reply", "edit", "native"], DeliveryProgress]] = []
+        self._input_issue: InputIssue | None = None
+        self._isolation_released = False
+        # The host bridge attests that native state loading and route selection
+        # occurred under its current task's lock. Host ownership stays external.
+        release = self.data.get("_teleforge_release_isolation")
+        if release is not None and "_teleforge_isolation" not in self.data:
+            if not callable(release):
+                raise TypeError("The terminal isolation bridge must be an async callable")
+            scope = IsolationScope.from_host(release)
+            self.data["_teleforge_isolation"] = scope
+            state = self.data.get("state")
+            if isinstance(state, FSMContext):
+                state.storage = ScopedStorage(state.storage, scope)
+                self.data["fsm_storage"] = state.storage
         if isinstance(event, CallbackQuery | ChosenInlineResult) and event.inline_message_id:
             self.response_target = DeliveryTarget(inline_message_id=event.inline_message_id)
         elif self.response_target is None:
@@ -120,11 +141,109 @@ class Context:
     def actor(self) -> User | None:
         return self.user
 
+    @property
+    def outcome(self) -> InvocationOutcome:
+        return InvocationOutcome(
+            handler_returned=self._handler_returned,
+            acknowledgement=self.acknowledgement if isinstance(self, CallbackContext) else None,
+            presentations=tuple(
+                Presentation(
+                    kind,
+                    progress.attempted_part is not None,
+                    len(progress.confirmed) or int(progress.phase == "complete"),
+                    progress.uncertain,
+                    progress.phase,
+                )
+                for kind, progress in self._presentations
+            ),
+            input_issue=self._input_issue,
+        )
+
+    async def release_isolation(self) -> None:
+        """Promise terminal selection: no later FSM access or SkipHandler continuation."""
+        scope = self.data.get("_teleforge_isolation")
+        if isinstance(scope, IsolationScope):
+            self._isolation_released = True
+            await scope.release()
+        elif "_teleforge_isolation" not in self.data and (
+            self.data.get("state") is not None or self.data.get("fsm_storage") is not None
+        ):
+            raise IsolationError(
+                "Early acknowledgement/coalescing requires terminal FSM release; "
+                "use App.create_dispatcher() or a host integration with an explicit release scope"
+            )
+        self._isolation_released = True
+
+    async def guide(self, issue: str | Text | InputError) -> None:
+        """Explicitly present a structured user issue; developer errors should propagate."""
+        from .inputs import InputError
+
+        text: str | Text
+        if isinstance(issue, InputError):
+            self._input_issue = InputIssue(issue.code, tuple(sorted(issue.params.items())))
+            formatter = self.data.get("_teleforge_input_formatter", str)
+            if not callable(formatter):
+                raise TypeError("The input issue formatter must be callable")
+            text = formatter(issue)
+            if not isinstance(text, str):
+                raise TypeError("The input issue formatter must return a string")
+        else:
+            self._input_issue = InputIssue("guidance", ())
+            text = issue
+        can_answer = (
+            isinstance(self, CallbackContext) and self.acknowledgement.owned and not self.acknowledgement.attempted
+        )
+        if not can_answer and not isinstance(self.message, Message):
+            if isinstance(issue, InputError):
+                raise issue
+            raise ResponseError("Input guidance requires an available chat target or callback acknowledgement")
+        try:
+            if can_answer:
+                assert isinstance(self, CallbackContext)
+                if isinstance(text, Text):
+                    text = text.render()[0]
+                used = 0
+                for index, character in enumerate(text):
+                    used += 2 if ord(character) > 0xFFFF else 1
+                    if used > 180:
+                        text = text[:index]
+                        break
+                await self.answer(text, show_alert=True)
+            else:
+                await self.reply(text, to=self.message, policy=ResponsePolicy(rich=False, soft_messages=1))
+        except (DeliveryError, ResponseError) as error:
+            if isinstance(issue, InputError):
+                issue.add_note(f"Input guidance could not be delivered ({type(error).__name__}).")
+                attach_outcome(issue, self.outcome)
+                raise issue from None
+            raise
+
+    @overload
     async def reply(
         self,
         text: str | Text | None = None,
         *,
         to: Target | None = None,
+        fixed: Literal[True],
+        **options: Unpack[ReplyOptions],
+    ) -> Message: ...
+
+    @overload
+    async def reply(
+        self,
+        text: str | Text | None = None,
+        *,
+        to: Target | None = None,
+        fixed: bool = False,
+        **options: Unpack[ReplyOptions],
+    ) -> Message | list[Message]: ...
+
+    async def reply(
+        self,
+        text: str | Text | None = None,
+        *,
+        to: Target | None = None,
+        fixed: bool = False,
         **options: Unpack[ReplyOptions],
     ) -> Message | list[Message]:
         target = to if to is not None else self.response_target
@@ -135,8 +254,12 @@ class Context:
         options.setdefault("policy", self.policy)
         progress = options.get("progress") or DeliveryProgress()
         options["progress"] = self.delivery_progress = progress
+        self._presentations.append(("reply", progress))
         try:
-            result = await send_response(self.bot, target, text, **options)
+            result = await send_response(self.bot, target, text, fixed=fixed, **options)
+        except BaseException as error:
+            attach_outcome(error, self.outcome)
+            raise
         finally:
             self.has_effects |= bool(progress.confirmed) or progress.uncertain
         self.has_effects = True
@@ -162,10 +285,36 @@ class Context:
         options.setdefault("policy", self.policy)
         progress = options.get("progress") or DeliveryProgress()
         options["progress"] = self.delivery_progress = progress
+        self._presentations.append(("edit", progress))
         try:
             result = await edit_response(self.bot, target, text, **options)
+        except BaseException as error:
+            attach_outcome(error, self.outcome)
+            raise
         finally:
             self.has_effects |= bool(progress.confirmed) or progress.uncertain
+        self.has_effects = True
+        return result
+
+    async def _execute_native(self, method: TelegramMethod[Any]) -> object:
+        if (
+            isinstance(self, CallbackContext)
+            and isinstance(method, AnswerCallbackQuery)
+            and method.callback_query_id == self.query.id
+        ):
+            return await self._answer_method(method)
+        if not method.__api_method__.startswith(("send", "editMessage", "copyMessage", "forwardMessage")):
+            return await self.bot(method)
+        progress = DeliveryProgress(attempted_part=0, total_parts=1, phase="sending", uncertain=True)
+        self._presentations.append(("native", progress))
+        try:
+            result = await self.bot(method)
+        except BaseException as error:
+            progress.phase = "cancelled" if isinstance(error, asyncio.CancelledError) else "failed"
+            progress.uncertain = not isinstance(error, Exception) or not rejected(error)
+            attach_outcome(error, self.outcome)
+            raise
+        progress.phase, progress.uncertain = "complete", False
         self.has_effects = True
         return result
 
@@ -187,13 +336,9 @@ class MessageContext(Context):
     def message(self) -> Message:
         return self.event
 
-
-@dataclass(slots=True)
-class Acknowledgement:
-    owned: bool = True
-    attempted: bool = False
-    confirmed: bool = False
-    uncertain: bool = False
+    @property
+    def chat(self) -> Chat:
+        return self.event.chat
 
 
 class CallbackContext(Context):
@@ -209,11 +354,23 @@ class CallbackContext(Context):
     ) -> None:
         super().__init__(bot, event, data=data, policy=policy)
         self.query = event
-        self.acknowledgement = Acknowledgement()
+        self._acknowledgement = Acknowledgement()
+
+    @property
+    def user(self) -> User:
+        return self.query.from_user
+
+    @property
+    def actor(self) -> User:
+        return self.user
+
+    @property
+    def acknowledgement(self) -> Acknowledgement:
+        return self._acknowledgement
 
     def manual_ack(self) -> CallbackQuery:
         """Give acknowledgement ownership to a native handler; finish becomes inert."""
-        self.acknowledgement.owned = False
+        self._acknowledgement = replace(self.acknowledgement, owned=False)
         return self.query
 
     async def answer(
@@ -240,20 +397,31 @@ class CallbackContext(Context):
         method = AnswerCallbackQuery(
             callback_query_id=self.query.id, text=text, show_alert=show_alert, url=url, cache_time=cache_time
         )
-        state.attempted, state.uncertain = True, True
+        return await self._answer_method(method, request_timeout=request_timeout)
+
+    async def _answer_method(self, method: AnswerCallbackQuery, *, request_timeout: int | None = None) -> bool | None:
+        if self.acknowledgement.attempted:
+            return None
+        self._acknowledgement = replace(self.acknowledgement, attempted=True, uncertain=True)
         try:
             async with asyncio.timeout(self.policy.timeout):
                 result = await self.bot(method, request_timeout=request_timeout)
             if result is not True:
                 raise ValueError("Telegram did not confirm the acknowledgement")
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
+            attach_outcome(error, self.outcome)
             raise
         except Exception as error:  # noqa: BLE001 - acknowledgement write boundary
-            state.uncertain = not rejected(error)
-            raise DeliveryError(
-                DeliveryProgress(attempted_part=0, total_parts=1, phase="failed", uncertain=state.uncertain), error
-            ) from None
-        state.confirmed, state.uncertain = True, False
+            self._acknowledgement = replace(self.acknowledgement, uncertain=not rejected(error))
+            failure = DeliveryError(
+                DeliveryProgress(
+                    attempted_part=0, total_parts=1, phase="failed", uncertain=self.acknowledgement.uncertain
+                ),
+                error,
+            )
+            attach_outcome(failure, self.outcome)
+            raise failure from None
+        self._acknowledgement = replace(self.acknowledgement, confirmed=True, uncertain=False)
         return True
 
     async def finish(self) -> None:

@@ -11,12 +11,11 @@ from enum import Enum
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import UnionType
-from typing import Annotated, Any, Literal, Union, get_args, get_origin, get_type_hints
+from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeAliasType, Union, get_args, get_origin, get_type_hints
 
 from aiogram.types import (
     Animation,
     Audio,
-    CallbackQuery,
     Document,
     Message,
     PhotoSize,
@@ -29,16 +28,17 @@ from aiogram.types import (
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
 from .context import Context
+from .issues import ConfigurationError as ConfigurationError
+from .issues import InputError as InputError
 from .rich_input import rich_media, rich_text
 
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 _MISSING = object()
-_RESERVED = {"ctx", "context", "event", "message", "query", "bot", "state", "callback_data"}
 type Downloadable = PhotoSize | Document | Video | Animation | VideoNote | Sticker | Audio | Voice
 
 
-class InputError(ValueError):
-    """Brief, safe guidance for a selected invocation's unusable input."""
+if TYPE_CHECKING:
+    from .parameters import ParameterPlan
 
 
 class _ValidatedPayload(dict[str, Any]):
@@ -140,6 +140,8 @@ _MEDIA = (ImageInput, VideoInput, DocumentInput, MediaInput)
 
 def representation(annotation: Any) -> Any:
     """Unwrap Annotated and one optional type without flattening meaningful unions."""
+    if isinstance(annotation, TypeAliasType):
+        return representation(annotation.__value__)
     if get_origin(annotation) is Annotated:
         return representation(get_args(annotation)[0])
     if get_origin(annotation) in (Union, UnionType):
@@ -197,7 +199,7 @@ class _LimitedBuffer(io.BytesIO):
 
     def write(self, data: Any) -> int:
         if self.tell() + len(data) > self.limit:
-            raise InputError("The attachment is too large. Please send a smaller file.")
+            raise InputError("attachment-too-large")
         return super().write(data)
 
 
@@ -209,11 +211,11 @@ async def _download(
     downloads: dict[str, io.BytesIO],
 ) -> io.BytesIO:
     if (media.file_size or 0) > limit:
-        raise InputError("The attachment is too large. Please send a smaller file.")
+        raise InputError("attachment-too-large")
     if media.file_id in downloads:
         cached = downloads[media.file_id]
         if cached.getbuffer().nbytes > limit:
-            raise InputError("The attachment is too large. Please send a smaller file.")
+            raise InputError("attachment-too-large")
         cached.seek(0)
         return cached
     stream = _LimitedBuffer(limit)
@@ -226,9 +228,9 @@ async def _download(
 
 def _check_text(text: str, declaration: TextInput) -> str:
     if declaration.max_chars is not None and len(text) > declaration.max_chars:
-        raise InputError(f"Text is too long; use at most {declaration.max_chars} characters.")
+        raise InputError("text-too-long", limit=declaration.max_chars)
     if len(text.encode("utf-8")) > declaration.max_bytes:
-        raise InputError("Text is too large. Please send less text.")
+        raise InputError("text-too-large")
     return text
 
 
@@ -260,7 +262,7 @@ async def _text(
                     try:
                         text = stream.getvalue().decode("utf-8")
                     except UnicodeDecodeError:
-                        raise InputError("Please send a UTF-8 text file.") from None
+                        raise InputError("text-encoding") from None
                     return target, _check_text(text, declaration)
     return None, ""
 
@@ -331,7 +333,7 @@ async def _decode(payload: bytes, declaration: MediaDeclaration, ctx: Context, r
     try:
         from PIL import Image, UnidentifiedImageError
     except ImportError:
-        raise InputError("Image decoding requires the teleforge[media] extra.") from None
+        raise ConfigurationError("Image decoding requires the teleforge[media] extra.") from None
     max_pixels = declaration.max_pixels if isinstance(declaration, ImageInput) else 16_000_000
     max_dimension = declaration.max_dimension if isinstance(declaration, ImageInput) else 8192
 
@@ -341,7 +343,7 @@ async def _decode(payload: bytes, declaration: MediaDeclaration, ctx: Context, r
             try:
                 width, height = image.size
                 if width * height > max_pixels or max(width, height) > max_dimension:
-                    raise InputError("The image dimensions are too large. Please resize it.")
+                    raise InputError("image-dimensions")
                 image.load()
             except BaseException:
                 image.close()
@@ -375,7 +377,7 @@ async def _decode(payload: bytes, declaration: MediaDeclaration, ctx: Context, r
         else:
             image = await run()
     except UnidentifiedImageError, OSError, Image.DecompressionBombError:
-        raise InputError("Could not decode the image. Please send another image.") from None
+        raise InputError("image-decode") from None
     resources.callback(image.close)
     return image
 
@@ -389,7 +391,7 @@ async def _media_value(
     downloads: dict[str, io.BytesIO],
 ) -> Any:
     if (media.file_size or 0) > declaration.max_bytes:
-        raise InputError("The attachment is too large. Please send a smaller file.")
+        raise InputError("attachment-too-large")
     requested = representation(annotation)
     is_image = getattr(requested, "__module__", "") == "PIL.Image" and getattr(requested, "__name__", "") == "Image"
     if requested not in (bytes, io.BytesIO, Path) and not is_image:
@@ -419,23 +421,38 @@ async def prepare_arguments(
     *,
     tail: str | None = None,
     payload: BaseModel | Mapping[str, Any] | None = None,
+    plan: ParameterPlan | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
-    """Prepare arguments once; keep streams/images/paths alive through delivery.
+    """Acquire the compiled values and own their resources through delivery.
 
-    Callback values come from a validated native model or the card codec. They
-    are never interpreted as command tokens or rescued with command defaults.
-    An explicitly selected callback input can be supplied in input_sources.
+    Direct callers may omit the plan; entrypoint adapters always pass their
+    compiled plan. Middleware values never change a parameter's selected source.
     """
-    signature = inspect.signature(handler)
-    annotations = annotations_for(handler)
+    from .declarations import Declaration as HandlerDeclaration
+    from .parameters import checked_dependency, compile_parameters
+
     payload_values = (
         {name: getattr(payload, name) for name in type(payload).model_fields}
         if isinstance(payload, BaseModel)
         else dict(payload or {})
     )
-    if payload_values.keys() & _RESERVED:
-        raise InputError("Callback data conflicts with invocation context.")
-    tokens = list(re.finditer(r"\S+", tail or ""))
+    if plan is None:
+        hints = annotations_for(handler)
+        kind: Literal["command", "callback", "event"] = (
+            "command" if tail is not None else "callback" if payload is not None else "event"
+        )
+        plan, issues = compile_parameters(
+            handler,
+            HandlerDeclaration(kind=kind, inputs=declarations),
+            annotations=hints,
+            payload_fields={name: hints.get(name, Any) for name in payload_values},
+        )
+        if issues:
+            raise ConfigurationError("; ".join(issue.message for issue in issues))
+    # Native event/filter data may contain a CommandObject without making this
+    # event declaration a command. Only the compiled command plan consumes it.
+    command_tail = (tail or "") if plan.command else None
+    tokens = list(re.finditer(r"\S+", command_tail or ""))
     position = consumed = 0
     contiguous = True
     values: dict[str, Any] = {}
@@ -445,51 +462,35 @@ async def prepare_arguments(
     source_media: Message | None = None
     with _owned_inputs() as resources:
         downloads: dict[str, io.BytesIO] = {}
-        for name, parameter in signature.parameters.items():
-            if name in {"self", "cls"}:
-                continue
-            annotation = annotations.get(name, parameter.annotation)
-            declaration = declarations.get(name)
-            default = parameter.default
-            if isinstance(declaration, TextInput):
+        for parameter in plan.parameters:
+            name, annotation, default = parameter.name, parameter.annotation, parameter.default
+            declaration = parameter.declaration
+            source = parameter.source
+            if source == "text":
+                assert isinstance(declaration, TextInput)
                 text_parameters.append((name, annotation, default, declaration))
-                continue
-            if isinstance(declaration, _MEDIA):
+            elif source == "media":
+                assert isinstance(declaration, _MEDIA)
                 media_parameters.append((name, annotation, default, declaration))
-                continue
-            if name in {"ctx", "context"}:
-                if isinstance(annotation, type) and not isinstance(ctx, annotation):
-                    raise InputError("This handler requires a different Telegram context.")
-                values[name] = ctx
-            elif name == "event":
-                values[name] = event
-            elif name == "bot":
-                values[name] = ctx.bot
-            elif (
-                name == "message" and isinstance(event, Message) or name == "query" and isinstance(event, CallbackQuery)
-            ):
-                values[name] = event
-            elif name in payload_values:
-                if name in data:
-                    raise InputError(f"Callback field '{name}' conflicts with a supplied dependency.")
+            elif source == "context":
+                values[name] = checked_dependency(annotation, ctx, name)
+            elif source == "event":
+                values[name] = checked_dependency(annotation, event, name)
+            elif source == "bot":
+                values[name] = checked_dependency(annotation, ctx.bot, name)
+            elif source == "callback_payload":
+                if name not in payload_values:
+                    raise InputError("callback-invalid")
                 if isinstance(payload, BaseModel | _ValidatedPayload):
-                    # Native CallbackData and the managed codec already validated
-                    # these fields. Re-running a transforming validator changes IDs.
+                    # CallbackData and managed codecs have already run validators;
+                    # reading their exact values must not transform them a second time.
                     values[name] = payload_values[name]
-                    continue
-                try:
-                    # Pydantic CallbackData has already run its validators. The
-                    # function's compatible annotation cannot change its values.
-                    values[name] = _validate(annotation, payload_values[name], strict=True)
-                except ValidationError:
-                    raise InputError("This button is no longer valid. Please open the feature again.") from None
-            elif name in data and declaration is None:
-                values[name] = data[name]
-            elif payload is not None:
-                if default is inspect.Parameter.empty:
-                    raise InputError(f"Callback data is missing '{name}'.")
-                values[name] = default
-            elif isinstance(declaration, Argument) or ordinary(annotation):
+                else:
+                    try:
+                        values[name] = _validate(annotation, payload_values[name], strict=True)
+                    except ValidationError:
+                        raise InputError("callback-invalid") from None
+            elif source == "argument":
                 rule = declaration if isinstance(declaration, Argument) else Argument()
                 raw = tokens[position].group() if position < len(tokens) else _MISSING
                 position += 1
@@ -499,51 +500,60 @@ async def prepare_arguments(
                         parsed = _validate(annotation, raw)
                     except ValidationError:
                         if rule.strict:
-                            raise InputError(f"Invalid value for '{name}'.") from None
+                            raise InputError("argument-invalid", parameter=name) from None
                 if parsed is _MISSING:
                     contiguous = False
                     if default is inspect.Parameter.empty:
-                        raise InputError(f"Provide a valid value for '{name}'.")
-                    parsed = _validate(annotation, default)
+                        raise InputError("argument-missing", parameter=name)
+                    try:
+                        parsed = _validate(annotation, default)
+                    except ValidationError:
+                        raise ConfigurationError(f"Argument '{name}' has an invalid default") from None
                 elif contiguous:
                     consumed = tokens[position - 1].end()
                 if rule.clamp is not None and isinstance(parsed, (int, float)):
                     parsed = max(rule.clamp[0], min(rule.clamp[1], parsed))
                     parsed = _validate(annotation, parsed)
                 values[name] = parsed
-            elif default is not inspect.Parameter.empty:
-                values[name] = default
             else:
-                raise TypeError(f"Missing injected dependency '{name}' for {handler.__qualname__}")
+                if name in data:
+                    value = data[name]
+                elif default is not inspect.Parameter.empty:
+                    value = default
+                else:
+                    raise ConfigurationError(f"Missing injected dependency '{name}' for {handler.__qualname__}")
+                values[name] = checked_dependency(annotation, value, name)
 
-        remaining = (tail[consumed:].lstrip() if consumed else tail) if tail is not None else None
+        remaining = (
+            (command_tail[consumed:].lstrip() if consumed else command_tail) if command_tail is not None else None
+        )
         for name, annotation, default, declaration_text in text_parameters:
-            source, value = await _text(
+            source_message, value = await _text(
                 event, ctx, declaration_text, remaining, resources, downloads, ctx.input_sources.get(name)
             )
             if not value:
                 if default is inspect.Parameter.empty:
-                    raise InputError(f"Provide text for '{name}'.")
+                    raise InputError("text-missing", parameter=name)
                 value = default
             values[name] = _validate(annotation, value)
-            if source is not None:
-                ctx.input_sources[name] = source
-                source_text = source
+            if source_message is not None:
+                ctx.input_sources[name] = source_message
+                source_text = source_message
         for name, annotation, default, declaration_media in media_parameters:
-            source, media = await _select_media(event, ctx, declaration_media, ctx.input_sources.get(name))
+            source_message, media = await _select_media(event, ctx, declaration_media, ctx.input_sources.get(name))
             if media is None:
                 if default is inspect.Parameter.empty:
-                    raise InputError(f"Attach or reply to media for '{name}'.")
+                    raise InputError("media-missing", parameter=name)
                 value_media = _validate(annotation, default)
             else:
                 try:
                     value_media = await _media_value(media, annotation, declaration_media, ctx, resources, downloads)
                 except ValidationError:
-                    raise InputError(f"The attachment has the wrong media type for '{name}'.") from None
+                    raise InputError("media-type", parameter=name) from None
             values[name] = value_media
-            if source is not None:
-                ctx.input_sources[name] = source
-                source_media = source
+            if source_message is not None:
+                ctx.input_sources[name] = source_message
+                source_media = source_message
         if isinstance(event, Message) and (selected_source := source_media or source_text) is not None:
             ctx.response_target = selected_source
         yield values

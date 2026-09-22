@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import io
 from datetime import UTC, datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated, Literal
 
 import pytest
 from aiogram.methods import AnswerCallbackQuery, EditMessageText, SendMessage
-from aiogram.types import CallbackQuery, Chat, Message, User
+from aiogram.types import CallbackQuery, Chat, InlineKeyboardButton, Message, MessageEntity, Update, User
 from pydantic import AfterValidator
 
-from teleforge.cards import Button, Card, CardError, CardRefreshError, action, card, show
-from teleforge.context import CallbackContext, Context
+from teleforge.app import App
+from teleforge.binding import invoke_handler
+from teleforge.cards import Button, Card, CardContent, CardError, CardRefreshError, action, card, prepare_card, show
+from teleforge.context import Context
 from teleforge.declarations import declarations_of, disable
-from teleforge.feature import Feature
+from teleforge.delivery import DeliveryTarget, edit_response, send_response
+from teleforge.feature import CompilationError, Feature, compile_feature
+from teleforge.issues import ConfigurationError
 from teleforge.testing import RecordingBot
 
 
@@ -75,11 +80,11 @@ class Counter(Feature, key="counter"):
         finally:
             self.active -= 1
 
-    @action(card="panel")
+    @action(key="increase", card="panel")
     async def increase(self, ctx: Context, item: int, revision: int) -> None:
         await self.change(ctx, revision, 1)
 
-    @action(card="panel")
+    @action(key="decrease", card="panel")
     async def decrease(self, ctx: Context, item: int, revision: int) -> None:
         await self.change(ctx, revision, -1)
 
@@ -110,16 +115,10 @@ async def click(
     if matched is False:
         return False
     assert isinstance(matched, dict)
-    ctx = CallbackContext(bot, callback, data=matched)
-
-    async def invoke() -> object:
-        values: dict[str, Any] = matched["_teleforge_payload"]
-        return await getattr(feature, method)(ctx=ctx, **values)
-
-    assert declaration.hook is not None
-    result = await declaration.hook(feature, ctx, matched, invoke)
-    await ctx.finish()
-    return result
+    compiled, errors = compile_feature(feature)
+    assert not errors
+    handler = next(item for item in compiled if item.name == method)
+    return await invoke_handler(handler, callback, bot=bot, **matched)
 
 
 async def test_action_changes_once_refreshes_keyboard_and_rejects_stale_click() -> None:
@@ -182,7 +181,7 @@ async def test_successful_mutation_is_not_replayed_after_refresh_failure() -> No
     feature.fail_render = True
     with pytest.raises(CardRefreshError) as caught:
         await click(bot, feature, ui, callbacks[0])
-    assert caught.value.applied and isinstance(caught.value.__cause__, RuntimeError)
+    assert caught.value.handler_returned and isinstance(caught.value.__cause__, RuntimeError)
     assert feature.value == 1 and feature.revision == 1
     with pytest.raises(StaleClick):
         await click(bot, feature, ui, callbacks[0])
@@ -195,7 +194,7 @@ async def test_oversized_button_fails_before_sending() -> None:
         async def panel(self, ctx: Context) -> Card:
             return Card("large", buttons=((Button("run", self.run, value="x" * 70),),))
 
-        @action(card="panel")
+        @action(key="run", card="panel")
         async def run(self, ctx: Context, value: str) -> None:
             pass
 
@@ -230,7 +229,7 @@ async def test_read_only_refresh_acknowledges_early_and_coalesces_busy_clicks() 
     entered, release = asyncio.Event(), asyncio.Event()
 
     class Refresh(Counter):
-        @action(card="panel", ack="early", coalesce=True)
+        @action(key="increase", card="panel", ack="early", coalesce=True)
         async def increase(self, ctx: Context, item: int, revision: int) -> None:
             assert any(isinstance(request, AnswerCallbackQuery) for request in ctx.bot.requests)
             entered.set()
@@ -252,7 +251,7 @@ async def test_read_only_refresh_acknowledges_early_and_coalesces_busy_clicks() 
 
 async def test_explicit_refresh_barrier_preserves_committed_action_without_edit() -> None:
     class Preview(Counter):
-        @action(card="panel", refresh=False)
+        @action(key="increase", card="panel", refresh=False)
         async def increase(self, ctx: Context, item: int, revision: int) -> None:
             await self.change(ctx, revision, 1)
 
@@ -265,7 +264,7 @@ async def test_explicit_refresh_barrier_preserves_committed_action_without_edit(
 
 async def test_numeric_literal_payload_does_not_accept_boolean_or_float_equivalents() -> None:
     class LiteralCounter(Counter):
-        @action(card="panel")
+        @action(key="increase", card="panel")
         async def increase(self, ctx: Context, item: int, revision: Literal[0, 1]) -> None:
             await self.change(ctx, revision, 1)
 
@@ -283,7 +282,7 @@ async def test_renderer_defaults_are_bound_into_actions_before_action_defaults()
         async def panel(self, ctx: Context, item: int = 1) -> Card:
             return Card(f"Item {item}", buttons=((Button("+", self.increase, revision=0),),))
 
-        @action(card="panel")
+        @action(key="increase", card="panel")
         async def increase(self, ctx: Context, item: int = 2, revision: int = 0) -> None:
             self.value = item
 
@@ -309,7 +308,7 @@ async def test_card_coalescing_is_owned_by_each_feature_instance() -> None:
             super().__init__()
             self.pause = pause
 
-        @action(card="panel", coalesce=True)
+        @action(key="increase", card="panel", coalesce=True)
         async def increase(self, ctx: Context, item: int, revision: int) -> None:
             if self.pause:
                 entered.set()
@@ -339,7 +338,7 @@ async def test_validator_function_addresses_do_not_change_button_identity() -> N
         class Typed(Counter, key="stable"):
             Revision = Annotated[int, AfterValidator(validate)]
 
-            @action(card="panel")
+            @action(key="increase", card="panel")
             async def increase(self, ctx: Context, item: int, revision: Revision) -> None:
                 await self.change(ctx, revision, 1)
 
@@ -358,7 +357,7 @@ async def test_cancelled_waiter_releases_only_its_own_card_lock_registration() -
     entered, release = asyncio.Event(), asyncio.Event()
 
     class Waiting(Counter):
-        @action(card="panel")
+        @action(key="increase", card="panel")
         async def increase(self, ctx: Context, item: int, revision: int) -> None:
             entered.set()
             await release.wait()
@@ -390,7 +389,7 @@ async def test_transforming_callback_validator_cannot_retarget_the_displayed_rec
         async def panel(self, ctx: Context, item: Item) -> Card:
             return Card(f"Record {item}", buttons=((Button("+", self.increase, revision=0),),))
 
-        @action(card="panel")
+        @action(key="increase", card="panel")
         async def increase(self, ctx: Context, item: Item, revision: int) -> None:
             self.value = item
 
@@ -398,3 +397,218 @@ async def test_transforming_callback_validator_cannot_retarget_the_displayed_rec
     with pytest.raises(CardError, match="normalize before building"):
         await open_card(bot, Transforming())
     assert not bot.requests
+
+
+def payload_of(content: CardContent) -> str:
+    payload = content["reply_markup"].inline_keyboard[0][0].callback_data
+    assert payload is not None
+    return payload
+
+
+def update_for(payload: str, *, update_id: int = 1, actor: int = 7) -> Update:
+    return Update(
+        update_id=update_id,
+        callback_query=CallbackQuery(
+            id=str(update_id),
+            from_user=User(id=actor, is_bot=False, first_name="Synthetic"),
+            chat_instance="test",
+            message=message(actor=42),
+            data=payload,
+        ),
+    )
+
+
+class CardStore:
+    def __init__(self) -> None:
+        self.value = 0
+        self.rendered: list[int] = []
+
+
+async def test_stable_key_replays_after_method_renames_and_dependency_additions() -> None:
+    class Before(Feature, key="stable"):
+        @card
+        def panel(self, item: int) -> Card:
+            return Card("Before", buttons=((Button("+", self.increase, delta=1),),))
+
+        @action(key="increase", card="panel")
+        async def increase(self, item: int, delta: int) -> None:
+            pass
+
+    class After(Feature, key="stable"):
+        @card
+        def renamed_panel(self, item: int, *, store: CardStore) -> Card:
+            store.rendered.append(item)
+            return Card(f"Value {store.value}", buttons=((Button("+", self.renamed_action, delta=1),),))
+
+        @action(key="increase", card="renamed_panel")
+        async def renamed_action(self, item: int, delta: int, *, store: CardStore) -> None:
+            assert item == 3
+            store.value += delta
+
+    feature, store = After(), CardStore()
+    old = await prepare_card(Before().panel, item=3)
+    fresh = await prepare_card(feature.renamed_panel, item=3, data={"store": store})
+    assert payload_of(old) == payload_of(fresh)
+    app, bot = App(feature, data={"store": store, "item": "middleware must not shadow payload"}), RecordingBot()
+    try:
+        await app.feed_update(bot, update_for(payload_of(old)))
+        assert store.value == 1 and store.rendered == [3, 3]
+        edits = [request for request in bot.requests if isinstance(request, EditMessageText)]
+        assert len(edits) == 1 and edits[0].text == "Value 1"
+    finally:
+        await app.aclose()
+
+
+async def test_eventless_worker_preparation_uses_native_delivery_and_borrowed_media() -> None:
+    bot = RecordingBot()
+    stream = io.BytesIO(b"prepared document")
+    native = InlineKeyboardButton(text="Native", callback_data="application:1")
+    try:
+        content = await prepare_card(
+            Card(
+                "Worker output",
+                document=stream,
+                entities=(MessageEntity(type="bold", offset=0, length=6),),
+                buttons=((native,),),
+            )
+        )
+        assert content["document"] is stream and not stream.closed and not bot.requests
+        sent = await send_response(bot, DeliveryTarget(chat_id=-100, thread_id=5), **content, fixed=True)
+        assert isinstance(sent, Message)
+        assert sent.reply_markup is not None and sent.reply_markup.inline_keyboard[0][0] == native
+        assert not stream.closed
+        updated = await prepare_card(Card("Updated", buttons=((native,),)))
+        await edit_response(bot, DeliveryTarget(chat_id=-100, message_id=sent.message_id, kind="document"), **updated)
+        assert any(b"prepared document" in uploads.values() for uploads in bot.recording.uploads)
+    finally:
+        stream.close()
+
+
+async def test_plain_renderer_has_explicit_dependencies_without_an_invocation() -> None:
+    def render(item: int, *, store: CardStore) -> Card:
+        store.rendered.append(item)
+        return Card(f"Item {item}")
+
+    store = CardStore()
+    prepared = await prepare_card(render, item=4, data={"store": store})
+    assert prepared["text"] == "Item 4" and store.rendered == [4]
+    with pytest.raises(CardError, match="Missing renderer dependency"):
+        await prepare_card(render, item=4)
+    with pytest.raises(ConfigurationError, match="declared type"):
+        await prepare_card(render, item=4, data={"store": object()})
+    with pytest.raises(CardError, match="Unknown"):
+        await prepare_card(render, item=4, store=store)
+    with pytest.raises(CardError, match="explicit invocation context"):
+        await prepare_card(Counter().panel, item=4)
+
+
+@pytest.mark.parametrize("problem", ["missing", "schema"])
+async def test_static_card_errors_agree_between_check_router_and_preparation(problem: str) -> None:
+    class Broken(Feature):
+        @card
+        def panel(self, item: str) -> Card:
+            return Card("Broken", buttons=((Button("Go", self.go),),))
+
+        @action(key="go", card="missing" if problem == "missing" else "panel")
+        async def go(self, item: int) -> None:
+            pass
+
+    feature = Broken()
+    app = App(feature)
+    errors = app.check()
+    assert errors
+    with pytest.raises(CompilationError) as built:
+        app.build_router()
+    with pytest.raises(CardError) as prepared:
+        await prepare_card(feature.panel, item="1")
+    assert any(error.message == str(prepared.value) for error in errors)
+    assert built.value.diagnostics == errors
+
+
+@pytest.mark.parametrize("cross_feature", [False, True])
+async def test_actual_target_lock_spans_renderers_and_features(cross_feature: bool) -> None:
+    entered, release = asyncio.Event(), asyncio.Event()
+    active = maximum = calls = 0
+
+    async def mutate() -> None:
+        nonlocal active, maximum, calls
+        active += 1
+        maximum = max(active, maximum)
+        calls += 1
+        try:
+            entered.set()
+            await release.wait()
+        finally:
+            active -= 1
+
+    class Panels(Feature, key="panels"):
+        @card
+        def left(self) -> Card:
+            return Card("Left", buttons=((Button("Left", self.to_left),),))
+
+        @card
+        def right(self) -> Card:
+            return Card("Right", buttons=((Button("Right", self.to_right),),))
+
+        @action(key="left", card="left")
+        async def to_left(self) -> None:
+            await mutate()
+
+        @action(key="right", card="right")
+        async def to_right(self) -> None:
+            await mutate()
+
+    class Other(Panels, key="other"):
+        pass
+
+    first_feature, other_feature = Panels(), Other()
+    right_feature = other_feature if cross_feature else first_feature
+    app = App(first_feature, other_feature) if cross_feature else App(first_feature)
+    bot = RecordingBot()
+    first = asyncio.create_task(app.feed_update(bot, update_for(payload_of(await prepare_card(first_feature.left)))))
+    await entered.wait()
+    second = asyncio.create_task(
+        app.feed_update(bot, update_for(payload_of(await prepare_card(right_feature.right)), update_id=2, actor=8))
+    )
+    try:
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert calls == 1
+    finally:
+        release.set()
+        await asyncio.gather(first, second)
+        await app.aclose()
+    assert calls == 2 and maximum == 1
+    assert len([request for request in bot.requests if isinstance(request, EditMessageText)]) == 2
+
+
+async def test_preview_delivery_barrier_survives_preparation_and_explicit_refresh() -> None:
+    class Preview(Feature):
+        def __init__(self) -> None:
+            self.preview_delivered = False
+            self.submissions = 0
+
+        @card
+        def panel(self) -> Card:
+            return Card("Exact preview", buttons=((Button("Submit", self.submit),),))
+
+        @action(key="submit", card="panel", refresh=False)
+        async def submit(self) -> None:
+            if not self.preview_delivered:
+                raise PermissionError("The exact preview has not been delivered")
+            self.submissions += 1
+
+    feature, bot = Preview(), RecordingBot()
+    prepared = await prepare_card(feature.panel)
+    app = App(feature)
+    try:
+        with pytest.raises(PermissionError, match="exact preview"):
+            await app.feed_update(bot, update_for(payload_of(prepared)))
+        assert feature.submissions == 0
+        await edit_response(bot, DeliveryTarget(chat_id=-100, message_id=10, kind="text"), **prepared)
+        feature.preview_delivered = True
+        await app.feed_update(bot, update_for(payload_of(prepared), update_id=2))
+        assert feature.submissions == 1
+        assert len([request for request in bot.requests if isinstance(request, EditMessageText)]) == 1
+    finally:
+        await app.aclose()

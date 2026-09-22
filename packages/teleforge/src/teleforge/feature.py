@@ -5,14 +5,12 @@ import re
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from types import UnionType
-from typing import TYPE_CHECKING, Any, ClassVar, Union, cast, get_args, get_origin, get_type_hints
+from typing import TYPE_CHECKING, Any, ClassVar, cast, get_type_hints
 
 from aiogram import Router
 
-from .context import CallbackContext, Context, MessageContext
 from .declarations import Declaration, Handler, declarations_of
-from .inputs import Argument, DocumentInput, ImageInput, MediaInput, TextInput, VideoInput, ordinary, representation
+from .parameters import ParameterPlan, compile_parameters
 
 if TYPE_CHECKING:
     from .app import App
@@ -80,6 +78,7 @@ class CompiledHandler:
     signature: inspect.Signature
     annotations: Mapping[str, Any]
     source: Source
+    plan: ParameterPlan
 
     def as_dict(self) -> dict[str, object]:
         declaration = self.declaration
@@ -92,14 +91,15 @@ class CompiledHandler:
             "source": self.source.as_dict(),
             "parameters": [
                 {
-                    "name": name,
-                    "type": _type_name(self.annotations.get(name, parameter.annotation)),
+                    "name": parameter.name,
+                    "type": _type_name(parameter.annotation),
                     "has_default": parameter.default is not inspect.Parameter.empty,
-                    "input": type(declaration.inputs[name]).__name__ if name in declaration.inputs else None,
+                    "input": type(parameter.declaration).__name__ if parameter.declaration is not None else None,
+                    "source": parameter.source,
+                    "availability": "external" if parameter.source in {"dependency", "native"} else "declared",
                 }
-                for name, parameter in self.signature.parameters.items()
+                for parameter in self.plan.parameters
             ],
-            "output": declaration.output,
             "response": {
                 "rich": declaration.policy.rich,
                 "soft_messages": declaration.policy.soft_messages,
@@ -190,28 +190,10 @@ def compile_feature(feature: Feature) -> tuple[tuple[CompiledHandler, ...], tupl
         except (NameError, TypeError) as exc:
             error("annotation", f"Cannot resolve method annotations ({type(exc).__name__}); use importable types")
             continue
-        for parameter in signature.parameters.values():
-            if parameter.kind in {parameter.POSITIONAL_ONLY, parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD}:
-                error("parameter-kind", f"Parameter '{parameter.name}' must be an ordinary named parameter")
-            if parameter.name not in annotations:
-                error("parameter-type", f"Parameter '{parameter.name}' needs a type annotation")
         for index, declaration in enumerate(declarations):
-            for input_name in declaration.inputs:
-                if input_name not in signature.parameters:
-                    error("input-name", f"Input '{input_name}' is not a method parameter")
-                    continue
-                input_rule = declaration.inputs[input_name]
-                annotation = representation(annotations.get(input_name))
-                if input_name in {"ctx", "context", "event", "bot", "message", "query", "state", "callback_data"}:
-                    error("input-reserved", f"Input '{input_name}' is reserved for invocation context")
-                if not isinstance(
-                    input_rule, Argument | TextInput | ImageInput | VideoInput | DocumentInput | MediaInput
-                ):
-                    error("input-rule", f"Input '{input_name}' needs an Argument, TextInput or media declaration")
-                elif isinstance(input_rule, TextInput) and annotation is not str:
-                    error("input-type", f"Text input '{input_name}' requires a str annotation")
-                elif isinstance(input_rule, Argument) and not ordinary(annotation):
-                    error("input-type", f"Argument '{input_name}' requires an ordinary scalar annotation")
+            plan, parameter_issues = compile_parameters(bound, declaration, annotations=annotations)
+            for issue in parameter_issues:
+                error(issue.code, issue.message)
             if declaration.event is not None and declaration.event not in events:
                 error("event-name", f"Unknown native event '{declaration.event}'")
             if declaration.kind == "command":
@@ -225,37 +207,47 @@ def compile_feature(feature: Feature) -> tuple[tuple[CompiledHandler, ...], tupl
                         "command-name",
                         "Declare nonempty command names; native names use 1–32 letters, digits or underscores",
                     )
-            if declaration.payload:
-                for field_name, field in declaration.payload.model_fields.items():
-                    if field_name in {"ctx", "context", "event", "bot", "message", "query", "state", "callback_data"}:
-                        error("payload-reserved", f"Callback field '{field_name}' is reserved for invocation context")
-                    if field_name in declaration.inputs:
-                        error("payload-input", f"Callback field '{field_name}' cannot also acquire a message input")
-                    if field_name in annotations and annotations[field_name] != field.annotation:
-                        error("payload-type", f"Parameter '{field_name}' must match its CallbackData field type")
-            for context_name in ("ctx", "context"):
-                context_type = representation(annotations.get(context_name))
-                if context_type is None:
-                    continue
-                context_types = (
-                    get_args(context_type) if get_origin(context_type) in (Union, UnionType) else (context_type,)
-                )
-                if any(not isinstance(item, type) or not issubclass(item, Context) for item in context_types):
-                    error("context-type", f"Parameter '{context_name}' must use Context or an event-specific Context")
-                elif declaration.event == "callback_query" and all(
-                    issubclass(item, MessageContext) for item in context_types
-                ):
-                    error("context-type", "A callback cannot receive MessageContext; use CallbackContext or Context")
-                elif (
-                    declaration.event is not None
-                    and declaration.event != "callback_query"
-                    and all(issubclass(item, CallbackContext) for item in context_types)
-                ):
-                    error("context-type", "CallbackContext requires a callback_query entrypoint")
+            if "card" in declaration.metadata or "card_action" in declaration.metadata:
+                from .cards import CardError, validate_card
+
+                try:
+                    validate_card(bound)
+                except (CardError, AttributeError, NameError, TypeError) as exc:
+                    error("card-schema", str(exc))
             suffix = f":{index + 1}" if len(declarations) > 1 else ""
             handlers.append(
                 CompiledHandler(
-                    feature, name, f"{feature.key}.{name}{suffix}", bound, declaration, signature, annotations, source
+                    feature,
+                    name,
+                    f"{feature.key}.{name}{suffix}",
+                    bound,
+                    declaration,
+                    signature,
+                    annotations,
+                    source,
+                    plan,
                 )
             )
+    identities: dict[tuple[str, str], CompiledHandler] = {}
+    for compiled in handlers:
+        declaration = compiled.declaration
+        identity: tuple[str, str] | None = None
+        if "step" in declaration.metadata:
+            identity = ("step", str(declaration.metadata["step"]))
+        elif "card_action" in declaration.metadata:
+            identity = ("action", str(declaration.metadata.get("card_action_key", "")))
+        elif declaration.kind == "job" and declaration.names:
+            identity = ("job", declaration.names[0])
+        if identity is not None:
+            if identity in identities:
+                errors.append(
+                    Diagnostic(
+                        f"duplicate-{identity[0]}",
+                        f"Declared {identity[0]} identities must be unique; duplicate '{identity[1]}'",
+                        feature.key,
+                        compiled.name,
+                        compiled.source,
+                    )
+                )
+            identities[identity] = compiled
     return tuple(handlers), tuple(errors)

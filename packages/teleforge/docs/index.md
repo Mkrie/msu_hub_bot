@@ -20,9 +20,9 @@ class Utilities(Feature, key="utilities"):
 
 Here `render_meme` returns an encoded `BytesIO`; the input is Pillow's decoded image. Install the `media` extra for decoding. Native aiogram media objects, `bytes`, `BytesIO` and `Path` are also supported input representations. Choose a native media object when an application executor must admit work before downloading, as in MSU's caption feature.
 
-Ordinary scalar parameters consume command tokens in signature order. Missing or invalid values use the annotated default; `Argument(strict=True)` reports invalid supplied values instead. Required parameters give brief guidance. `TextInput` explicitly consumes remaining text, then optionally a replied message or UTF-8 text document. Invalid tokens rescued by defaults remain available to text input.
+Undeclared positional scalar parameters of commands consume tokens in signature order. Keyword-only parameters are middleware dependencies unless explicitly declared as acquired input; payload fields and step drafts have their declared sources. Ordinary event handlers never parse command tokens. Missing or invalid values use the annotated default; `Argument(strict=True)` reports invalid supplied values instead. Required parameters give brief guidance. `TextInput` explicitly consumes remaining text, then optionally a replied message or UTF-8 text document. Invalid tokens rescued by defaults remain available to text input.
 
-Declarations are named after parameters. An undeclared non-scalar parameter comes from aiogram middleware data by name. `ctx`, `event`, `bot`, message `message`, and callback `query` are invocation values. Prefer `event: InlineQuery` or another native type for non-message events. Constructor injection is ordinary Python.
+Declarations are named after parameters. Undeclared command services are keyword-only and come from aiogram middleware by name. Middleware cannot shadow command arguments or declared payload fields. Dependencies are type-checked without copying or reconstructing service objects. `ctx`, `event`, `bot`, message `message`, and callback `query` are invocation values. Prefer `event: InlineQuery` or another native type for non-message events. Constructor injection is ordinary Python.
 
 Attached media takes precedence over replied media. `/meme Hello` replying to a photo selects the command's text and the replied photo: successful output replies to the photo, guidance to the command. `ctx.input_sources` records each source separately. Callback UI is never implicitly interpreted as input; select a source deliberately or load an application record.
 
@@ -34,7 +34,7 @@ The default matcher is native, case-insensitive aiogram `Command`. Applications 
 
 Plain strings are literal text. Use aiogram `Text`, `Bold`, `Code`, `TextLink` and related objects for formatting. TeleForge disables bot-wide parse-mode defaults for its own sends. Explicit entities use Telegram's UTF-16 offsets.
 
-Return text from an ordinary command, or declare `output="photo"` (video, document, audio or animation) when returning encoded media. Use `await ctx.reply(...)` when combining content or needing the sent result. Native aiogram methods and handled results are supported. Native sends bypass TeleForge's delivery policies.
+Return `str | Text` from an ordinary command. Use `await ctx.reply(photo=...)` for media, combined content or a sent result; a string file ID belongs in a named media argument. `ctx.reply(..., fixed=True)` and `show(...)` return one `Message`. Native aiogram methods and handled results are supported. Native sends bypass TeleForge's delivery policies.
 
 Text plus media prefers one Rich Message when supported by the content's entity/media constraints; otherwise delivery plans captions and complete text chunks before sending. A rejected or uncertain Rich API write is never retried as native messages. The default soft budget is three messages; larger text becomes a complete UTF-8 file. `rich=False`, `soft_messages=...` and `max_output_bytes=...` customize that policy. Hard budgets bound locally owned text/uploads before sending; referenced Telegram files and explicitly allowed remote URLs cannot be preflighted for media size. Output is never silently truncated.
 
@@ -57,19 +57,28 @@ async def board(self, ctx: Context, game: str) -> Card:
     return Card(record.text, buttons=[[Button("Vote", self.vote, option=1)]])
 
 
-@action(card="board")
+@action(key="vote", card="board")
 async def vote(self, ctx: CallbackContext, game: str, option: int) -> None:
     await self.games.vote(game, actor=ctx.user.id, option=option)
     await ctx.answer("Saved")
 ```
 
-`await show(ctx, self.board, game=id)` opens it. Renderer arguments carry into buttons; button arguments add or replace values. Pass short application IDs, not serialized state: callback payloads have a 64-byte bound. Valid typed payloads are **not authorization**. The service must check current actor, origin, ownership, expiry and revision.
+`await show(ctx, self.board, game=id)` opens it. Renderer payload arguments carry into buttons; button arguments add or replace values. Keyword-only services come from middleware and never enter the callback payload. Explicit stable action keys survive Python action/renderer method renames; changing payload schema intentionally invalidates incompatible old buttons. Pass short application IDs, not serialized state: callback payloads have a 64-byte bound. Valid typed payloads are **not authorization**. The service must check current actor, origin, ownership, expiry and revision.
 
-Callback validators must be pure and preserve the encoded argument value. Normalize values before building a button; a transforming validator is rejected so repeated validation cannot change which record an action addresses. Renderer defaults are included in button arguments, and runtime card locks belong to each feature instance.
+Callback validators must be pure and preserve the encoded argument value. Normalize values before building a button; a transforming validator is rejected so repeated validation cannot change which record an action addresses. Renderer defaults are included in button arguments, and runtime card locks belong to the application and use the actual bot/chat/message/business address across features and renderers.
 
-Renderers reload current state and have no domain side effects. Actions serialize per UI in the process; application transactions/CAS provide durable concurrency. Successful actions refresh by default. `CardRefreshError` means the action completed but presentation failed; retry only rendering. `refresh=False` supports explicit barriers such as delivering feedback's exact preview before enabling submission.
+Renderers reload current state and have no domain side effects. Actions serialize per UI in the process; application transactions/CAS provide durable concurrency. Successful actions refresh by default. `CardRefreshError` means the handler returned but presentation failed; application state determines whether rendering can be retried. `ctx.outcome` and an exception’s `teleforge_outcome` preserve independent handler-return, acknowledgement and presentation facts. A Python return never proves a database commit, and an exception never proves its absence. `refresh=False` supports explicit barriers such as delivering feedback's exact preview before enabling submission.
 
-Read-only cards may choose `ack="early", coalesce=True`: acknowledge before waiting, and drop overlapping refreshes for that UI. Early acknowledgement gives up a later alert result. Do not coalesce votes, payments or other mutations that must each run.
+Read-only cards may choose `ack="early", coalesce=True`: acknowledge before waiting, and drop overlapping refreshes for that UI. Early acknowledgement gives up a later alert result. Do not coalesce votes, payments or other mutations that must each run. Early/coalescing actions release their conversation isolation after route selection; they must not access FSM afterward or skip to another handler. Embedded hosts must provide the explicit release bridge described below.
+
+A job can prepare the same view without manufacturing a Telegram event:
+
+```python
+content = await prepare_card(render_board, data={"games": games}, game=game_id)
+await edit_response(bot, saved_target, **content)
+```
+
+`prepare_card` accepts an ordinary renderer or an already-rendered `Card`. Use `context=` only if the renderer explicitly needs one. Its result is native keyword arguments for existing delivery functions. Media remains caller-owned and must stay open through send/edit. The application owns leases, current-state checks and persisted targets.
 
 ## Conversations
 
@@ -88,11 +97,17 @@ Steps persist named destinations and JSON-compatible Pydantic drafts through the
 
 Native FSM data and state updates are separate writes, not a transaction. A failed transition may leave a mismatched envelope; the step rejects it rather than running with another step's draft. The host owns recovery and must configure storage namespaces/key builders to isolate bots and business connections. Direct-message topics require an application conversation adapter; they cannot use the default forum-topic key safely.
 
-Standalone apps default to `USER_IN_TOPIC` and local event isolation. Embedded hosts must supply state scoped to the actual bot, chat, actor and forum topic. Inline/inaccessible callbacks cannot invent that scope. Commands default to `StateFilter(None)`. Put `/cancel` before catch-all steps, with an explicit state filter; other commands remain input during the conversation. Conversations are opt-in.
+Standalone apps default to `USER_IN_TOPIC` and local event isolation. State loading and route selection happen while locked. Terminal stateless handlers can use `flags={"fsm_release": True}`, or call `await ctx.release_isolation()` after completing a transition; later FSM access, child-task release and `SkipHandler` are rejected. Embedded hosts must supply state scoped to the actual bot, chat, actor and forum topic. Inline/inaccessible callbacks cannot invent that scope. Commands default to `StateFilter(None)`. Put `/cancel` before catch-all steps, with an explicit state filter; other commands remain input during the conversation. Conversations are opt-in.
+
+## Guidance and observation
+
+Automatic acquisition errors are structured `InputError` values with a safe code and declared parameter/limit metadata. Supply `App(input_formatter=...)` to render them in the bot’s language. Internal configuration errors propagate to the host error boundary. An application handler can deliberately send `await ctx.guide("Пришли картинку в ответ на это сообщение.")`; no exception or framework translation catalog is needed.
+
+`data["teleforge_invocation"].outcome` lets host middleware distinguish handled input issues from successful work. Install `InvocationMiddleware` before host outer middleware that needs this holder; inner middleware receives it through the compiled router. The snapshot includes no user text, callback payloads or credentials. It records managed delivery and native returned methods; direct `ctx.bot(...)` calls remain native operations observed by the host’s session middleware. TeleForge does not infer transaction commits, charge status or retry safety. Commit application operation/results in explicit short transactions before presentation; do not hold a transaction around a provider call plus automatic delivery.
 
 ## Jobs, HTTP and persistence
 
-`@job("name", payload=Model)` and `bind_jobs(app, adapter)` expose validated methods to the application's worker under `feature_key.name`; renaming the Python method does not change that durable identity. Enqueue with the application's transaction API. TeleForge does not provide atomic state-plus-enqueue, exactly-once execution, leases, retry policy or retention. Those belong to the durable worker and repository. MSU's worker feature owns its existing worker lifecycle without re-registering reminder/game handlers.
+The optional registration helpers are convenience APIs, outside the stable Telegram invocation contract. Use native host registration when it is clearer. `@job("name", payload=Model)` and `bind_jobs(app, adapter)` expose validated methods to the application's worker under `feature_key.name`; renaming the Python method does not change that durable identity. Enqueue with the application's transaction API. TeleForge does not provide atomic state-plus-enqueue, exactly-once execution, leases, retry policy or retention. Those belong to the durable worker and repository. MSU's worker feature owns its existing worker lifecycle without re-registering reminder/game handlers.
 
 `@web("POST", "/path")` and `bind_web(app, adapter)` attach ordinary bound request methods to a host HTTP router. Auth, body limits, request services, transactions and native responses remain with that host. Shared services can serve Telegram, jobs and HTTP; a live request transaction must never live on shared `self`.
 
@@ -100,11 +115,13 @@ Standalone apps default to `USER_IN_TOPIC` and local event isolation. Embedded h
 
 `App().include(feature)` preserves feature order. `build_router()` returns a fresh native router for an existing dispatcher; the host wraps its runtime in `async with app.lifespan()`. `create_dispatcher()`/`run_polling()` own standalone startup, feature lifespans, shutdown and FSM cleanup. Pass `close_bot_session=True` only when transferring session ownership to polling. Resource factories unwind in reverse order, including partial startup failures.
 
+The standalone dispatcher executes returned native `TelegramMethod` values before leaving update admission, including native routes and slow webhook processing; it sends through the Bot API instead of returning methods for an HTTP response shortcut. Embedded native hosts keep their own transport semantics.
+
 Standalone shutdown closes update admission, drains for `drain_timeout` (30 seconds), cancels remaining updates and joins for `cancel_timeout` (5 seconds) before closing resources. `DrainTimeout` leaves resources open rather than closing clients beneath a handler that refuses cancellation; the owner must retry shutdown or terminate the process. An active handler cannot call `app.aclose()` itself. Embedded hosts must stop admission and drain their own updates before leaving the feature lifespan.
 
-Override `Feature.lifespan` for resources/background workers; stop and join them before returning. Imports and constructors must not perform network work. App data is injected by name; invocation-specific middleware data wins. Native aiogram middleware remains the injection and instrumentation mechanism.
+Override `Feature.lifespan` for resources/background workers; stop and join them before returning. Imports and constructors must not perform network work. App data is injected by name; invocation-specific middleware data wins. Native aiogram middleware remains the injection and instrumentation mechanism. A host with its own FSM installs an async zero-argument `_teleforge_release_isolation` callback in middleware data. It must release the current task’s already-selected state scope; TeleForge guards subsequent injected FSM access. A host without that bridge cannot promise early/coalescing cards while holding FSM isolation. Hub’s `HubIsolationBridge` adapts its existing scope.
 
-Declarations compile after class creation. An undecorated override retains its inherited route and position. A new decorator replaces it; `@disable` removes it. Give reusable subclasses explicit stable feature keys. Signatures and direct calls remain ordinary Python.
+Declarations compile after class creation. Effective parameter sources, native state constraints and static card/step/job relationships share the same checks used by inspection and dispatch. External middleware availability and dynamic filters remain host responsibilities. Automatic inherited route declarations are an advanced extension convention; ordinary helper composition is sufficient for most features. An undecorated override retains its inherited route and position. A new decorator replaces it; `@disable` removes it. Give reusable subclasses explicit stable feature keys. Signatures and direct calls remain ordinary Python.
 
 ```sh
 PYTHONPATH=packages/teleforge/examples uv run --no-sync teleforge inspect quickstart:make_app --json

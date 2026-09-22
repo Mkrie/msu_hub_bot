@@ -182,3 +182,80 @@ async def test_retained_buffer_does_not_mask_handler_exception():
     assert primary.__notes__ == ["Input cleanup also failed (BufferError)"]
     retained.release()
     values["stream"].close()
+
+
+@pytest.mark.asyncio
+async def test_compiled_command_cannot_be_shadowed_by_middleware():
+    from teleforge.declarations import Declaration
+    from teleforge.parameters import compile_parameters
+
+    async def handler(count: int = 3, *, label: str = "default"):
+        pass
+
+    plan, issues = compile_parameters(handler, Declaration(kind="command", event="message"))
+    assert not issues
+    event = message(text="/roll 9")
+    async with prepare_arguments(
+        handler,
+        event,
+        context_for(RecordingBot(), event),
+        {"count": "unvalidated", "label": "injected"},
+        {},
+        tail="9",
+        plan=plan,
+    ) as values:
+        assert values == {"count": 9, "label": "injected"}
+
+
+@pytest.mark.asyncio
+async def test_noncommand_native_values_never_parse_an_ambient_command_tail():
+    from teleforge.declarations import Declaration
+    from teleforge.issues import ConfigurationError
+    from teleforge.parameters import compile_parameters
+
+    async def handler(count: int = 3):
+        pass
+
+    plan, issues = compile_parameters(handler, Declaration(kind="event", event="message"))
+    assert not issues
+    event = message(text="ordinary message")
+    ctx = context_for(RecordingBot(), event)
+    async with prepare_arguments(handler, event, ctx, {}, {}, tail="9", plan=plan) as values:
+        assert values == {"count": 3}
+    with pytest.raises(ConfigurationError, match="does not match"):
+        async with prepare_arguments(handler, event, ctx, {"count": "9"}, {}, plan=plan):
+            pytest.fail("An injected scalar was coerced")
+
+
+@pytest.mark.asyncio
+async def test_injected_models_keep_identity_and_do_not_rerun_validators():
+    from pydantic import BaseModel, model_validator
+
+    from teleforge.parameters import checked_dependency
+
+    validations = []
+
+    class Service(BaseModel):
+        name: str
+
+        @model_validator(mode="after")
+        def record(self):
+            validations.append(self.name)
+            return self
+
+    service = Service(name="service")
+    assert checked_dependency(Service, service, "service") is service
+    assert validations == ["service"]
+
+
+def test_structured_issues_only_accept_safe_declared_parameters():
+    from teleforge.issues import ConfigurationError
+
+    issue = InputError("text-too-long", limit=12)
+    assert issue.code == "text-too-long"
+    assert dict(issue.params) == {"limit": 12}
+    assert "12 characters" in str(issue)
+    with pytest.raises(ConfigurationError):
+        InputError("argument-invalid", parameter="raw user input")
+    with pytest.raises(ConfigurationError):
+        InputError("argument-invalid", parameter="count", value="private")

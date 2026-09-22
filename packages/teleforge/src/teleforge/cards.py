@@ -7,10 +7,11 @@ import base64
 import hashlib
 import inspect
 import json
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, Literal, TypeVar, cast, get_type_hints
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, TypeVar, cast, get_type_hints
 
 from aiogram.filters import Filter
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageEntity
@@ -22,6 +23,10 @@ from .declarations import Declaration, attach_declaration, declarations_of
 from .delivery import MediaSource
 from .feature import Feature
 from .inputs import _ValidatedPayload
+from .parameters import ParameterPlan, checked_dependency, compile_parameters
+
+if TYPE_CHECKING:
+    from .outcome import InvocationOutcome
 
 _Handler = TypeVar("_Handler", bound=Callable[..., Any])
 _PREFIX = "tf:"
@@ -32,12 +37,26 @@ class CardError(ValueError):
 
 
 class CardRefreshError(RuntimeError):
-    """An action completed, but refreshing its presentation failed. Do not replay it."""
+    """The handler returned, but refreshing its presentation failed. Do not replay it."""
 
-    applied = True
+    handler_returned = True
 
-    def __init__(self, renderer: str) -> None:
-        super().__init__(f"Action completed but card {renderer!r} could not be refreshed")
+    def __init__(self, renderer: str, *, outcome: InvocationOutcome) -> None:
+        self.teleforge_outcome = outcome
+        super().__init__(f"Handler returned but card {renderer!r} could not be refreshed")
+
+
+class CardContent(TypedDict, total=False):
+    """Native delivery arguments; media resources remain owned by the caller."""
+
+    text: str | Text | None
+    reply_markup: InlineKeyboardMarkup
+    photo: MediaSource | None
+    video: MediaSource | None
+    animation: MediaSource | None
+    audio: MediaSource | None
+    document: MediaSource | None
+    entities: Sequence[MessageEntity] | None
 
 
 @dataclass(frozen=True, init=False)
@@ -67,13 +86,17 @@ class Card:
     document: MediaSource | None = None
     entities: Sequence[MessageEntity] | None = None
 
-    def _content(self, keyboard: InlineKeyboardMarkup) -> dict[str, Any]:
-        result: dict[str, Any] = {"text": self.text, "reply_markup": keyboard}
-        for name in ("photo", "video", "animation", "audio", "document", "entities"):
-            value = getattr(self, name)
-            if value is not None:
-                result[name] = value
-        return result
+    def _content(self, keyboard: InlineKeyboardMarkup) -> CardContent:
+        return {
+            "text": self.text,
+            "reply_markup": keyboard,
+            "photo": self.photo,
+            "video": self.video,
+            "animation": self.animation,
+            "audio": self.audio,
+            "document": self.document,
+            "entities": self.entities,
+        }
 
 
 def _bound(method: Callable[..., Any]) -> tuple[Feature, str]:
@@ -99,34 +122,48 @@ class _Parameter:
     default: object = inspect.Parameter.empty
 
 
-def _parameters(method: Callable[..., Any]) -> list[_Parameter]:
-    feature, _ = _bound(method)
+def _plan(method: Callable[..., Any], declaration: Declaration) -> ParameterPlan:
+    feature = getattr(method, "__self__", None)
     namespace: dict[str, Any] = {}
-    for cls in reversed(type(feature).__mro__):
-        namespace.update(vars(cls))
-        namespace[cls.__name__] = cls
-    hints = get_type_hints(method, localns=namespace, include_extras=True)
+    if isinstance(feature, Feature):
+        for cls in reversed(type(feature).__mro__):
+            namespace.update(vars(cls))
+            namespace[cls.__name__] = cls
+    try:
+        hints = get_type_hints(method, localns=namespace, include_extras=True)
+        plan, issues = compile_parameters(method, declaration, annotations=hints)
+    except (NameError, TypeError) as exc:
+        raise CardError(f"Cannot resolve card method annotations ({type(exc).__name__})") from exc
+    if issues:
+        raise CardError("; ".join(issue.message for issue in issues))
+    return plan
+
+
+def _parameters(method: Callable[..., Any], declaration: Declaration) -> list[_Parameter]:
     parameters = []
-    for name, parameter in inspect.signature(method).parameters.items():
-        if name in {"ctx", "context"}:
+    for parameter in _plan(method, declaration).parameters:
+        if parameter.source not in {"native", "callback_payload"}:
             continue
-        if parameter.kind not in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
-            raise CardError("Card methods accept named arguments, without *args or **kwargs")
-        if name not in hints:
-            raise CardError(f"Card argument {name!r} needs a type annotation")
-        parameters.append(_Parameter(name, TypeAdapter(hints[name]), hints[name], parameter.default))
+        try:
+            adapter: TypeAdapter[Any] = TypeAdapter(parameter.annotation)
+            adapter.json_schema()
+        except (ValueError, TypeError) as exc:
+            raise CardError(f"Card argument {parameter.name!r} needs a JSON-compatible type") from exc
+        parameters.append(_Parameter(parameter.name, adapter, parameter.annotation, parameter.default))
     return parameters
 
 
 def _schema(action_method: Callable[..., Any]) -> tuple[str, list[_Parameter], Callable[..., Any]]:
-    feature, name = _bound(action_method)
+    feature, _ = _bound(action_method)
     declaration = _declaration(action_method, "card_action")
     renderer_name = cast(str, declaration.metadata["card_action"])
-    renderer = cast(Callable[..., Any], getattr(feature, renderer_name))
-    _declaration(renderer, "card")
-    parameters = _parameters(action_method)
+    renderer = getattr(feature, renderer_name, None)
+    if not callable(renderer):
+        raise CardError(f"Card renderer {renderer_name!r} must be a declared feature method")
+    renderer_declaration = _declaration(renderer, "card")
+    parameters = _parameters(action_method, declaration)
     by_name = {parameter.name: parameter for parameter in parameters}
-    for parameter in _parameters(renderer):
+    for parameter in _parameters(renderer, renderer_declaration):
         previous = by_name.get(parameter.name)
         if previous is not None and previous.annotation != parameter.annotation:
             raise CardError(f"Card and action disagree on argument {parameter.name!r}")
@@ -137,12 +174,21 @@ def _schema(action_method: Callable[..., Any]) -> tuple[str, list[_Parameter], C
     # buttons would stop matching after every process restart. The public input
     # schema is stable; validators still run on each decoded callback.
     identity = json.dumps(
-        [feature.key, name, renderer_name, [(p.name, p.adapter.json_schema()) for p in parameters]],
+        [feature.key, declaration.metadata["card_action_key"], [(p.name, p.adapter.json_schema()) for p in parameters]],
         sort_keys=True,
         separators=(",", ":"),
     )
     digest = hashlib.blake2s(identity.encode(), digest_size=6).digest()
     return base64.urlsafe_b64encode(digest).decode(), parameters, renderer
+
+
+def validate_card(method: Callable[..., Any]) -> None:
+    """Validate the same static contract used by packing, filtering and rendering."""
+    for declaration in declarations_of(method):
+        if "card_action" in declaration.metadata:
+            _schema(method)
+        elif "card" in declaration.metadata:
+            _parameters(method, declaration)
 
 
 def _validate(
@@ -224,10 +270,10 @@ class _Lock:
 
 class _CardLocks:
     def __init__(self) -> None:
-        self._locks: dict[tuple[int, int, int], _Lock] = {}
+        self._locks: dict[tuple[int, str | None, int, int], _Lock] = {}
 
     @asynccontextmanager
-    async def hold(self, key: tuple[int, int, int], *, coalesce: bool = False) -> AsyncIterator[bool]:
+    async def hold(self, key: tuple[int, str | None, int, int], *, coalesce: bool = False) -> AsyncIterator[bool]:
         entry = self._locks.setdefault(key, _Lock())
         entry.users += 1
         try:
@@ -242,16 +288,20 @@ class _CardLocks:
                 del self._locks[key]
 
 
-def _locks_for(feature: Feature, renderer: str) -> _CardLocks:
-    # Declarations are inherited/shared class metadata. Runtime coalescing must
-    # instead belong to the particular application-scoped feature instance.
-    registries = cast(dict[str, _CardLocks], vars(feature).setdefault("_teleforge_card_locks", {}))
-    return registries.setdefault(renderer, _CardLocks())
+def _locks_for(ctx: Context, feature: Feature) -> _CardLocks:
+    registry = ctx.data.get("_teleforge_card_locks")
+    if registry is None:
+        # Direct invocation without App has only this feature's lifetime. App
+        # injects its shared registry for every routed feature and renderer.
+        registry = vars(feature).setdefault("_teleforge_card_locks", _CardLocks())
+    if not isinstance(registry, _CardLocks):
+        raise CardError("Managed actions require the application's card lock registry")
+    return registry
 
 
-def _keyboard(view: Card, renderer: Callable[..., Any], arguments: Mapping[str, object]) -> InlineKeyboardMarkup:
-    owner, renderer_name = _bound(renderer)
-    render_arguments = {p.name: arguments[p.name] for p in _parameters(renderer) if p.name in arguments}
+def _keyboard(view: Card, renderer: Callable[..., Any] | None, arguments: Mapping[str, object]) -> InlineKeyboardMarkup:
+    owner = getattr(renderer, "__self__", None)
+    renderer_name = getattr(renderer, "__name__", None)
     rows = []
     for row in view.buttons:
         buttons = []
@@ -261,11 +311,14 @@ def _keyboard(view: Card, renderer: Callable[..., Any], arguments: Mapping[str, 
                 continue
             action_owner, _ = _bound(button.action)
             declaration = _declaration(button.action, "card_action")
-            if action_owner is not owner or declaration.metadata["card_action"] != renderer_name:
+            validate_card(button.action)
+            if isinstance(owner, Feature) and (
+                action_owner is not owner or declaration.metadata["card_action"] != renderer_name
+            ):
                 raise CardError("A managed button must target an action of the card's feature and renderer")
             buttons.append(
                 InlineKeyboardButton(
-                    text=button.text, callback_data=_pack(button.action, {**render_arguments, **button.arguments})
+                    text=button.text, callback_data=_pack(button.action, {**arguments, **button.arguments})
                 )
             )
         rows.append(buttons)
@@ -273,18 +326,30 @@ def _keyboard(view: Card, renderer: Callable[..., Any], arguments: Mapping[str, 
 
 
 async def _render(
-    ctx: Context,
+    ctx: Context | None,
     renderer: Callable[..., Any],
     arguments: Mapping[str, object],
     *,
+    data: Mapping[str, Any] | None = None,
     action_arguments: bool = False,
 ) -> tuple[Card, dict[str, Any]]:
-    _declaration(renderer, "card")
-    parameters = _parameters(renderer)
+    declaration = Declaration(kind="card", metadata={"card": True})
+    parameters = _parameters(renderer, declaration)
     selected = {p.name: arguments[p.name] for p in parameters if p.name in arguments} if action_arguments else arguments
     values = dict(selected) if isinstance(arguments, _ValidatedPayload) else _validate(parameters, selected)
-    context_values = {name: ctx for name in inspect.signature(renderer).parameters if name in {"ctx", "context"}}
-    result = renderer(**context_values, **values)
+    injected: dict[str, Any] = {}
+    dependencies = data if data is not None else ctx.data if ctx is not None else {}
+    for parameter in _plan(renderer, declaration).parameters:
+        if parameter.source == "context":
+            if ctx is None:
+                raise CardError(f"Renderer parameter {parameter.name!r} requires an explicit invocation context")
+            injected[parameter.name] = checked_dependency(parameter.annotation, ctx, parameter.name)
+        elif parameter.source == "dependency":
+            value = dependencies.get(parameter.name, parameter.default)
+            if value is inspect.Parameter.empty:
+                raise CardError(f"Missing renderer dependency {parameter.name!r}; supply data explicitly")
+            injected[parameter.name] = checked_dependency(parameter.annotation, value, parameter.name)
+    result = renderer(**injected, **values)
     if inspect.isawaitable(result):
         result = await result
     if not isinstance(result, Card):
@@ -292,10 +357,32 @@ async def _render(
     return result, values
 
 
-async def show(ctx: Context, renderer: Callable[..., Any], **arguments: object) -> object:
+async def prepare_card(
+    renderer: Callable[..., Any] | Card,
+    *,
+    data: Mapping[str, Any] | None = None,
+    context: Context | None = None,
+    **arguments: object,
+) -> CardContent:
+    """Prepare native arguments for send_response/edit_response without sending.
+
+    A plain renderer needs no event. Keyword-only dependencies come from data
+    (or an explicitly supplied context). For an already-rendered Card, managed
+    buttons carry their full payload. Keep caller-owned media resources open
+    until the subsequent send or edit finishes; preparation does not copy them.
+    """
+    if isinstance(renderer, Card):
+        if arguments:
+            raise CardError("An already-rendered Card takes its payload from each Button")
+        return renderer._content(_keyboard(renderer, None, {}))
+    view, values = await _render(context, renderer, arguments, data=data)
+    return view._content(_keyboard(view, renderer, values))
+
+
+async def show(ctx: Context, renderer: Callable[..., Any], **arguments: object) -> Message:
     """Render and send one card. The application binds durable UI identity if needed."""
-    view, values = await _render(ctx, renderer, arguments)
-    return await ctx.reply(**view._content(_keyboard(view, renderer, values)), fixed=True)
+    content = await prepare_card(renderer, data=ctx.data, context=ctx, **arguments)
+    return await ctx.reply(**content, fixed=True)
 
 
 def card[H: Callable[..., Any]](method: H) -> H:
@@ -306,6 +393,7 @@ def card[H: Callable[..., Any]](method: H) -> H:
 
 def action(
     *,
+    key: str,
     card: str,
     refresh: bool = True,
     ack: Literal["auto", "early"] = "auto",
@@ -321,6 +409,8 @@ def action(
     """
     if ack not in {"auto", "early"}:
         raise CardError("Managed action acknowledgement must be 'auto' or 'early'")
+    if not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_.-]{0,63}", key):
+        raise CardError("Managed actions need a stable 1–64 character key")
 
     def decorate(method: _Handler) -> _Handler:
         name = method.__name__
@@ -339,10 +429,13 @@ def action(
             arguments = cast(dict[str, object], data["_teleforge_card_arguments"])
             renderer = cast(Callable[..., Any], getattr(feature, card))
             _declaration(renderer, "card")
-            locks = _locks_for(feature, card)
+            locks = _locks_for(ctx, feature)
+            if ack == "early" or coalesce:
+                await ctx.release_isolation()
             if ack == "early":
                 await ctx.answer()
-            async with locks.hold((ctx.bot.id, message.chat.id, message.message_id), coalesce=coalesce) as acquired:
+            target = (ctx.bot.id, message.business_connection_id, message.chat.id, message.message_id)
+            async with locks.hold(target, coalesce=coalesce) as acquired:
                 if not acquired:
                     return None
                 result = await invoke()
@@ -351,7 +444,7 @@ def action(
                         view, values = await _render(ctx, renderer, arguments, action_arguments=True)
                         await ctx.edit(**view._content(_keyboard(view, renderer, values)))
                     except Exception as exc:
-                        raise CardRefreshError(card) from exc
+                        raise CardRefreshError(card, outcome=ctx.outcome) from exc
                 return result
 
         attach_declaration(
@@ -363,7 +456,13 @@ def action(
                 filters=filters,
                 filter_factory=bound_filters,
                 hook=hook,
-                metadata={"card_action": card, "refresh": refresh, "ack_timing": ack, "coalesce": coalesce},
+                metadata={
+                    "card_action": card,
+                    "card_action_key": key,
+                    "refresh": refresh,
+                    "ack_timing": ack,
+                    "coalesce": coalesce,
+                },
             ),
         )
         return method

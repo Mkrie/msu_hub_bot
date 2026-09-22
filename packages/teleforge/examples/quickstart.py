@@ -35,7 +35,7 @@ class Counter(Feature, key="counter"):
     async def board(self, ctx: Context) -> Card:
         return Card(Text("Together: ", Bold(sum(self.scores.values()))), buttons=[[Button("+1", self.add)]])
 
-    @action(card="board")
+    @action(key="increment", card="board")
     async def add(self, ctx: CallbackContext) -> None:
         assert ctx.user is not None
         self.scores[ctx.user.id] = self.scores.get(ctx.user.id, 0) + 1

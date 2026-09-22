@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 from aiogram.filters.callback_data import CallbackData, CallbackQueryFilter
 
-from .delivery import OutputKind, ResponsePolicy
+from .delivery import ResponsePolicy
 
 if TYPE_CHECKING:
     from .context import Context
@@ -33,7 +33,6 @@ class Declaration:
     flags: Mapping[str, Any] = field(default_factory=dict)
     metadata: Mapping[str, object] = field(default_factory=dict)
     policy: ResponsePolicy = field(default_factory=ResponsePolicy)
-    output: OutputKind | None = None
     payload: type[CallbackData] | None = None
     ack: Literal["auto", "manual"] = "auto"
     filter_factory: FilterFactory | None = None
@@ -88,7 +87,6 @@ def command(
     filter: NativeFilter | None = None,
     filters: tuple[NativeFilter, ...] = (),
     flags: Mapping[str, Any] | None = None,
-    output: OutputKind | None = None,
     rich: bool = True,
     soft_messages: int = 3,
     max_output_bytes: int = 20 * 1024 * 1024,
@@ -102,7 +100,6 @@ def command(
         inputs=inputs,
         metadata={"_command_filter": filter} if filter is not None else {},
         flags=flags or {},
-        output=output,
         policy=ResponsePolicy(rich=rich, soft_messages=soft_messages, max_output_bytes=max_output_bytes),
     )
     return lambda fn: attach_declaration(fn, declaration)
@@ -113,7 +110,6 @@ def callback(
     *filters: NativeFilter,
     flags: Mapping[str, Any] | None = None,
     ack: Literal["auto", "manual"] = "auto",
-    output: OutputKind | None = None,
     **inputs: object,
 ) -> Callable[[F], F]:
     model: type[CallbackData] | None = None
@@ -132,7 +128,6 @@ def callback(
         inputs=inputs,
         payload=model,
         ack=ack,
-        output=output,
     )
     return lambda fn: attach_declaration(fn, declaration)
 
@@ -141,31 +136,26 @@ def event(
     name: str,
     *filters: NativeFilter,
     flags: Mapping[str, Any] | None = None,
-    output: OutputKind | None = None,
     **inputs: object,
 ) -> Callable[[F], F]:
-    declaration = Declaration(
-        kind="event", event=name, filters=filters, flags=flags or {}, inputs=inputs, output=output
-    )
+    declaration = Declaration(kind="event", event=name, filters=filters, flags=flags or {}, inputs=inputs)
     return lambda fn: attach_declaration(fn, declaration)
 
 
 def message(
     *filters: NativeFilter,
     flags: Mapping[str, Any] | None = None,
-    output: OutputKind | None = None,
     **inputs: object,
 ) -> Callable[[F], F]:
-    return event("message", *filters, flags=flags, output=output, **inputs)
+    return event("message", *filters, flags=flags, **inputs)
 
 
 def edited_message(
     *filters: NativeFilter,
     flags: Mapping[str, Any] | None = None,
-    output: OutputKind | None = None,
     **inputs: object,
 ) -> Callable[[F], F]:
-    return event("edited_message", *filters, flags=flags, output=output, **inputs)
+    return event("edited_message", *filters, flags=flags, **inputs)
 
 
 def inline_query(*filters: NativeFilter) -> Callable[[F], F]:

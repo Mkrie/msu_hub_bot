@@ -10,15 +10,21 @@ from aiogram import Bot, Dispatcher, Router
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from aiogram.dispatcher.middlewares.user_context import EVENT_CONTEXT_KEY, EventContext
 from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
 from aiogram.fsm.middleware import FSMContextMiddleware
 from aiogram.fsm.storage.base import BaseEventIsolation, BaseStorage
 from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
 from aiogram.fsm.strategy import FSMStrategy
+from aiogram.methods import TelegramMethod
 from aiogram.types import InaccessibleMessage, TelegramObject, Update
 
 from .binding import adapter_for
+from .cards import _CardLocks
 from .declarations import NativeFilter
 from .feature import CompilationError, CompiledHandler, Diagnostic, Feature, compile_feature
+from .inputs import InputError
+from .isolation import IsolationScope, ScopedStorage
+from .outcome import Invocation, InvocationMiddleware
 
 type ResourceFactory = Callable[[], AbstractAsyncContextManager[object]]
 type NextHandler = Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]]
@@ -44,7 +50,10 @@ class _Dispatcher(Dispatcher):
     async def feed_update(self, bot: Bot, update: Update, **kwargs: Any) -> Any:
         # Enclose the native dispatcher, including its outer error middleware.
         async with self._app._admit_update():
-            return await super().feed_update(bot, update, **kwargs)
+            result = await super().feed_update(bot, update, **kwargs)
+            # Standalone owns delivery. Returning a method to native polling or
+            # webhook response handling would let the send outlive admission.
+            return await bot(result) if isinstance(result, TelegramMethod) else result
 
 
 class _Workflow(BaseMiddleware):
@@ -56,11 +65,15 @@ class _Workflow(BaseMiddleware):
         for name, value in self.app.data.items():
             data.setdefault(name, value)
         data["_teleforge_media_slots"] = self.app._media_slots
+        data["_teleforge_card_locks"] = self.app._card_locks
+        data["_teleforge_input_formatter"] = self.app.input_formatter
+        data.setdefault("teleforge_invocation", Invocation())
         return await handler(event, data)
 
 
 class _ScopedFSM(FSMContextMiddleware):
     async def __call__(self, handler: NextHandler, event: TelegramObject, data: dict[str, Any]) -> Any:
+        data["_teleforge_isolation"] = None
         context = data.get(EVENT_CONTEXT_KEY)
         inaccessible = (
             isinstance(event, Update)
@@ -72,7 +85,28 @@ class _ScopedFSM(FSMContextMiddleware):
             # inaccessible callback also cannot establish its real topic identity.
             data["fsm_storage"] = self.storage
             return await handler(event, data)
-        return await super().__call__(handler, event, data)
+        bot = cast(Bot, data["bot"])
+        state = self.resolve_event_context(bot, data)
+        data["fsm_storage"] = self.storage
+        if state is None:
+            return await handler(event, data)
+        # Acquire before loading state and selecting a native handler. The
+        # selected handler may explicitly finish this lease before slow work.
+        async with AsyncExitStack() as stack:
+            await stack.enter_async_context(self.events_isolation.lock(key=state.key))
+            scope = IsolationScope(stack)
+            guarded = ScopedStorage(self.storage, scope)
+            state = FSMContext(guarded, state.key)
+            data.update(
+                state=state,
+                raw_state=await state.get_state(),
+                fsm_storage=guarded,
+                _teleforge_isolation=scope,
+            )
+            try:
+                return await handler(event, data)
+            finally:
+                await scope.release()
 
 
 class App:
@@ -84,6 +118,7 @@ class App:
         media_concurrency: int = 2,
         drain_timeout: float = 30,
         cancel_timeout: float = 5,
+        input_formatter: Callable[[InputError], str] = str,
     ) -> None:
         if type(media_concurrency) is not int or media_concurrency < 1:
             raise ValueError("media_concurrency must be a positive integer")
@@ -91,8 +126,10 @@ class App:
             raise ValueError("Update drain timeouts must be finite and nonnegative")
         self.bot = bot
         self.data = dict(data or {})
+        self.input_formatter = input_formatter
         self._features: list[Feature] = list(features)
         self._media_slots = asyncio.Semaphore(media_concurrency)
+        self._card_locks = _CardLocks()
         self._resources: list[ResourceFactory] = []
         self._stack: AsyncExitStack | None = None
         self._configuration_closed = False
@@ -244,6 +281,7 @@ class App:
             **self.data,
         )
         dispatcher.fsm = _ScopedFSM(dispatcher.fsm.storage, dispatcher.fsm.events_isolation, fsm_strategy)
+        dispatcher.update.outer_middleware(InvocationMiddleware())
         dispatcher.update.outer_middleware(dispatcher.fsm)
         # A fresh Dispatcher has only fsm.close here. Workers/resources must stop
         # before storage closes; this app owns that single shutdown boundary.

@@ -24,6 +24,7 @@ def test_cli_loads_factory_without_lifespan(
     assert main(["inspect", "offline_factory:create", "--json"]) == 0
     manifest = json.loads(capsys.readouterr().out)
     assert manifest["handlers"][0]["names"] == ["roll"]
+    assert manifest["handlers"][0]["parameters"][0]["source"] == "argument"
     assert main(["check", "offline_factory:create"]) == 0
     assert "valid" in capsys.readouterr().out
 

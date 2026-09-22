@@ -5,29 +5,27 @@ from contextlib import AsyncExitStack
 from typing import Any, cast
 
 from aiogram import Bot
+from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.filters.command import CommandObject
-from aiogram.methods import AnswerCallbackQuery, TelegramMethod
-from aiogram.types import Message, TelegramObject
+from aiogram.methods import TelegramMethod
+from aiogram.types import TelegramObject
 from aiogram.utils.formatting import Text
 from pydantic import BaseModel
 
 from .context import CallbackContext, Context, context_for
-from .delivery import DeliveryError, MediaSource, ResponsePolicy
 from .feature import CompiledHandler
-from .formatting import ResponseError
 from .inputs import Declaration as InputDeclaration
 from .inputs import InputError, prepare_arguments
+from .isolation import IsolationError
+from .outcome import Invocation, attach_outcome
 
 type Adapter = Callable[..., Awaitable[object]]
 
 
-def _notification(text: str) -> str:
-    used = 0
-    for index, character in enumerate(text):
-        used += 2 if ord(character) > 0xFFFF else 1
-        if used > 180:
-            return text[:index]
-    return text
+class _AcquisitionRejected(Exception):
+    def __init__(self, issue: InputError) -> None:
+        self.issue = issue
+        super().__init__(issue.code)
 
 
 async def _deliver(ctx: Context, value: object, compiled: CompiledHandler) -> object:
@@ -37,31 +35,12 @@ async def _deliver(ctx: Context, value: object, compiled: CompiledHandler) -> ob
         return value
     if isinstance(value, TelegramMethod):
         # Native method returns must execute here, while telemetry/input scopes are open.
-        if (
-            isinstance(ctx, CallbackContext)
-            and isinstance(value, AnswerCallbackQuery)
-            and value.callback_query_id == ctx.query.id
-        ):
-            ctx.manual_ack()
-        return await ctx.bot(value)
+        return await ctx._execute_native(value)
     if isinstance(ctx, CallbackContext):
         raise TypeError("Callback output must use ctx.answer, ctx.edit or ctx.reply explicitly")
     if isinstance(value, str | Text):
         return await ctx.reply(value)
-    media = cast(MediaSource, value)
-    match compiled.declaration.output:
-        case "photo":
-            return await ctx.reply(photo=media)
-        case "video":
-            return await ctx.reply(video=media)
-        case "audio":
-            return await ctx.reply(audio=media)
-        case "document":
-            return await ctx.reply(document=media)
-        case "animation":
-            return await ctx.reply(animation=media)
-        case _:
-            raise TypeError(f"{compiled.key} returned unsupported output; declare a media output or send explicitly")
+    raise TypeError(f"{compiled.key} returned unsupported output; use ctx.reply(photo=..., document=...) explicitly")
 
 
 async def invoke_handler(compiled: CompiledHandler, event: TelegramObject, **data: Any) -> object:
@@ -72,8 +51,27 @@ async def invoke_handler(compiled: CompiledHandler, event: TelegramObject, **dat
         raise TypeError("An invocation requires an aiogram Bot")
     ctx = context_for(bot, event, data=data, policy=compiled.declaration.policy)
     data["_teleforge_context"] = ctx
+    invocation = data.setdefault("teleforge_invocation", Invocation())
+    if not isinstance(invocation, Invocation):
+        raise TypeError("teleforge_invocation is reserved for the shared invocation holder")
+    invocation.context = ctx
     if isinstance(ctx, CallbackContext) and compiled.declaration.ack == "manual":
         ctx.manual_ack()
+    try:
+        return await _invoke(compiled, event, ctx, data)
+    except SkipHandler as error:
+        if ctx._isolation_released:
+            failure = IsolationError("A released terminal handler cannot skip to another route")
+            attach_outcome(failure, ctx.outcome)
+            raise failure from None
+        attach_outcome(error, ctx.outcome)
+        raise
+    except BaseException as error:
+        attach_outcome(error, ctx.outcome)
+        raise
+
+
+async def _invoke(compiled: CompiledHandler, event: TelegramObject, ctx: Context, data: dict[str, Any]) -> object:
     command = data.get("command")
     tail = data.get("_teleforge_tail", (command.args or "") if isinstance(command, CommandObject) else None)
     if tail is not None and not isinstance(tail, str):
@@ -89,46 +87,35 @@ async def invoke_handler(compiled: CompiledHandler, event: TelegramObject, **dat
             payload = data.get("_teleforge_payload", data.get("callback_data"))
             if payload is not None and not isinstance(payload, BaseModel | Mapping):
                 raise TypeError("Callback payload must be a validated model or mapping")
-            kwargs = await resources.enter_async_context(
-                prepare_arguments(
-                    compiled.handler,
-                    event,
-                    ctx,
-                    data,
-                    cast(Mapping[str, InputDeclaration], compiled.declaration.inputs),
-                    tail=tail,
-                    payload=payload,
-                )
-            )
-            return await compiled.handler(**kwargs)
-
-        try:
-            hook = compiled.declaration.hook
-            result = await call() if hook is None else await hook(compiled.feature, ctx, data, call)
-            delivered = await _deliver(ctx, result, compiled)
-        except (InputError, ResponseError) as error:
-            if ctx.has_effects:
-                raise
-            # Input guidance is a new reply to the invocation, never a replacement UI.
-            can_answer = (
-                isinstance(ctx, CallbackContext) and not ctx.acknowledgement.attempted and ctx.acknowledgement.owned
-            )
-            if not can_answer and not isinstance(ctx.message, Message):
-                # Inline/inaccessible callbacks cannot establish a safe destination.
-                raise
             try:
-                if can_answer:
-                    assert isinstance(ctx, CallbackContext)
-                    await ctx.answer(_notification(str(error)), show_alert=True)
-                elif isinstance(ctx, CallbackContext):
-                    await ctx.reply(str(error), to=ctx.message, policy=ResponsePolicy(rich=False, soft_messages=1))
-                else:
-                    assert isinstance(event, Message)
-                    await ctx.reply(str(error), to=event, policy=ResponsePolicy(rich=False, soft_messages=1))
-            except (DeliveryError, ResponseError) as guidance_error:
-                error.add_note(f"Input guidance could not be delivered ({type(guidance_error).__name__}).")
-                raise error from None
+                kwargs = await resources.enter_async_context(
+                    prepare_arguments(
+                        compiled.handler,
+                        event,
+                        ctx,
+                        data,
+                        cast(Mapping[str, InputDeclaration], compiled.declaration.inputs),
+                        tail=tail,
+                        payload=payload,
+                        plan=compiled.plan,
+                    )
+                )
+            except InputError as issue:
+                raise _AcquisitionRejected(issue) from None
+            result = await compiled.handler(**kwargs)
+            ctx._handler_returned = True
+            return result
+
+        if compiled.declaration.flags.get("fsm_release") is True and "_teleforge_isolation" in data:
+            await ctx.release_isolation()
+        hook = compiled.declaration.hook
+        try:
+            result = await call() if hook is None else await hook(compiled.feature, ctx, data, call)
+        except _AcquisitionRejected as rejected:
+            await ctx.guide(rejected.issue)
             delivered = None
+        else:
+            delivered = await _deliver(ctx, result, compiled)
         await ctx.finish()
         return delivered
 

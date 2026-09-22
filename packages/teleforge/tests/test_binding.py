@@ -1,11 +1,13 @@
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters.callback_data import CallbackData
 from aiogram.methods import AnswerCallbackQuery, SendMessage
 from aiogram.types import CallbackQuery, Chat, InaccessibleMessage, Message, MessageId, Update, User
@@ -14,9 +16,11 @@ from teleforge.app import App
 from teleforge.cards import Button, Card, action, card, show
 from teleforge.context import CallbackContext, MessageContext
 from teleforge.declarations import callback, command
+from teleforge.delivery import DeliveryError
 from teleforge.feature import Feature
 from teleforge.formatting import ResponseError
 from teleforge.inputs import Argument, InputError, TextInput
+from teleforge.outcome import Invocation, InvocationMiddleware
 from teleforge.testing import RecordingBot
 
 
@@ -158,14 +162,14 @@ async def test_returned_input_file_remains_alive_through_upload(
     async def prepare(*args: Any, **kwargs: Any) -> AsyncIterator[dict[str, object]]:
         path.write_bytes(b"live input")
         try:
-            yield {"file": path}
+            yield {"ctx": args[2], "file": path}
         finally:
             path.unlink()
 
     class File(Feature):
-        @command("file", output="document")
-        async def file(self, file: Path) -> Path:
-            return file
+        @command("file")
+        async def file(self, ctx: MessageContext, *, file: Path) -> Message:
+            return await ctx.reply(document=file, fixed=True)
 
     monkeypatch.setattr(binding, "prepare_arguments", prepare)
     bot = RecordingBot()
@@ -251,7 +255,7 @@ async def test_managed_card_uses_native_compiled_callback_and_strict_payload() -
         async def panel(self, ctx: CallbackContext | MessageContext) -> Card:
             return Card(text=str(self.count), buttons=[[Button("Add", self.add, amount=1)]])
 
-        @action(card="panel")
+        @action(key="add", card="panel")
         async def add(self, ctx: CallbackContext, amount: int) -> None:
             self.count += amount
 
@@ -270,12 +274,12 @@ async def test_managed_card_uses_native_compiled_callback_and_strict_payload() -
 
 @pytest.mark.parametrize("inaccessible", [False, True])
 async def test_manual_ack_guidance_never_guesses_unavailable_ui_scope(inaccessible: bool) -> None:
-    primary = InputError("Provide the missing value")
+    primary = InputError("argument-missing", parameter="value")
 
     class Missing(Feature):
         @callback(Count, ack="manual")
-        async def press(self, count: int) -> None:
-            raise primary
+        async def press(self, ctx: CallbackContext, count: int) -> None:
+            await ctx.guide(primary)
 
     bot = RecordingBot()
     update = clicked(Count(count=1).pack())
@@ -301,12 +305,12 @@ async def test_manual_ack_guidance_never_guesses_unavailable_ui_scope(inaccessib
 
 
 async def test_failed_guidance_preserves_primary_error_and_does_not_ack_success() -> None:
-    primary = InputError("Missing value")
+    primary = InputError("argument-missing", parameter="value")
 
     class Missing(Feature):
         @callback(Count)
-        async def press(self, count: int) -> None:
-            raise primary
+        async def press(self, ctx: CallbackContext, count: int) -> None:
+            await ctx.guide(primary)
 
     bot = RecordingBot()
     bot.recording.responses.append(TimeoutError())
@@ -321,11 +325,203 @@ async def test_failed_guidance_preserves_primary_error_and_does_not_ack_success(
 async def test_callback_error_alert_obeys_utf16_budget() -> None:
     class Missing(Feature):
         @callback(Count)
-        async def press(self, count: int) -> None:
-            raise InputError("😀" * 150)
+        async def press(self, ctx: CallbackContext, count: int) -> None:
+            await ctx.guide("😀" * 150)
 
     bot = RecordingBot()
     async with App(Missing()) as app:
         await app.feed_update(bot, clicked(Count(count=1).pack()))
     assert len(bot.requests) == 1
     assert bot.requests[0].text == "😀" * 90
+
+
+@pytest.mark.parametrize("uncertain", [False, True])
+async def test_ack_failure_preserves_handler_return_and_confirmed_edit(uncertain: bool) -> None:
+    observations = []
+
+    class Updated(Feature):
+        @callback(Count)
+        async def press(self, ctx: CallbackContext, count: int) -> None:
+            await ctx.edit("already saved")
+
+    bot, app = RecordingBot(), App(Updated())
+    dispatcher = app.create_dispatcher()
+
+    async def observe(handler: Any, event: Any, data: Any) -> object:
+        invocation = data["teleforge_invocation"]
+        assert isinstance(invocation, Invocation)
+        try:
+            return await handler(event, data)
+        finally:
+            observations.append(invocation.outcome)
+
+    dispatcher.callback_query.middleware(observe)
+    edit = bot.recording._default(bot, SendMessage(chat_id=1, text="saved"))
+    failure = (
+        TimeoutError()
+        if uncertain
+        else TelegramBadRequest(method=AnswerCallbackQuery(callback_query_id="click"), message="query too old")
+    )
+    bot.recording.responses.extend([edit, failure])
+    async with app:
+        with pytest.raises(DeliveryError) as caught:
+            await app.feed_update(bot, clicked(Count(count=1).pack()))
+    outcome = caught.value.teleforge_outcome
+    assert outcome == observations[0]
+    assert outcome.handler_returned
+    assert outcome.acknowledgement.attempted and not outcome.acknowledgement.confirmed
+    assert outcome.acknowledgement.uncertain is uncertain
+    assert len(outcome.presentations) == 1
+    assert outcome.presentations[0].confirmed == 1
+    assert not outcome.presentations[0].uncertain
+    with pytest.raises(FrozenInstanceError):
+        outcome.handler_returned = False
+
+
+async def test_localized_acquisition_rejection_is_visible_to_host_outer_middleware() -> None:
+    observations = []
+
+    class Caption(Feature):
+        @command("caption", text=TextInput())
+        async def caption(self, text: str) -> str:
+            raise AssertionError("No input must not reach the handler")
+
+    from aiogram import Dispatcher
+
+    bot = RecordingBot()
+    app = App(Caption(), input_formatter=lambda issue: "Пришли текст." if issue.code == "text-missing" else str(issue))
+    dispatcher = Dispatcher()
+    dispatcher.update.outer_middleware(InvocationMiddleware())
+
+    async def observe(handler: Any, event: Any, data: Any) -> object:
+        invocation = data["teleforge_invocation"]
+        result = await handler(event, data)
+        observations.append(invocation.outcome)
+        return result
+
+    dispatcher.update.outer_middleware(observe)
+    dispatcher.include_router(app.build_router())
+    await dispatcher.feed_update(bot, incoming("/caption"))
+    await dispatcher.fsm.close()
+    assert bot.requests[-1].text == "Пришли текст."
+    outcome = observations[0]
+    assert not outcome.handler_returned
+    assert outcome.input_issue.code == "text-missing"
+    assert outcome.input_issue.params == (("parameter", "text"),)
+    assert outcome.presentations[0].confirmed == 1
+
+
+@pytest.mark.parametrize("kind", ["input", "response"])
+async def test_handler_errors_are_not_converted_to_acquisition_guidance(kind: str) -> None:
+    primary = InputError("text-missing", parameter="value") if kind == "input" else ResponseError("invalid output")
+
+    class Broken(Feature):
+        @command("broken")
+        async def broken(self) -> None:
+            raise primary
+
+    bot = RecordingBot()
+    async with App(Broken()) as app:
+        with pytest.raises(type(primary)) as caught:
+            await app.feed_update(bot, incoming("/broken"))
+    assert caught.value is primary and not bot.requests
+    assert not primary.teleforge_outcome.handler_returned
+    assert primary.teleforge_outcome.input_issue is None
+
+
+async def test_missing_dependency_is_configuration_failure_without_user_guidance() -> None:
+    from teleforge.issues import ConfigurationError
+
+    class Configured(Feature):
+        @command("run")
+        async def run(self, *, service: object) -> None:
+            raise AssertionError("Missing injection must fail before invocation")
+
+    bot = RecordingBot()
+    async with App(Configured()) as app:
+        with pytest.raises(ConfigurationError):
+            await app.feed_update(bot, incoming("/run"))
+    assert not bot.requests
+
+
+async def test_resource_cleanup_failure_retains_confirmed_presentation(monkeypatch: pytest.MonkeyPatch) -> None:
+    from teleforge import binding
+
+    @asynccontextmanager
+    async def prepare(*args: Any, **kwargs: Any) -> AsyncIterator[dict[str, object]]:
+        try:
+            yield {}
+        finally:
+            raise RuntimeError("cleanup failure")
+
+    class Reply(Feature):
+        @command("run")
+        async def run(self) -> str:
+            return "delivered"
+
+    monkeypatch.setattr(binding, "prepare_arguments", prepare)
+    bot = RecordingBot()
+    async with App(Reply()) as app:
+        with pytest.raises(RuntimeError, match="cleanup failure") as caught:
+            await app.feed_update(bot, incoming("/run"))
+    assert caught.value.teleforge_outcome.handler_returned
+    assert caught.value.teleforge_outcome.presentations[0].confirmed == 1
+    assert len(bot.requests) == 1
+
+
+async def test_cancelled_auto_ack_retains_prior_confirmed_edit() -> None:
+    entered = asyncio.Event()
+
+    class Edited(Feature):
+        @callback(Count)
+        async def press(self, ctx: CallbackContext, count: int) -> None:
+            await ctx.edit("saved")
+
+    bot = RecordingBot()
+
+    async def responder(selected: Any, method: Any) -> object:
+        if isinstance(method, AnswerCallbackQuery):
+            entered.set()
+            await asyncio.Event().wait()
+        return bot.recording._default(selected, method)
+
+    bot.recording.responder = responder
+    async with App(Edited()) as app:
+        task = asyncio.create_task(app.feed_update(bot, clicked(Count(count=1).pack())))
+        await asyncio.wait_for(entered.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+    outcome = caught.value.teleforge_outcome
+    assert outcome.handler_returned and outcome.presentations[0].confirmed == 1
+    assert outcome.acknowledgement.attempted and outcome.acknowledgement.uncertain
+
+
+async def test_early_callback_fails_explicitly_for_unbridged_host_isolation() -> None:
+    from aiogram import Dispatcher
+    from aiogram.fsm.storage.memory import SimpleEventIsolation
+
+    from teleforge.isolation import IsolationError
+
+    class Panel(Feature):
+        @command("open")
+        async def open(self, ctx: MessageContext) -> None:
+            await show(ctx, self.panel)
+
+        @card
+        async def panel(self) -> Card:
+            return Card(text="panel", buttons=[[Button("Refresh", self.refresh)]])
+
+        @action(key="refresh", card="panel", ack="early", coalesce=True)
+        async def refresh(self) -> None:
+            raise AssertionError("An unsupported release contract must fail before invocation")
+
+    bot, app = RecordingBot(), App(Panel())
+    dispatcher = Dispatcher(events_isolation=SimpleEventIsolation())
+    dispatcher.include_router(app.build_router())
+    await dispatcher.feed_update(bot, incoming("/open"))
+    payload = bot.requests[0].reply_markup.inline_keyboard[0][0].callback_data
+    with pytest.raises(IsolationError, match="terminal FSM release"):
+        await dispatcher.feed_update(bot, clicked(payload))
+    await dispatcher.fsm.close()
+    assert len(bot.requests) == 1

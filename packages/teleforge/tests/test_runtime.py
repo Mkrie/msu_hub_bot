@@ -1,10 +1,12 @@
 import asyncio
+import warnings
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 
 import pytest
 from aiogram import Bot
+from aiogram.methods import SendMessage
 from aiogram.types import Chat, Message, Update, User
 
 from teleforge.app import AdmissionClosed, App, DrainTimeout
@@ -174,3 +176,70 @@ async def test_shutdown_before_startup_cannot_reopen_resources() -> None:
     with pytest.raises(AdmissionClosed):
         await app.feed_update(bot, update())
     assert app._stack is None and app._dispatcher is None
+
+
+@pytest.mark.parametrize("transport", ["polling", "webhook", "background-webhook"])
+async def test_native_returned_request_remains_admitted_through_delivery(transport: str) -> None:
+    feature, bot = Work(), RecordingBot()
+    app = App(feature)
+    dispatcher = app.create_dispatcher()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    # A native route deliberately bypasses the TeleForge binding adapter.
+    @dispatcher.message()
+    async def native(message: Message) -> SendMessage:
+        return message.answer("native response")
+
+    async def responder(selected: Bot, method: object) -> object:
+        entered.set()
+        await release.wait()
+        assert not feature.closed
+        return True
+
+    bot.recording.responder = responder
+    await app.start()
+    with warnings.catch_warnings(record=True):
+        if transport == "polling":
+            task = asyncio.create_task(dispatcher._process_update(bot, update()))
+        else:
+            task = asyncio.create_task(
+                dispatcher.feed_webhook_update(bot, update(), _timeout=0 if transport == "background-webhook" else 55)
+            )
+        await asyncio.wait_for(entered.wait(), 1)
+        if transport == "background-webhook":
+            assert await task is None
+        closing = asyncio.create_task(app.aclose())
+        await asyncio.sleep(0)
+        assert not closing.done() and not feature.closed
+        release.set()
+        result = await task
+        await closing
+        await asyncio.sleep(0)
+    assert result is (True if transport == "polling" else None)
+    assert len(bot.requests) == 1 and feature.closed
+
+
+async def test_native_returned_request_is_cancelled_before_resources_close() -> None:
+    feature, bot = Work(), RecordingBot()
+    app = App(feature, drain_timeout=0, cancel_timeout=1)
+    dispatcher = app.create_dispatcher()
+    entered, stopped = asyncio.Event(), asyncio.Event()
+
+    @dispatcher.message()
+    async def native(message: Message) -> SendMessage:
+        return message.answer("native response")
+
+    async def responder(selected: Bot, method: object) -> object:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            assert not feature.closed
+            stopped.set()
+
+    bot.recording.responder = responder
+    await app.start()
+    task = asyncio.create_task(dispatcher._process_update(bot, update()))
+    await asyncio.wait_for(entered.wait(), 1)
+    await app.aclose()
+    assert task.cancelled() and stopped.is_set() and feature.closed

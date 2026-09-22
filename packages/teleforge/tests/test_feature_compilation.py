@@ -126,3 +126,76 @@ def test_multiple_entrypoints_keep_source_declaration_order() -> None:
     handlers = App(Multi()).iter_handlers()
     assert [item.declaration.event for item in handlers] == ["message", "edited_message"]
     assert len({item.key for item in handlers}) == 2
+
+
+def test_inspection_exposes_effective_sources_and_unknown_external_dependencies() -> None:
+    class Inputs(Feature):
+        @command("describe", text=TextInput())
+        async def describe(self, ctx: MessageContext, count: int, text: str, *, service: object) -> None:
+            pass
+
+    app = App(Inputs())
+    compiled = app.iter_handlers()[0]
+    parameters = app.inspect()["handlers"][0]["parameters"]
+    assert (
+        [(item["name"], item["source"]) for item in parameters]
+        == [(parameter.name, parameter.source) for parameter in compiled.plan.parameters]
+        == [("ctx", "context"), ("count", "argument"), ("text", "text"), ("service", "dependency")]
+    )
+    assert parameters[-1]["availability"] == "external"
+    assert app.check() == ()  # Native middleware supplies external dependencies at invocation time.
+
+
+def test_nonordinary_command_dependency_and_impossible_media_are_static_errors() -> None:
+    from teleforge.inputs import Argument, ImageInput
+
+    class Invalid(Feature):
+        @command("service")
+        async def service(self, service: object) -> None:
+            pass
+
+        @command("photo", image=ImageInput())
+        async def photo(self, image: int) -> None:
+            pass
+
+        @event("message", count=Argument())
+        async def incoming(self, count: int) -> None:
+            pass
+
+    assert {issue.code for issue in App(Invalid()).check()} == {"parameter-source", "input-type", "argument-source"}
+
+
+def test_missing_card_renderer_is_rejected_by_check_inspect_and_router() -> None:
+    from teleforge.cards import action
+
+    class Invalid(Feature):
+        @action(key="refresh", card="missing")
+        async def refresh(self, ctx: CallbackContext) -> None:
+            pass
+
+    app = App(Invalid())
+    assert [issue.code for issue in app.check()] == ["card-schema"]
+    assert app.inspect()["diagnostics"][0]["code"] == "card-schema"
+    with pytest.raises(CompilationError, match="missing"):
+        app.build_router()
+
+
+def test_step_and_job_signature_metadata_are_checked_without_binding_adapters() -> None:
+    from pydantic import BaseModel
+
+    from teleforge.conversations import step
+    from teleforge.jobs import job
+
+    class Draft(BaseModel):
+        value: int
+
+    class Invalid(Feature):
+        @step("collect", draft=Draft)
+        async def collect(self, ctx: MessageContext, draft: str) -> None:
+            pass
+
+        @job("work", payload=Draft)
+        async def work(self, payload: str) -> None:
+            pass
+
+    assert {issue.code for issue in App(Invalid()).check()} == {"step-draft", "job-payload"}
