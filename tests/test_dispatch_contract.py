@@ -40,8 +40,6 @@ def implementation(original):
         "process_lobster": "Captions.caption",
         "process_demotivator": "Captions.caption",
         "process_meme": "Captions.caption",
-        "process_roll": "Roll.roll",
-        "process_dice": "Roll.dice",
         "process_figlet": "FigletFeature.process_figlet",
         "Reactions.process": "ReactionsFeature.process",
         "Reactions.process_cb": "ReactionsFeature.process_cb",

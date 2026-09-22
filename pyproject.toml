@@ -276,10 +276,8 @@ files = [
     "src/msu_hub_bot/features/__init__.py",
     "src/msu_hub_bot/features/captions.py",
     "src/msu_hub_bot/features/command.py",
-    "src/msu_hub_bot/features/compiler.py",
     "src/msu_hub_bot/features/integration.py",
     "src/msu_hub_bot/features/reactions.py",
-    "src/msu_hub_bot/features/roll.py",
     "tools/check_types.py",
     "tools/migrate_storage.py",
 ]

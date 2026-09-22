@@ -27,14 +27,19 @@ _NAMES: dict[CaptionStyle, tuple[str, ...]] = {
     "demotivator": ("demotivator", "de", "д", "де"),
     "meme": ("meme",),
 }
-_INPUTS = {"text": TextInput(), "media": MediaInput(kinds=("video", "image"), avatar=True)}
+_OPTIONS = {
+    "text": TextInput(),
+    "media": MediaInput(kinds=("video", "image"), avatar=True),
+    # The renderer bounds video at 50 MiB; the complete response also includes controls.
+    "max_output_bytes": 64 * 1024 * 1024,
+}
 
 
 class Captions(Feature, key="captions"):
     # Keep router precedence when a message contains triggers for several styles.
-    @hub_command(*_NAMES["lobster"], flags={"handler_key": "process_lobster", "fsm_release": True}, **_INPUTS)
-    @hub_command(*_NAMES["demotivator"], flags={"handler_key": "process_demotivator", "fsm_release": True}, **_INPUTS)
-    @hub_command(*_NAMES["meme"], flags={"handler_key": "process_meme", "fsm_release": True}, **_INPUTS)
+    @hub_command(*_NAMES["lobster"], flags={"handler_key": "process_lobster", "fsm_release": True}, **_OPTIONS)
+    @hub_command(*_NAMES["demotivator"], flags={"handler_key": "process_demotivator", "fsm_release": True}, **_OPTIONS)
+    @hub_command(*_NAMES["meme"], flags={"handler_key": "process_meme", "fsm_release": True}, **_OPTIONS)
     async def caption(self, ctx: MessageContext, text: str, media: DownloadableMedia, *, meta: MetaInfo, cpu_executor: TPExecutor) -> None:
         assert isinstance(ctx.message, Message)
         style = next(style for style, names in _NAMES.items() if meta.keyword.lower() in names)

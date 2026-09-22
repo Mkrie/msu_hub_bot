@@ -1,5 +1,6 @@
 from contextlib import suppress
 from collections.abc import Awaitable, Callable
+import asyncio
 import re
 
 import cachetools
@@ -11,15 +12,18 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.filters.callback_data import CallbackData
-from aiogram.utils.markdown import hpre, hbold, hcode, hitalic
-from aiogram.utils.formatting import Bold, Code, Pre, Text
+from aiogram.utils.markdown import hbold, hcode
+from aiogram.utils.formatting import Bold, Code, Italic, Pre, Text, TextLink
 from pydantic import BaseModel
+from teleforge.delivery import DeliveryError, DeliveryProgress, complete_response, edit_response, send_response
+from teleforge.formatting import ResponseError
 
 from msu_hub_bot.telegram.callbacks import CallbackCommandBase
 from msu_hub_bot.telegram.filters import MetaCommand, MetaInfo
 from msu_hub_bot.telegram.state import UpdateStateContext, release_state_isolation
 from msu_hub_bot.telegram.files import download_text
 from msu_hub_bot.providers.jdoodle import LANGUAGES, JDoodleError, ManyJDoodle
+from msu_hub_bot.telemetry import record_handled_failure
 
 CompilerHandler = Callable[..., Awaitable[Message | bool]]
 
@@ -103,6 +107,40 @@ async def code_submit(jdoodle: ManyJDoodle, source_code: str, stdin: str = "", l
     return None
 
 
+def _header(lang: str) -> Text:
+    return Text(Bold(lang), " | ", Bold(LANGUAGES[lang][1][-1][0]), "\n\n")
+
+
+async def _run_code(
+    jdoodle: ManyJDoodle, code: str, lang: str, status: Message, source: Message, bot: Bot, *, stdin: str = ""
+) -> Message | bool:
+    progress = DeliveryProgress()
+    try:
+        output = await code_submit(jdoodle, code, stdin=stdin, lang=lang)
+        content = Text(_header(lang), Pre(output)) if output else Code("🤷🏻‍♂️ Произошла какая-то ошибка")
+        completed = await complete_response(
+            bot, status, content, overflow_to=source, overflow_notice="Готово — полный результат в файле.", progress=progress
+        )
+    except asyncio.CancelledError:
+        if progress.phase != "complete" and not progress.uncertain:
+            with suppress(DeliveryError, ResponseError):
+                await edit_response(bot, status, "Выполнение отменено.")
+        raise
+    except (DeliveryError, ResponseError) as error:
+        record_handled_failure(error)
+        notice = "Не удалось подтвердить отправку. Результат мог уже прийти." if progress.uncertain else "Не удалось отправить результат."
+        with suppress(DeliveryError, ResponseError):
+            if progress.uncertain:
+                guidance = await send_response(bot, source, notice, fixed=True)
+                assert isinstance(guidance, Message)
+                return guidance
+            return await edit_response(bot, status, notice)
+        raise
+    if completed.status_error is not None:
+        record_handled_failure(completed.status_error)
+    return completed.result
+
+
 class ProgStates(StatesGroup):
     stdin = State()
 
@@ -161,24 +199,22 @@ class ProgCompiler(CallbackCommandBase):
                 action=ChatAction.TYPING,
                 message_thread_id=message.message_thread_id if message.is_topic_message else None,
             )
-            header = hbold(lang) + " | " + hbold(LANGUAGES[lang][1][-1][0]) + "\n\n"
+            waiting = Text(_header(lang), Italic("🔄 Ожидание..."))
 
             advance = None
             if message_id := cls.replies.get(cls.cache_key(target)):
                 with suppress(TelegramBadRequest):
-                    edited = await bot.edit_message_text(header + hitalic("🔄 Ожидание..."), chat_id=message.chat.id, message_id=message_id)
+                    edited = await bot.edit_message_text(**waiting.as_kwargs(), chat_id=message.chat.id, message_id=message_id)
                     if isinstance(edited, Message):
                         advance = edited
 
             if advance is None:
-                advance = await target.reply(header + hitalic("🔄 Ожидание..."))
+                sent = await send_response(bot, target, waiting, fixed=True)
+                assert isinstance(sent, Message)
+                advance = sent
                 cls.replies[cls.cache_key(target)] = advance.message_id
 
-            result = await code_submit(jdoodle, text, lang=lang)
-            if result:
-                return await advance.edit_text(header + hpre(result))
-
-            return await advance.edit_text(hcode("🤷🏻‍♂️ Произошла какая-то ошибка"))
+            return await _run_code(jdoodle, text, lang, advance, target, bot)
 
         return process
 
@@ -212,7 +248,9 @@ class ProgCompiler(CallbackCommandBase):
                     result = edited
 
         if result is None:
-            result = await target.reply(**preview.as_kwargs(), reply_markup=cls.keyboard())
+            sent = await send_response(bot, target, preview, reply_markup=cls.keyboard(), fixed=True)
+            assert isinstance(sent, Message)
+            result = sent
             cls.replies[cls.cache_key(target)] = result.message_id
 
         return result
@@ -244,7 +282,13 @@ class ProgCompiler(CallbackCommandBase):
             return await m.edit_text(m.html_text + "\n\n⚠️ Сообщение с исходным кодом удалено")
         lang, code = source
 
-        reply = await m.reply(f"{query.from_user.mention_html()}, ожидаю ввод ⬇️, или /cancel")
+        reply = await send_response(
+            bot,
+            m,
+            Text(TextLink(query.from_user.full_name, url=f"tg://user?id={query.from_user.id}"), ", ожидаю ввод ⬇️, или /cancel"),
+            fixed=True,
+        )
+        assert isinstance(reply, Message)
         data = StdinDraft(chat_id=reply.chat.id, inform_message_id=reply.message_id, prog_lang=lang, prog_code=code)
         await state.set_data(data.model_dump())
         await state.set_state(ProgStates.stdin)
@@ -267,11 +311,6 @@ class ProgCompiler(CallbackCommandBase):
         await state.clear()
         release_state_isolation(state_context)
 
-        header = hbold(lang) + " | " + hbold(LANGUAGES[lang][1][-1][0]) + "\n\n"
-        advance = await message.reply(header + hitalic("🔄 Ожидание..."))
-
-        result = await code_submit(jdoodle, code, stdin=message.text or message.caption or "", lang=lang)
-        if result:
-            return await advance.edit_text(header + hpre(result))
-
-        return await advance.edit_text(hcode("🤷🏻‍♂️ Произошла какая-то ошибка"))
+        advance = await send_response(bot, message, Text(_header(lang), Italic("🔄 Ожидание...")), fixed=True)
+        assert isinstance(advance, Message)
+        return await _run_code(jdoodle, code, lang, advance, message, bot, stdin=message.text or message.caption or "")

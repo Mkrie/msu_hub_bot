@@ -15,6 +15,7 @@ from msu_hub_bot.execution.executor import TPExecutor
 from msu_hub_bot.features import captions
 from msu_hub_bot.features.command import format_input_error
 from msu_hub_bot.media.caption_layout import CaptionLayoutError
+from msu_hub_bot.media.ffmpeg import MAX_OUTPUT_BYTES
 from msu_hub_bot.telegram.media_jobs import DownloadUnavailable
 from telegram_helpers import make_bot, make_message
 
@@ -163,6 +164,52 @@ async def test_attached_media_has_priority_over_reply_media(bot, dispatch, actio
 
     assert downloaded.call_args.args[2] is (captions.caption_video if is_video else captions.caption_image)
     assert bot.session.methods[-1].reply_parameters.message_id == 11
+
+
+@pytest.mark.parametrize("attached_photo", [False, True])
+async def test_mixed_rich_reply_prefers_video_but_attached_photo_still_wins(bot, dispatch, actions, downloaded, attached_photo):
+    target = make_message(
+        bot,
+        message_id=10,
+        rich_message={
+            "blocks": [
+                {
+                    "type": "collage",
+                    "blocks": [
+                        {"type": "photo", **media_fields("photo")},
+                        {"type": "video", **media_fields("video")},
+                    ],
+                }
+            ]
+        },
+    )
+    fields = {"caption": "/meme подпись", **media_fields("photo")} if attached_photo else {"text": "/meme подпись"}
+    message = make_message(bot, message_id=11, reply_to_message=target, **fields)
+    downloaded.return_value = (Image.new("RGB", (20, 20)) if attached_photo else io.BytesIO(b"converted video")), False
+
+    await dispatch(message)
+
+    assert downloaded.call_args.args[2] is (captions.caption_image if attached_photo else captions.caption_video)
+    sent = bot.session.methods[-1]
+    assert sent.__api_method__ == ("sendPhoto" if attached_photo else "sendVideo")
+    assert sent.reply_parameters.message_id == (11 if attached_photo else 10)
+
+
+async def test_full_native_video_output_limit_fits_with_group_controls(bot, dispatch, actions, downloaded):
+    payload = b"v" * MAX_OUTPUT_BYTES
+    output = io.BytesIO(payload)
+    downloaded.return_value = output, False
+    target = make_message(bot, message_id=10, is_topic_message=True, message_thread_id=55, **media_fields("video"))
+    message = make_message(bot, text="/meme подпись", reply_to_message=target, is_topic_message=True, message_thread_id=55)
+
+    await dispatch(message)
+
+    assert [method.__api_method__ for method in bot.session.methods] == ["sendVideo"]
+    sent = bot.session.methods[0]
+    assert sent.video.data == payload
+    assert sent.reply_markup is not None and sent.supports_streaming
+    assert sent.reply_parameters.message_id == 10 and sent.message_thread_id == 55
+    assert output.closed and actions[-1][0] == "stop"
 
 
 async def test_profile_photo_fallback_keeps_replied_user_as_target(bot, dispatch, actions, downloaded, monkeypatch):

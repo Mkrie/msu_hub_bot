@@ -7,6 +7,7 @@ from aiogram.enums import ContentType
 from aiogram.utils.formatting import Pre
 from pyfiglet import Figlet
 from teleforge import Feature
+from teleforge.context import MessageContext
 from teleforge.inputs import TextInput
 from transliterate import translit
 
@@ -42,8 +43,15 @@ class FigletFeature(Feature, key="figlet"):
         rich=False,
         soft_messages=1,
     )
-    async def process_figlet(self, text: str = "kek", *, cpu_executor: TPExecutor) -> Pre | str:
+    async def process_figlet(self, ctx: MessageContext, text: str = "kek", *, cpu_executor: TPExecutor) -> Pre | None:
+        # Even the default joke replies to the message the user selected.
+        if "text" not in ctx.input_sources and ctx.message.reply_to_message:
+            ctx.response_target = ctx.message.reply_to_message
         rendered, timed_out = await cpu_executor.run(next(figlets).renderText, translit(text, "ru", reversed=True), timeout=10)
         if timed_out:
-            return "🤷🏻‍♂️ Не успел нарисовать буквы. Попробуй текст покороче."
-        return Pre(rendered) if rendered.strip() else "Этот шрифт не умеет рисовать такие символы. Попробуй буквы или цифры."
+            await ctx.reply("🤷🏻‍♂️ Не успел нарисовать буквы. Попробуй текст покороче.", to=ctx.message)
+            return None
+        if not rendered.strip():
+            await ctx.reply("Этот шрифт не умеет рисовать такие символы. Попробуй буквы или цифры.", to=ctx.message)
+            return None
+        return Pre(rendered)

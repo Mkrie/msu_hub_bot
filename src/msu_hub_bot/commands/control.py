@@ -37,7 +37,11 @@ async def process_start(message: Message) -> Message:
 async def process_cancel(message: Message, state: FSMContext, state_context: UpdateStateContext) -> Message:
     await state.clear()
     release_state_isolation(state_context)
-    return await message.reply("👌🏻", reply_markup=ReplyKeyboardRemove())
+    return await message.reply(
+        "👌🏻",
+        reply_markup=ReplyKeyboardRemove(),
+        direct_messages_topic_id=message.direct_messages_topic.topic_id if message.direct_messages_topic else None,
+    )
 
 
 async def process_echo(message: Message) -> Message:

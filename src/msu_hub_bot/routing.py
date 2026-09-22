@@ -82,10 +82,12 @@ from msu_hub_bot.commands.rolls import (
     Randoms,
     Rolls,
     process_d6,
+    process_dice,
     process_mash,
     process_or,
     process_others_dice,
     process_random,
+    process_roll,
     process_truth,
 )
 from msu_hub_bot.commands.sed import process_sed
@@ -96,7 +98,6 @@ from msu_hub_bot.features.captions import Captions
 from msu_hub_bot.features.command import format_input_error
 from msu_hub_bot.features.integration import HubIsolationBridge
 from msu_hub_bot.features.reactions import ReactionsFeature
-from msu_hub_bot.features.roll import Roll
 from msu_hub_bot.commands.remind import Remind
 from msu_hub_bot.commands.feedback import Feedback
 from msu_hub_bot.commands.app import is_app_start, process_app, process_app_start
@@ -126,8 +127,8 @@ def fsm_callback_allowed(query: object, state_context: UpdateStateContext) -> bo
 def build_router(*, wit: Wit, wolfram: WolframAPI, config: Settings) -> Router:
     settings = config
     root = Router(name="hub")
-    captions, roll, reactions, figlet = Captions(), Roll(), ReactionsFeature(), FigletFeature()
-    features = App(captions, roll, reactions, figlet, input_formatter=format_input_error)
+    captions, reactions, figlet = Captions(), ReactionsFeature(), FigletFeature()
+    features = App(captions, reactions, figlet, input_formatter=format_input_error)
     root.startup.register(features.start)
     root.shutdown.register(features.aclose)
     current: Router | None = None
@@ -757,7 +758,9 @@ def build_router(*, wit: Wit, wolfram: WolframAPI, config: Settings) -> Router:
     group("rate").callback_query.register(
         Rate.process_cb, Rate.callback_data.filter(), StateFilter(None), flags={"handler_key": "Rate.process_cb", "fsm_release": True}
     )
-    features.register(group("rolls"), roll.roll)
+    group("rolls").message.register(
+        process_roll, MetaCommand("roll", "ролл"), StateFilter(None), flags={"handler_key": "process_roll", "fsm_release": True}
+    )
     group("rolls").message.register(
         Rolls.process,
         MetaCommand("rolls", "роллим", "рулетка"),
@@ -809,7 +812,9 @@ def build_router(*, wit: Wit, wolfram: WolframAPI, config: Settings) -> Router:
     group("rolls").message.register(
         process_d6, MetaCommand("d6"), StateFilter(None), flags={"handler_key": "process_d6", "fsm_release": True}
     )
-    features.register(group("rolls"), roll.dice)
+    group("rolls").message.register(
+        process_dice, MetaCommand("dice"), StateFilter(None), flags={"handler_key": "process_dice", "fsm_release": True}
+    )
     group("rolls").message.register(
         process_others_dice,
         StateFilter(None),

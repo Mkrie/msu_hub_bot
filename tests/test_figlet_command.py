@@ -56,6 +56,25 @@ async def test_explicit_text_transliterates_and_targets_invocation(setup, text):
     assert sent.reply_parameters.message_id == message.message_id
 
 
+@pytest.mark.parametrize("command,target_id", [("/figlet", 7), ("/figlet kek", 1)])
+async def test_default_on_captionless_reply_preserves_target_without_retargeting_explicit_text(setup, command, target_id):
+    app, bot, _ = setup
+    reply = make_message(
+        bot,
+        message_id=7,
+        photo=[{"file_id": "photo", "file_unique_id": "p", "width": 20, "height": 20}],
+        is_topic_message=True,
+        message_thread_id=55,
+    )
+    message = make_message(bot, text=command, reply_to_message=reply, is_topic_message=True, message_thread_id=55)
+
+    await app.feed_update(bot, Update(update_id=1, message=message))
+
+    sent = bot.requests[-1]
+    assert sent.text == figlet.figlet_fonts[0].renderText("kek")
+    assert sent.reply_parameters.message_id == target_id and sent.message_thread_id == 55
+
+
 async def test_long_render_is_complete_file_on_selected_reply_topic(setup):
     app, bot, _ = setup
     text = "Всем привет! " * 80
@@ -87,25 +106,33 @@ async def test_oversized_rich_reply_is_rejected_before_rendering(setup, monkeypa
     assert bot.requests[-1].reply_parameters.message_id == message.message_id
 
 
-async def test_worker_deadline_has_useful_guidance(setup, monkeypatch):
+@pytest.mark.parametrize("source_text", ["Привет", None])
+async def test_worker_deadline_has_useful_guidance_at_invocation(setup, monkeypatch, source_text):
     app, bot, executor = setup
     monkeypatch.setattr(executor, "run", AsyncMock(return_value=(None, True)))
-    message = make_message(bot, text="/figlet Привет")
+    reply = make_message(bot, message_id=7, text=source_text, is_topic_message=True, message_thread_id=55)
+    message = make_message(bot, text="/figlet", reply_to_message=reply, is_topic_message=True, message_thread_id=55)
 
     await app.feed_update(bot, Update(update_id=1, message=message))
 
     assert len(bot.requests) == 1
     assert bot.requests[0].text == "🤷🏻‍♂️ Не успел нарисовать буквы. Попробуй текст покороче."
+    assert bot.requests[0].reply_parameters.message_id == message.message_id
+    assert bot.requests[0].message_thread_id == 55
 
 
-async def test_unsupported_symbols_have_guidance_instead_of_empty_output(setup):
+@pytest.mark.parametrize("command", ["/figlet", "/figlet 🙂"])
+async def test_unsupported_symbols_have_guidance_at_invocation(setup, command):
     app, bot, _ = setup
-    message = make_message(bot, text="/figlet 🙂")
+    reply = make_message(bot, message_id=7, text="🙂", is_topic_message=True, message_thread_id=55)
+    message = make_message(bot, text=command, reply_to_message=reply, is_topic_message=True, message_thread_id=55)
 
     await app.feed_update(bot, Update(update_id=1, message=message))
 
     assert len(bot.requests) == 1
     assert bot.requests[0].text == "Этот шрифт не умеет рисовать такие символы. Попробуй буквы или цифры."
+    assert bot.requests[0].reply_parameters.message_id == message.message_id
+    assert bot.requests[0].message_thread_id == 55
 
 
 async def test_caption_command_remains_outside_figlet_text_route(setup, monkeypatch):
