@@ -124,6 +124,8 @@ class DocumentInput:
 
 @dataclass(frozen=True, slots=True)
 class MediaInput:
+    """Prefer attached media, trying kinds in declaration order within each message."""
+
     reply: bool = True
     avatar: bool = False
     max_bytes: int = MAX_DOWNLOAD_BYTES
@@ -355,29 +357,30 @@ def _pick_media(message: Message, kinds: tuple[str, ...]) -> Downloadable | None
     if message.audio or message.voice:
         candidates.append(message.audio or message.voice)  # type: ignore[arg-type]
     candidates.extend(rich_media(message))
-    for media in candidates:
-        if isinstance(media, (Video, Animation, VideoNote)) and "video" in kinds:
-            return media
-        if isinstance(media, PhotoSize) and "image" in kinds:
-            return media
-        if isinstance(media, Sticker) and (
-            media.is_video and "video" in kinds or not (media.is_video or media.is_animated) and "image" in kinds
-        ):
-            return media
-        if isinstance(media, Document):
-            mime = media.mime_type or ""
-            base, _, subtype = mime.partition("/")
-            if (
-                "document" in kinds
-                or "image" in kinds
-                and base == "image"
-                and subtype.endswith(("jpeg", "png", "tiff", "bmp", "gif", "webp"))
-                or "video" in kinds
-                and mime.startswith("video/")
+    for kind in kinds:
+        for media in candidates:
+            if isinstance(media, (Video, Animation, VideoNote)) and kind == "video":
+                return media
+            if isinstance(media, PhotoSize) and kind == "image":
+                return media
+            if isinstance(media, Sticker) and (
+                media.is_video and kind == "video" or not (media.is_video or media.is_animated) and kind == "image"
             ):
                 return media
-        if isinstance(media, (Audio, Voice)) and "audio" in kinds:
-            return media
+            if isinstance(media, Document):
+                mime = media.mime_type or ""
+                base, _, subtype = mime.partition("/")
+                if (
+                    kind == "document"
+                    or kind == "image"
+                    and base == "image"
+                    and subtype.endswith(("jpeg", "png", "tiff", "bmp", "gif", "webp"))
+                    or kind == "video"
+                    and mime.startswith("video/")
+                ):
+                    return media
+            if isinstance(media, (Audio, Voice)) and kind == "audio":
+                return media
     return None
 
 

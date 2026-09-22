@@ -9,6 +9,7 @@ from aiogram.types import (
     InputMediaPhoto,
     InputTextMessageContent,
     Message,
+    ReplyKeyboardRemove,
     SentWebAppMessage,
 )
 
@@ -41,3 +42,11 @@ async def test_native_album_and_additional_upload_fields_are_fully_recorded() ->
     await bot(native)
     assert bot.requests == [album, native]
     assert bot.recording.uploads[1] == {"future_attachment": b"extra"}
+
+
+async def test_reply_keyboard_removal_is_sent_but_not_returned_as_inline_markup() -> None:
+    bot = RecordingBot()
+    method = SendMessage(chat_id=7, text="Cancelled", reply_markup=ReplyKeyboardRemove())
+    result = await bot(method)
+    assert bot.requests == [method] and result.reply_markup is None
+    assert isinstance(bot.requests[0].reply_markup, ReplyKeyboardRemove)

@@ -30,9 +30,11 @@ from .declarations import inline_query as inline_query
 from .declarations import message as message
 from .declarations import pre_checkout_query as pre_checkout_query
 from .declarations import shipping_query as shipping_query
+from .delivery import CompletedResponse as CompletedResponse
 from .delivery import DeliveryError as DeliveryError
 from .delivery import DeliveryTarget as DeliveryTarget
 from .delivery import ResponsePolicy as ResponsePolicy
+from .delivery import complete_response as complete_response
 from .feature import CompilationError as CompilationError
 from .feature import Feature as Feature
 from .inputs import Argument as Argument

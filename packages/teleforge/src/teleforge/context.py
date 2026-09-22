@@ -15,6 +15,7 @@ from aiogram.types import (
     InaccessibleMessage,
     InlineKeyboardMarkup,
     InputRichMessage,
+    LinkPreviewOptions,
     Message,
     MessageEntity,
     MessageId,
@@ -75,6 +76,7 @@ class EditOptions(TypedDict, total=False):
     animation: MediaSource | None
     entities: Sequence[MessageEntity] | None
     reply_markup: InlineKeyboardMarkup | None
+    link_preview_options: LinkPreviewOptions | None
     allow_remote_media: bool
     request_timeout: int | None
     progress: DeliveryProgress | None

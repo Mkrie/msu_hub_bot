@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
-from aiogram.types import CallbackQuery, Chat, Document, Message, PhotoSize, User
+from aiogram.types import CallbackQuery, Chat, Document, Message, PhotoSize, User, Video
 
 from teleforge.context import context_for
 from teleforge.inputs import Argument, DocumentInput, ImageInput, InputError, MediaInput, TextInput, prepare_arguments
@@ -186,6 +186,31 @@ async def test_raw_document_acquisition_still_accepts_svg(rule):
     bot = RecordingBot()
     async with prepare_arguments(handler, event, context_for(bot, event), {}, {"media": rule}) as values:
         assert values["media"] is attachment
+    assert not bot.requests
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kinds,expected", [(("video", "image"), "video"), (("image", "video"), "photo")])
+async def test_declared_media_kind_order_selects_within_one_rich_message(kinds, expected):
+    async def handler(media: PhotoSize | Video):
+        pass
+
+    event = message(
+        rich_message={
+            "blocks": [
+                {"type": "photo", "photo": [{"file_id": "photo", "file_unique_id": "p", "width": 20, "height": 20}]},
+                {
+                    "type": "video",
+                    "video": {"file_id": "video", "file_unique_id": "v", "width": 20, "height": 20, "duration": 1},
+                },
+            ]
+        }
+    )
+    bot = RecordingBot()
+    ctx = context_for(bot, event)
+    async with prepare_arguments(handler, event, ctx, {}, {"media": MediaInput(kinds=kinds)}) as values:
+        assert values["media"].file_id == expected
+        assert ctx.input_sources["media"] is event
     assert not bot.requests
 
 

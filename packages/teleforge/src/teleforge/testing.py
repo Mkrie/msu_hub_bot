@@ -9,7 +9,7 @@ from aiogram import Bot
 from aiogram.client.session.base import BaseSession
 from aiogram.methods import TelegramMethod
 from aiogram.methods.base import TelegramType
-from aiogram.types import Chat, InputFile, Message, User
+from aiogram.types import Chat, InlineKeyboardMarkup, InputFile, Message, User
 from pydantic import BaseModel
 
 type Responder = Callable[[Bot, TelegramMethod[Any]], Awaitable[object]]
@@ -86,6 +86,7 @@ class RecordingSession(BaseSession):
             if message_id is None:
                 self.next_message_id += 1
                 message_id = self.next_message_id
+            reply_markup = getattr(method, "reply_markup", None)
             values: dict[str, Any] = {
                 "message_id": message_id,
                 "date": datetime.now(UTC),
@@ -96,7 +97,7 @@ class RecordingSession(BaseSession):
                 "message_thread_id": getattr(method, "message_thread_id", None),
                 "is_topic_message": getattr(method, "message_thread_id", None) is not None,
                 "business_connection_id": getattr(method, "business_connection_id", None),
-                "reply_markup": getattr(method, "reply_markup", None),
+                "reply_markup": reply_markup if isinstance(reply_markup, InlineKeyboardMarkup) else None,
             }
             for kind in ("photo", "video", "audio", "document", "animation"):
                 replacement = getattr(method, "media", None)

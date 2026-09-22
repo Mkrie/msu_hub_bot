@@ -91,8 +91,8 @@ class ResponsePolicy:
     def __post_init__(self) -> None:
         if type(self.rich) is not bool or type(self.soft_messages) is not int or not 1 <= self.soft_messages <= 20:
             raise ValueError("Expected rich=True/False and 1–20 soft messages")
-        if type(self.max_output_bytes) is not int or not 1 <= self.max_output_bytes <= 50 * 1024 * 1024:
-            raise ValueError("Output budget must be between 1 byte and 50 MiB")
+        if type(self.max_output_bytes) is not int or not 1 <= self.max_output_bytes <= 64 * 1024 * 1024:
+            raise ValueError("Output budget must be between 1 byte and 64 MiB")
         if isinstance(self.timeout, bool) or not math.isfinite(self.timeout) or not 0 < self.timeout <= 300:
             raise ValueError("Delivery timeout must be between 0 and 300 seconds")
 
@@ -187,6 +187,15 @@ class DeliveryError(Exception):
 
 ResponseDeliveryError = DeliveryError
 ResponseProgress = DeliveryProgress
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedResponse:
+    """Confirmed result delivery, independent of a later status-message update."""
+
+    result: NativeResult
+    spilled: bool = False
+    status_error: DeliveryError | None = None
 
 
 def rejected(error: Exception) -> bool:
@@ -683,6 +692,7 @@ async def edit_response(
     animation: MediaSource | None = None,
     entities: Sequence[MessageEntity] | None = None,
     reply_markup: InlineKeyboardMarkup | None = None,
+    link_preview_options: LinkPreviewOptions | None = None,
     allow_remote_media: bool = False,
     request_timeout: int | None = None,
     progress: DeliveryProgress | None = None,
@@ -776,7 +786,7 @@ async def edit_response(
                     text=value.text,
                     entities=list(value.entities),
                     parse_mode=None,
-                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                    link_preview_options=link_preview_options or LinkPreviewOptions(is_disabled=True),
                     **common,
                 )
             state.total_parts, state.phase = 1, "waiting"
@@ -804,3 +814,84 @@ async def edit_response(
     except Exception as error:  # noqa: BLE001 - preserve every outbound-write failure and its uncertainty
         state.phase, state.uncertain = "failed", state.attempted_part is not None and not rejected(error)
         raise DeliveryError(state, error) from None
+
+
+async def complete_response(
+    bot: Bot,
+    status: Target,
+    text: str | Text,
+    *,
+    overflow_to: Target,
+    overflow_notice: str | Text,
+    policy: ResponsePolicy = DEFAULT_POLICY,
+    entities: Sequence[MessageEntity] | None = None,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    link_preview_options: LinkPreviewOptions | None = None,
+    request_timeout: int | None = None,
+    progress: DeliveryProgress | None = None,
+) -> CompletedResponse:
+    """Complete a text status, spilling only preflighted overflow to one full file.
+
+    ``progress`` describes the result write, including cancellation. A confirmed
+    file is independent of its later status notice; that notice's delivery error
+    is returned separately and never causes an upload retry.
+    """
+    state = _new_progress(progress)
+    try:
+        address = resolve_target(status)
+        if address.kind != "text" or address.message_id is None or address.chat_id is None:
+            raise ResponseError("Completion requires an existing chat text status")
+        prepared_markup, markup_bytes = _prepare_markup(reply_markup, policy.max_output_bytes)
+        if prepared_markup is not None and not isinstance(prepared_markup, InlineKeyboardMarkup):
+            raise ResponseError("A text status accepts only inline controls")
+        value = format_text(text, entities, policy.max_output_bytes - markup_bytes)
+        if not value.text.strip():
+            raise ResponseError("A completed response cannot be empty")
+        if value.fits(4096):
+            result = await edit_response(
+                bot,
+                address,
+                value.text,
+                entities=value.entities,
+                reply_markup=prepared_markup,
+                link_preview_options=link_preview_options,
+                policy=policy,
+                request_timeout=request_timeout,
+                progress=state,
+            )
+            return CompletedResponse(result)
+        destination = resolve_target(overflow_to)
+        if destination.chat_id is None:
+            raise ResponseError("A full result file needs an explicit chat target")
+        notice = format_text(overflow_notice, None, policy.max_output_bytes - markup_bytes)
+        if not notice.text.strip() or not notice.fits(4096):
+            raise ResponseLimitError("The completion notice must fit one text message")
+        payload = value.file_bytes()
+        if len(payload) + notice.size_bytes + markup_bytes > policy.max_output_bytes:
+            raise ResponseLimitError("The complete result and status notice exceed their byte budget")
+        output = await send_response(
+            bot,
+            destination,
+            document=BufferedInputFile(payload, "result.txt"),
+            fixed=True,
+            policy=policy,
+            request_timeout=request_timeout,
+            progress=state,
+        )
+        assert isinstance(output, Message)
+        try:
+            await edit_response(
+                bot,
+                address,
+                notice.text,
+                entities=notice.entities,
+                reply_markup=prepared_markup,
+                policy=policy,
+                request_timeout=request_timeout,
+            )
+        except DeliveryError as error:
+            return CompletedResponse(output, spilled=True, status_error=error)
+        return CompletedResponse(output, spilled=True)
+    except ResponseError:
+        state.phase = "failed"
+        raise
