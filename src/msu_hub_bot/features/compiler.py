@@ -29,7 +29,7 @@ class Compiler(Feature, key="compiler"):
         "python_stdin",
         "pys",
         "pythons",
-        code=TextInput(document=True),
+        code=TextInput(document="prefer"),
         flags={"handler_key": "compile.stdin_prompt.python3", "fsm_release": False},
     )
     async def prompt(self, ctx: MessageContext, code: str) -> None:

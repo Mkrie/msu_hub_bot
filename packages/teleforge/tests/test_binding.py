@@ -9,13 +9,22 @@ from typing import Any
 import pytest
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters.callback_data import CallbackData
-from aiogram.methods import AnswerCallbackQuery, SendMessage
-from aiogram.types import CallbackQuery, Chat, InaccessibleMessage, Message, MessageId, Update, User
+from aiogram.methods import (
+    AnswerCallbackQuery,
+    CopyMessages,
+    EditMessageText,
+    ExportChatInviteLink,
+    SendChatAction,
+    SendMediaGroup,
+    SendMessage,
+    TelegramMethod,
+)
+from aiogram.types import CallbackQuery, Chat, InaccessibleMessage, InputMediaPhoto, Message, MessageId, Update, User
 
 from teleforge.app import App
-from teleforge.cards import Button, Card, action, card, show
+from teleforge.cards import Button, Card, action, card, prepare_card, show
 from teleforge.context import CallbackContext, MessageContext
-from teleforge.declarations import callback, command
+from teleforge.declarations import Declaration, attach_declaration, callback, command
 from teleforge.delivery import DeliveryError
 from teleforge.feature import Feature
 from teleforge.formatting import ResponseError
@@ -525,3 +534,184 @@ async def test_early_callback_fails_explicitly_for_unbridged_host_isolation() ->
         await dispatcher.feed_update(bot, clicked(payload))
     await dispatcher.fsm.close()
     assert len(bot.requests) == 1
+
+
+@pytest.mark.parametrize("completion", ["success", "rejected", "cancelled"])
+async def test_returned_native_edit_holds_card_lock_until_write_finishes(completion: str) -> None:
+    class Panel(Feature):
+        calls = 0
+
+        @card
+        def panel(self) -> Card:
+            return Card("panel", buttons=[[Button("Go", self.go)]])
+
+        @action(key="go", card="panel", refresh=False)
+        async def go(self) -> EditMessageText:
+            self.calls += 1
+            return EditMessageText(chat_id=1, message_id=100, text=str(self.calls))
+
+    feature, bot = Panel(), RecordingBot()
+    rendered = await prepare_card(feature.panel)
+    payload = rendered["reply_markup"].inline_keyboard[0][0].callback_data
+    first_started, release, second_arrived = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    completions = []
+
+    async def responder(selected: Any, method: Any) -> object:
+        if isinstance(method, EditMessageText):
+            if method.text == "1":
+                first_started.set()
+                await release.wait()
+                if completion == "rejected":
+                    raise TelegramBadRequest(method=method, message="rejected")
+            completions.append(method.text)
+        return bot.recording._default(selected, method)
+
+    bot.recording.responder = responder
+    async with App(feature) as app:
+        dispatcher = app.create_dispatcher()
+
+        async def arrived(handler: Any, event: Any, data: Any) -> object:
+            if event.id == "second":
+                second_arrived.set()
+            return await handler(event, data)
+
+        dispatcher.callback_query.middleware(arrived)
+        first = asyncio.create_task(app.feed_update(bot, clicked(payload)))
+        await asyncio.wait_for(first_started.wait(), 1)
+        second_update = clicked(payload)
+        second_update = second_update.model_copy(
+            update={
+                "callback_query": second_update.callback_query.model_copy(
+                    update={"id": "second", "from_user": User(id=8, is_bot=False, first_name="other")}
+                )
+            }
+        )
+        second = asyncio.create_task(app.feed_update(bot, second_update))
+        await asyncio.wait_for(second_arrived.wait(), 1)
+        try:
+            assert feature.calls == 1 and not second.done()
+        finally:
+            if completion == "cancelled":
+                first.cancel()
+            release.set()
+        if completion == "success":
+            await first
+        else:
+            error_type = asyncio.CancelledError if completion == "cancelled" else TelegramBadRequest
+            with pytest.raises(error_type) as caught:
+                await first
+            outcome = caught.value.teleforge_outcome
+            assert outcome.handler_returned and not outcome.acknowledgement.attempted
+            assert outcome.presentations[0].uncertain is (completion == "cancelled")
+        await second
+        assert app._card_locks._locks == {}
+    assert feature.calls == 2
+    assert completions == (["1", "2"] if completion == "success" else ["2"])
+
+
+@pytest.mark.parametrize("case", ["single", "album", "bool-edit", "ids", "ids-username", "empty", "chat-action"])
+async def test_native_result_tracks_confirmed_messages_and_known_references(case: str) -> None:
+    message = incoming("source").message
+    assert message is not None
+    references = ()
+    if case == "single":
+        method = SendMessage(chat_id=1, text="sent")
+        result = message
+        expected = 1
+        references = ((1, 10),)
+    elif case == "album":
+        method = SendMediaGroup(chat_id=1, media=[InputMediaPhoto(media="one"), InputMediaPhoto(media="two")])
+        result = [message, message.model_copy(update={"message_id": 11})]
+        expected = 2
+        references = ((1, 10), (1, 11))
+    elif case == "bool-edit":
+        method, result, expected = EditMessageText(inline_message_id="inline", text="changed"), True, 1
+    elif case == "chat-action":
+        method, result, expected = SendChatAction(chat_id=1, action="typing"), True, 0
+    else:
+        method = CopyMessages(chat_id="@channel" if case == "ids-username" else 1, from_chat_id=2, message_ids=[10, 11])
+        result = [] if case == "empty" else [MessageId(message_id=20), MessageId(message_id=21)]
+        expected = len(result)
+        if case == "ids":
+            references = ((1, 20), (1, 21))
+
+    class Native(Feature):
+        @command("native")
+        async def native(self) -> TelegramMethod[Any]:
+            return method
+
+    observations = []
+    bot = RecordingBot()
+    bot.recording.responses.append(result)
+    async with App(Native()) as app:
+        dispatcher = app.create_dispatcher()
+
+        async def observe(handler: Any, event: Any, data: Any) -> object:
+            value = await handler(event, data)
+            invocation = data["teleforge_invocation"]
+            observations.append((invocation.outcome, invocation.context.delivery_progress))
+            return value
+
+        dispatcher.message.middleware(observe)
+        assert await app.feed_update(bot, incoming("/native")) == result
+    outcome, progress = observations[0]
+    assert outcome.handler_returned and len(outcome.presentations) == 1
+    assert outcome.presentations[0].confirmed == expected
+    assert progress.confirmed == references
+    assert len(bot.requests) == 1
+
+
+@pytest.mark.parametrize("failure", ["timeout", "rejected", "cancelled"])
+async def test_native_album_failure_does_not_invent_confirmed_messages(failure: str) -> None:
+    method = SendMediaGroup(chat_id=1, media=[InputMediaPhoto(media="one"), InputMediaPhoto(media="two")])
+
+    class Native(Feature):
+        @command("native")
+        async def native(self) -> SendMediaGroup:
+            return method
+
+    error = (
+        TimeoutError()
+        if failure == "timeout"
+        else asyncio.CancelledError()
+        if failure == "cancelled"
+        else TelegramBadRequest(method=method, message="rejected")
+    )
+    bot = RecordingBot()
+    bot.recording.responses.append(error)
+    async with App(Native()) as app:
+        with pytest.raises(type(error)) as caught:
+            await app.feed_update(bot, incoming("/native"))
+    presentation = caught.value.teleforge_outcome.presentations[0]
+    assert presentation.confirmed == 0 and presentation.attempted
+    assert presentation.uncertain is (failure != "rejected")
+    assert len(bot.requests) == 1
+
+
+async def test_native_returned_string_is_not_delivered_a_second_time() -> None:
+    class Native(Feature):
+        @command("native")
+        async def native(self) -> ExportChatInviteLink:
+            return ExportChatInviteLink(chat_id=1)
+
+    bot = RecordingBot()
+    bot.recording.responses.append("https://example.test/invite")
+    async with App(Native()) as app:
+        assert await app.feed_update(bot, incoming("/native")) == "https://example.test/invite"
+    assert len(bot.requests) == 1
+
+
+async def test_hook_replacement_output_is_delivered_once() -> None:
+    async def hook(feature: Any, ctx: Any, data: Any, call: Any) -> object:
+        await call()
+        return "hook output"
+
+    class Hooked(Feature):
+        async def run(self) -> str:
+            return "handler output"
+
+    attach_declaration(Hooked.run, Declaration(kind="command", event="message", names=("run",), hook=hook))
+    bot = RecordingBot()
+    async with App(Hooked()) as app:
+        await app.feed_update(bot, incoming("/run"))
+    assert [item.text for item in bot.requests] == ["handler output", "hook output"]

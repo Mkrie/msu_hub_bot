@@ -19,6 +19,7 @@ _MESSAGES: dict[str, tuple[str, str | None]] = {
     "argument-invalid": ("Invalid value for '{parameter}'.", "parameter"),
     "argument-missing": ("Provide a valid value for '{parameter}'.", "parameter"),
     "text-missing": ("Provide text for '{parameter}'.", "parameter"),
+    "text-invalid": ("The text for '{parameter}' is not valid. Please check it.", "parameter"),
     "media-missing": ("Attach or reply to media for '{parameter}'.", "parameter"),
     "media-type": ("The attachment has the wrong media type for '{parameter}'.", "parameter"),
     "callback-invalid": ("This button is no longer valid. Please open the feature again.", None),

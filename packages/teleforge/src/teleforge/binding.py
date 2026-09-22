@@ -76,11 +76,14 @@ async def _invoke(compiled: CompiledHandler, event: TelegramObject, ctx: Context
     tail = data.get("_teleforge_tail", (command.args or "") if isinstance(command, CommandObject) else None)
     if tail is not None and not isinstance(tail, str):
         raise TypeError("A custom command filter must provide a string _teleforge_tail")
+    if "_teleforge_text" in data and not isinstance(data["_teleforge_text"], str):
+        raise TypeError("A custom command filter must provide a string _teleforge_text")
     called = False
+    handled_result: object = object()
     async with AsyncExitStack() as resources:
 
         async def call() -> object:
-            nonlocal called
+            nonlocal called, handled_result
             if called:
                 raise RuntimeError("An invocation hook cannot execute the handler more than once")
             called = True
@@ -104,7 +107,10 @@ async def _invoke(compiled: CompiledHandler, event: TelegramObject, ctx: Context
                 raise _AcquisitionRejected(issue) from None
             result = await compiled.handler(**kwargs)
             ctx._handler_returned = True
-            return result
+            # Hook-owned scopes (notably a card's UI lock) include presentation
+            # of the handler's native return value as well as the action itself.
+            handled_result = await _deliver(ctx, result, compiled)
+            return handled_result
 
         if compiled.declaration.flags.get("fsm_release") is True and "_teleforge_isolation" in data:
             await ctx.release_isolation()
@@ -115,7 +121,9 @@ async def _invoke(compiled: CompiledHandler, event: TelegramObject, ctx: Context
             await ctx.guide(rejected.issue)
             delivered = None
         else:
-            delivered = await _deliver(ctx, result, compiled)
+            # Hooks may supply their own output. A pass-through result was
+            # already normalized, including native methods returning strings.
+            delivered = result if result is handled_result else await _deliver(ctx, result, compiled)
         await ctx.finish()
         return delivered
 

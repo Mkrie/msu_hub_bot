@@ -18,9 +18,10 @@ class HubCommand(MetaCommand):
             return result
         meta = result["meta"]
         assert isinstance(meta, MetaInfo)
-        # Hashtag arguments are encoded after underscores, separately from text.
-        prefix = " ".join(meta.arguments) if meta.hashtag else ""
-        return {**result, "_teleforge_tail": " ".join(part for part in (prefix, meta.text) if part)}
+        if meta.hashtag:
+            # Underscores carry arguments; surrounding text remains a separate input.
+            return {**result, "_teleforge_tail": " ".join(meta.arguments), "_teleforge_text": meta.text}
+        return {**result, "_teleforge_tail": meta.text}
 
 
 def command[Handler: Callable[..., Any]](*names: str, **options: Any) -> Callable[[Handler], Handler]:
@@ -40,6 +41,7 @@ def format_input_error(issue: InputError) -> str:
         "argument-invalid": "Не удалось разобрать аргумент. Проверь команду и попробуй ещё раз.",
         "argument-missing": "Добавь аргумент к команде — пример есть в /help.",
         "text-missing": "Добавь текст после команды или ответь ею на сообщение с текстом.",
+        "text-invalid": "Текст не подходит для команды. Проверь формат — пример есть в /help.",
         "media-missing": "Прикрепи подходящий файл или ответь командой на сообщение с ним.",
         "media-type": "Этот файл не подходит для команды. Попробуй другой формат.",
     }

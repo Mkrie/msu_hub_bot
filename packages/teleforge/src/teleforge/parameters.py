@@ -10,12 +10,18 @@ from typing import (
     Annotated,
     Any,
     Literal,
+    NotRequired,
+    ReadOnly,
+    Required,
     TypeAliasType,
+    TypeVar,
     Union,
     get_args,
     get_origin,
     get_protocol_members,
+    get_type_hints,
     is_protocol,
+    is_typeddict,
 )
 
 from aiogram import Bot
@@ -268,32 +274,89 @@ def compile_parameters(
             and not _accepts_type(annotation, declaration.payload)
         ):
             error("payload-type", "Parameter 'callback_data' must accept the declared CallbackData model")
+        if source in {"dependency", "draft"} and not dependency_annotation_supported(annotation):
+            error("dependency-type", f"Dependency '{name}' needs a supported native runtime annotation")
         parameters.append(Parameter(name, annotation, parameter.default, source, rule))
     return ParameterPlan(tuple(parameters), command=declaration.kind == "command"), tuple(issues)
 
 
+def dependency_annotation_supported(annotation: Any, seen: frozenset[int] = frozenset()) -> bool:
+    """Determine admissibility without inspecting values or constructing schemas."""
+    if id(annotation) in seen:
+        return True
+    seen = seen | {id(annotation)}
+    if isinstance(annotation, TypeAliasType):
+        return dependency_annotation_supported(annotation.__value__, seen)
+    if annotation is Any or annotation is inspect.Parameter.empty or annotation is None or annotation is type(None):
+        return True
+    if isinstance(annotation, TypeVar):
+        constraints = annotation.__constraints__ or (annotation.__bound__,)
+        return all(dependency_annotation_supported(kind, seen) for kind in constraints)
+    origin, args = get_origin(annotation), get_args(annotation)
+    if origin in (Annotated, Required, NotRequired, ReadOnly):
+        return dependency_annotation_supported(args[0], seen)
+    if origin in (Union, UnionType):
+        return all(dependency_annotation_supported(kind, seen) for kind in args)
+    if origin is Literal:
+        return True
+    target = origin or annotation
+    if is_protocol(target):
+        return True  # Method return types cannot be checked without invoking services.
+    if is_typeddict(target):
+        try:
+            fields = get_type_hints(target, include_extras=True)
+        except NameError, TypeError:
+            return False
+        return all(dependency_annotation_supported(kind, seen) for kind in (*fields.values(), *args))
+    if not isinstance(target, type):
+        return False
+    if origin in (list, set, frozenset, dict, Mapping, Sequence, tuple, type):
+        return all(kind is Ellipsis or dependency_annotation_supported(kind, seen) for kind in args)
+    return True
+
+
 def dependency_matches(annotation: Any, value: Any) -> bool:
     """Check compatibility without validators, coercion, copies or service construction."""
+    return _dependency_matches(annotation, value, {})
+
+
+def _dependency_matches(annotation: Any, value: Any, bindings: Mapping[TypeVar, Any]) -> bool:
+    def matches(kind: Any, item: Any) -> bool:
+        return _dependency_matches(kind, item, bindings)
+
     if isinstance(annotation, TypeAliasType):
-        return dependency_matches(annotation.__value__, value)
+        return matches(annotation.__value__, value)
     if annotation is Any or annotation is inspect.Parameter.empty:
         return True
-    origin = get_origin(annotation)
-    args = get_args(annotation)
-    if origin is Annotated:
-        return dependency_matches(args[0], value)
+    if isinstance(annotation, TypeVar):
+        if annotation in bindings:
+            return matches(bindings[annotation], value)
+        if annotation.__constraints__:
+            return any(matches(kind, value) for kind in annotation.__constraints__)
+        return annotation.__bound__ is None or matches(annotation.__bound__, value)
+    origin, args = get_origin(annotation), get_args(annotation)
+    if origin in (Annotated, Required, NotRequired, ReadOnly):
+        return matches(args[0], value)
     if origin in (Union, UnionType):
-        return any(dependency_matches(choice, value) for choice in args)
+        return any(matches(choice, value) for choice in args)
     if annotation is None or annotation is type(None):
         return value is None
     if origin is Literal:
         return any(type(value) is type(choice) and value == choice for choice in args)
-    if is_protocol(annotation):
+    target = origin or annotation
+    if is_protocol(target):
         return all(
             inspect.getattr_static(value, name, inspect.Parameter.empty) is not inspect.Parameter.empty
-            for name in get_protocol_members(annotation)
+            for name in get_protocol_members(target)
         )
-    target = origin or annotation
+    if is_typeddict(target):
+        if not isinstance(value, dict) or not target.__required_keys__.issubset(value):
+            return False
+        fields = get_type_hints(target, include_extras=True)
+        variables = getattr(target, "__type_params__", ()) or getattr(target, "__parameters__", ())
+        resolved = dict(bindings)
+        resolved.update(zip(variables, args))
+        return all(_dependency_matches(kind, value[name], resolved) for name, kind in fields.items() if name in value)
     if target in (int, float, bool, str, bytes):
         return type(value) is target
     if not isinstance(target, type):
@@ -301,23 +364,25 @@ def dependency_matches(annotation: Any, value: Any) -> bool:
     if not isinstance(value, target):
         return False
     if origin in (list, set, frozenset) and args and isinstance(value, list | set | frozenset):
-        return all(dependency_matches(args[0], item) for item in value)
+        return all(matches(args[0], item) for item in value)
     if origin in (dict, Mapping) and args and isinstance(value, Mapping):
-        return all(
-            dependency_matches(args[0], key) and dependency_matches(args[1], item) for key, item in value.items()
-        )
+        return all(matches(args[0], key) and matches(args[1], item) for key, item in value.items())
     if origin is Sequence and args and isinstance(value, Sequence):
-        return all(dependency_matches(args[0], item) for item in value)
+        return all(matches(args[0], item) for item in value)
     if origin is tuple and args and isinstance(value, tuple):
         if len(args) == 2 and args[1] is Ellipsis:
-            return all(dependency_matches(args[0], item) for item in value)
-        return len(value) == len(args) and all(
-            dependency_matches(kind, item) for kind, item in zip(args, value, strict=True)
-        )
+            return all(matches(args[0], item) for item in value)
+        return len(value) == len(args) and all(matches(kind, item) for kind, item in zip(args, value, strict=True))
+    if origin is type and args and isinstance(value, type):
+        return _accepts_type(args[0], value)
     return True
 
 
 def checked_dependency(annotation: Any, value: Any, name: str) -> Any:
-    if not dependency_matches(annotation, value):
+    try:
+        compatible = dependency_matches(annotation, value)
+    except TypeError, NameError:
+        raise ConfigurationError(f"Injected dependency '{name}' has an unsupported annotation") from None
+    if not compatible:
         raise ConfigurationError(f"Injected dependency '{name}' does not match its declared type")
     return value

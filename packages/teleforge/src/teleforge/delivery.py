@@ -168,6 +168,7 @@ class DeliveryProgress:
     total_parts: int = 0
     phase: Literal["preparing", "waiting", "sending", "complete", "failed", "cancelled"] = "preparing"
     uncertain: bool = False
+    confirmed_count: int | None = None
 
 
 class DeliveryError(Exception):
@@ -304,14 +305,20 @@ async def prepare_media(
 
 
 async def _prepare_rich(
-    rich: InputRichMessage, policy: ResponsePolicy, *, inline: bool, allow_remote_media: bool
+    rich: InputRichMessage,
+    policy: ResponsePolicy,
+    *,
+    inline: bool,
+    allow_remote_media: bool,
+    reserved_bytes: int = 0,
 ) -> InputRichMessage:
     """Bound and snapshot one complete native rich replacement; never merge blocks."""
     if sum(item is not None for item in (rich.blocks, rich.html, rich.markdown)) != 1:
         raise ResponseError("A rich replacement needs exactly one of blocks, html or markdown")
     if not (rich.blocks or rich.html or rich.markdown):
         raise ResponseError("A rich replacement cannot be empty")
-    nodes = byte_count = string_units = 0
+    nodes = string_units = 0
+    byte_count = reserved_bytes
 
     async def copy(value: object, depth: int = 0, field_name: str = "") -> object:
         nonlocal nodes, byte_count, string_units
@@ -357,6 +364,53 @@ async def _prepare_rich(
         return value
 
     return cast(InputRichMessage, await copy(rich))
+
+
+def _prepare_markup(markup: ReplyMarkupUnion | None, limit: int) -> tuple[ReplyMarkupUnion | None, int]:
+    """Bound and snapshot owned keyboard metadata before yielding to delivery."""
+    if markup is None:
+        return None, 0
+    nodes = byte_count = 0
+
+    def copy(value: object, depth: int = 0) -> object:
+        nonlocal nodes, byte_count
+        nodes += 1
+        if nodes > 10_000 or depth > 32:
+            raise ResponseLimitError("Reply markup exceeds its structural budget")
+        if isinstance(value, BaseModel):
+            fields = {
+                name: copy(item, depth + 1)
+                for name in type(value).model_fields
+                if (item := getattr(value, name)) is not None
+            }
+            for name, extra in (value.model_extra or {}).items():
+                copy(name, depth + 1)
+                fields[name] = copy(extra, depth + 1)
+            return value.model_copy(update=fields)
+        if isinstance(value, list | tuple):
+            return [copy(item, depth + 1) for item in value]
+        if isinstance(value, dict):
+            return {copy(key, depth + 1): copy(item, depth + 1) for key, item in value.items()}
+        if isinstance(value, str):
+            if len(value) > limit - byte_count:
+                raise ResponseLimitError("Reply markup exceeds its byte budget")
+            try:
+                byte_count += len(value.encode())
+            except UnicodeError:
+                raise ResponseError("Reply markup contains invalid Unicode") from None
+            if byte_count > limit:
+                raise ResponseLimitError("Reply markup exceeds its byte budget")
+        elif value is not None and not isinstance(value, bool | int | float):
+            raise ResponseError("Reply markup contains an unsupported native value")
+        return value
+
+    prepared = cast(ReplyMarkupUnion, copy(markup))
+    # Include field names, scalar metadata and containers, while leaving the
+    # enclosing Telegram request envelope outside the owned-content budget.
+    size = len(prepared.model_dump_json(exclude_none=True).encode())
+    if size > limit:
+        raise ResponseLimitError("Reply markup exceeds its byte budget")
+    return prepared, size
 
 
 def _text_method(value: FormattedText) -> SendMessage:
@@ -448,11 +502,12 @@ async def _plan(
     fixed: bool,
     options: dict[str, Any],
     allow_remote_media: bool,
+    reserved_bytes: int = 0,
 ) -> list[TelegramMethod[Message]]:
     selected = [(kind, source) for kind, source in sources if source is not None]
     if len(selected) > 1:
         raise ResponseError("Supply one media item per delivery")
-    value = format_text(text, entities, policy.max_output_bytes)
+    value = format_text(text, entities, policy.max_output_bytes - reserved_bytes)
     if not selected and not value.text.strip():
         raise ResponseError("The response contains no text or media")
     if fixed and not value.fits(1024 if selected else 4096):
@@ -464,9 +519,12 @@ async def _plan(
         kind, source = selected[0]
         assert source is not None
         media, media_bytes = await prepare_media(
-            source, kind, policy.max_output_bytes, allow_remote_media=allow_remote_media
+            source,
+            kind,
+            policy.max_output_bytes - reserved_bytes - value.size_bytes,
+            allow_remote_media=allow_remote_media,
         )
-    if value.size_bytes + media_bytes > policy.max_output_bytes:
+    if value.size_bytes + media_bytes + reserved_bytes > policy.max_output_bytes:
         raise ResponseLimitError("The complete response exceeds its byte budget")
 
     def native(caption: FormattedText | None = None) -> TelegramMethod[Message]:
@@ -489,12 +547,12 @@ async def _plan(
                     SendRichMessage(chat_id=1, rich_message=InputRichMessage(blocks=blocks, skip_entity_detection=True))
                 )
             return plan
-        return _file_plan(value, media_bytes, policy, [native()] if selected else [])
+        return _file_plan(value, media_bytes + reserved_bytes, policy, [native()] if selected else [])
     if selected and (not value.text or value.fits(1024)):
         return [native(value)]
     parts = _chunks(value, 4096, policy.soft_messages - int(bool(selected)))
     if parts is None:
-        return _file_plan(value, media_bytes, policy, [native()] if selected else [])
+        return _file_plan(value, media_bytes + reserved_bytes, policy, [native()] if selected else [])
     return ([native()] if selected else []) + [_text_method(part) for part in parts]
 
 
@@ -549,6 +607,7 @@ async def send_response(
     sent: list[Message] = []
     try:
         async with asyncio.timeout(policy.timeout):
+            reply_markup, markup_bytes = _prepare_markup(reply_markup, policy.max_output_bytes)
             plan = await _plan(
                 text,
                 entities,
@@ -563,6 +622,7 @@ async def send_response(
                 fixed=fixed,
                 options=options,
                 allow_remote_media=allow_remote_media,
+                reserved_bytes=markup_bytes,
             )
             state.total_parts, state.phase = len(plan), "waiting"
             async with _lane(bot, address):
@@ -632,6 +692,7 @@ async def edit_response(
     state = _new_progress(progress)
     try:
         async with asyncio.timeout(policy.timeout):
+            prepared_markup, markup_bytes = _prepare_markup(reply_markup, policy.max_output_bytes)
             if address.inline_message_id is None and address.message_id is None:
                 raise ResponseError("Editing requires an existing message address")
             sources: tuple[tuple[OutputKind, MediaSource | None], ...] = (
@@ -655,7 +716,7 @@ async def edit_response(
                 raise ResponseError(
                     "A complete rich replacement cannot be combined with text, entities or media arguments"
                 )
-            value = format_text(text, entities, policy.max_output_bytes)
+            value = format_text(text, entities, policy.max_output_bytes - markup_bytes)
             if target_kind == "rich" and rich_message is None:
                 raise ResponseError("Rich edits require an explicit complete native rich-message replacement")
             caption = target_kind in {"photo", "video", "audio", "document", "animation"}
@@ -666,7 +727,7 @@ async def edit_response(
                 "message_id": address.message_id,
                 "inline_message_id": address.inline_message_id,
                 "business_connection_id": address.business_connection_id,
-                "reply_markup": reply_markup,
+                "reply_markup": prepared_markup,
             }
             method: TelegramMethod[NativeResult]
             if rich_message is not None:
@@ -675,6 +736,7 @@ async def edit_response(
                     policy,
                     inline=address.inline_message_id is not None,
                     allow_remote_media=allow_remote_media,
+                    reserved_bytes=markup_bytes,
                 )
                 method = EditMessageText(rich_message=prepared_rich, parse_mode=None, **common)
             elif selected:
@@ -683,9 +745,12 @@ async def edit_response(
                     raise ResponseError("Changing the existing media kind requires a native Telegram operation")
                 assert source is not None
                 media, size = await prepare_media(
-                    source, media_kind, policy.max_output_bytes, allow_remote_media=allow_remote_media
+                    source,
+                    media_kind,
+                    policy.max_output_bytes - markup_bytes - value.size_bytes,
+                    allow_remote_media=allow_remote_media,
                 )
-                if size + value.size_bytes > policy.max_output_bytes:
+                if size + value.size_bytes + markup_bytes > policy.max_output_bytes:
                     raise ResponseLimitError("The complete response exceeds its byte budget")
                 if address.inline_message_id is not None and isinstance(media, InputFile):
                     raise ResponseError("Inline media edits cannot upload a new file")

@@ -17,6 +17,7 @@ from aiogram.types import (
     InputRichMessage,
     Message,
     MessageEntity,
+    MessageId,
     ReplyMarkupUnion,
     User,
 )
@@ -150,7 +151,9 @@ class Context:
                 Presentation(
                     kind,
                     progress.attempted_part is not None,
-                    len(progress.confirmed) or int(progress.phase == "complete"),
+                    progress.confirmed_count
+                    if progress.confirmed_count is not None
+                    else len(progress.confirmed) or int(progress.phase == "complete"),
                     progress.uncertain,
                     progress.phase,
                 )
@@ -306,6 +309,7 @@ class Context:
         if not method.__api_method__.startswith(("send", "editMessage", "copyMessage", "forwardMessage")):
             return await self.bot(method)
         progress = DeliveryProgress(attempted_part=0, total_parts=1, phase="sending", uncertain=True)
+        self.delivery_progress = progress
         self._presentations.append(("native", progress))
         try:
             result = await self.bot(method)
@@ -314,6 +318,24 @@ class Context:
             progress.uncertain = not isinstance(error, Exception) or not rejected(error)
             attach_outcome(error, self.outcome)
             raise
+        items = result if isinstance(result, list) else [result]
+        references = []
+        count = 0
+        for item in items:
+            if isinstance(item, Message):
+                references.append((item.chat.id, item.message_id))
+                count += 1
+            elif isinstance(item, MessageId):
+                chat_id = getattr(method, "chat_id", None)
+                if isinstance(chat_id, int):
+                    references.append((chat_id, item.message_id))
+                count += 1
+        # Inline edits and already-present edits confirm one UI without a
+        # returned Message. Other bool methods do not identify sent messages.
+        if result is True and method.__api_method__.startswith("editMessage"):
+            count = 1
+        progress.confirmed = tuple(references)
+        progress.confirmed_count = count
         progress.phase, progress.uncertain = "complete", False
         self.has_effects = True
         return result

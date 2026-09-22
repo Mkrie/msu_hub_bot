@@ -38,8 +38,8 @@ from aiogram.types import (
 from aiogram.utils.formatting import Bold, Text
 
 from teleforge.app import App
-from teleforge.context import CallbackContext, Context, context_for
-from teleforge.declarations import callback
+from teleforge.context import CallbackContext, Context, MessageContext, context_for
+from teleforge.declarations import callback, command
 from teleforge.delivery import (
     DeliveryError,
     DeliveryTarget,
@@ -149,6 +149,131 @@ async def test_output_bytes_are_checked_before_any_media_or_text_write() -> None
     with pytest.raises(ResponseLimitError):
         await send_response(bot, message(), "12345", photo=b"123456", policy=ResponsePolicy(max_output_bytes=10))
     assert bot.requests == []
+
+
+@pytest.mark.parametrize("operation", ["reply", "edit"])
+@pytest.mark.parametrize("oversize", ["label", "url", "metadata", "shape"])
+async def test_owned_markup_limits_fail_before_dispatch_sends(operation: str, oversize: str) -> None:
+    if oversize == "label":
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="x" * 1000, callback_data="ok")]])
+    elif oversize == "url":
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="open", url="https://example.test/" + "x" * 1000)]]
+        )
+    elif oversize == "metadata":
+        keyboard = markup().model_copy(update={"future_metadata": {"description": "x" * 1000}})
+    else:
+        button = InlineKeyboardButton(text="small", callback_data="ok")
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[button] for _ in range(4000)])
+
+    class Keyboard(Feature):
+        @command("run")
+        async def run(self, ctx: MessageContext) -> None:
+            await getattr(ctx, operation)(
+                "x",
+                policy=ResponsePolicy(max_output_bytes=1_000_000 if oversize == "shape" else 128),
+                reply_markup=keyboard,
+            )
+
+    bot = RecordingBot()
+    async with App(Keyboard()) as app:
+        with pytest.raises(ResponseLimitError) as caught:
+            await app.feed_update(bot, Update(update_id=1, message=message(text="/run")))
+    assert "structural" in str(caught.value) if oversize == "shape" else "byte budget" in str(caught.value)
+    assert bot.requests == []
+    assert not caught.value.teleforge_outcome.presentations[0].attempted
+
+
+@pytest.mark.parametrize("operation", ["reply", "edit"])
+async def test_markup_body_and_upload_share_one_output_budget(operation: str) -> None:
+    keyboard = markup()
+    owned = len(keyboard.model_dump_json(exclude_none=True).encode())
+    total = owned + len(b"caption") + len(b"photo")
+    source = message(text=None, photo=[PhotoSize(file_id="photo", file_unique_id="photo", width=10, height=10)])
+    bot = RecordingBot()
+    call = send_response if operation == "reply" else edit_response
+    with pytest.raises(ResponseLimitError):
+        await call(
+            bot,
+            source,
+            "caption",
+            photo=b"photo",
+            reply_markup=keyboard,
+            policy=ResponsePolicy(rich=False, max_output_bytes=total - 1),
+        )
+    assert bot.requests == []
+    await call(
+        bot,
+        source,
+        "caption",
+        photo=b"photo",
+        reply_markup=keyboard,
+        policy=ResponsePolicy(rich=False, max_output_bytes=total),
+    )
+    assert len(bot.requests) == 1 and bot.requests[0].reply_markup == keyboard
+
+
+async def test_markup_reserves_bytes_from_complete_rich_replacement() -> None:
+    keyboard = markup()
+    owned = len(keyboard.model_dump_json(exclude_none=True).encode())
+    rich = InputRichMessage(html="x" * 300)
+    target = DeliveryTarget(chat_id=1, message_id=10, kind="rich")
+    bot = RecordingBot()
+    with pytest.raises(ResponseLimitError):
+        await edit_response(
+            bot, target, rich_message=rich, reply_markup=keyboard, policy=ResponsePolicy(max_output_bytes=owned + 299)
+        )
+    assert bot.requests == []
+    bot.recording.responses.append(message())
+    await edit_response(
+        bot, target, rich_message=rich, reply_markup=keyboard, policy=ResponsePolicy(max_output_bytes=owned + 300)
+    )
+    assert len(bot.requests) == 1
+
+
+async def test_markup_is_snapshotted_before_media_preparation_yields(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from teleforge import delivery
+
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def snapshot(path: Path, limit: int) -> bytes:
+        entered.set()
+        await release.wait()
+        return b"file"
+
+    monkeypatch.setattr(delivery, "_path_snapshot", snapshot)
+    keyboard, bot = markup(), RecordingBot()
+    task = asyncio.create_task(
+        send_response(
+            bot,
+            message(),
+            document=tmp_path / "file",
+            reply_markup=keyboard,
+            policy=ResponsePolicy(max_output_bytes=1024),
+        )
+    )
+    await asyncio.wait_for(entered.wait(), 1)
+    keyboard.inline_keyboard[0].append(InlineKeyboardButton(text="x" * 10_000, callback_data="later"))
+    release.set()
+    await task
+    assert len(bot.requests[0].reply_markup.inline_keyboard[0]) == 1
+
+
+async def test_split_response_counts_markup_once_and_attaches_it_to_final_message() -> None:
+    keyboard, bot = markup(), RecordingBot()
+    owned = len(keyboard.model_dump_json(exclude_none=True).encode())
+    await send_response(
+        bot,
+        message(),
+        "x" * 5000,
+        reply_markup=keyboard,
+        policy=ResponsePolicy(rich=False, max_output_bytes=owned + 5000),
+    )
+    assert len(bot.requests) == 2
+    assert bot.requests[0].reply_markup is None
+    assert bot.requests[1].reply_markup == keyboard
 
 
 @pytest.mark.asyncio

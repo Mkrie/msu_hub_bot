@@ -74,12 +74,16 @@ class Argument:
 
 @dataclass(frozen=True, slots=True)
 class TextInput:
+    """Acquire text, optionally preferring a document within each selected source."""
+
     reply: bool = True
-    document: bool = False
+    document: bool | Literal["prefer"] = False
     max_chars: int | None = None
     max_bytes: int = MAX_DOWNLOAD_BYTES
 
     def __post_init__(self) -> None:
+        if type(self.document) is not bool and self.document != "prefer":
+            raise ValueError("Text document policy must be False, True or 'prefer'")
         if self.max_bytes <= 0 or self.max_chars is not None and self.max_chars <= 0:
             raise ValueError("Text input limits must be positive")
 
@@ -156,7 +160,10 @@ def ordinary(annotation: Any) -> bool:
     if annotation in (str, int, float, bool):
         return True
     if get_origin(annotation) is Literal:
-        return True
+        choices = get_args(annotation)
+        return any(choice is not None for choice in choices) and all(
+            choice is None or type(choice) in (str, int, float, bool) or isinstance(choice, Enum) for choice in choices
+        )
     if get_origin(annotation) in (Union, UnionType):
         return all(choice is type(None) or ordinary(choice) for choice in get_args(annotation))
     return isinstance(annotation, type) and issubclass(annotation, Enum)
@@ -180,6 +187,66 @@ def _adapter(annotation: Any) -> TypeAdapter[Any]:
 
 def _validate(annotation: Any, value: Any, *, strict: bool = False) -> Any:
     return _adapter(annotation).validate_python(value, strict=strict)
+
+
+class _ScalarTokenError(ValueError):
+    """The token has no type-exact member in a declared Literal."""
+
+
+def _literal_choices(annotation: Any) -> tuple[Any, ...] | None:
+    requested = representation(annotation)
+    if get_origin(requested) is Literal:
+        return get_args(requested)
+    if get_origin(requested) in (Union, UnionType):
+        members = [_literal_choices(choice) for choice in get_args(requested) if choice is not type(None)]
+        if all(member is not None for member in members):
+            return tuple(value for member in members if member is not None for value in member)
+    return None
+
+
+def _validated_literal(annotation: Any, value: Any) -> Any:
+    validated = _validate(annotation, value)
+    # Pydantic Literal matches by equality and can return True for a supplied 1.
+    # The candidate was already matched by type; keep that distinction.
+    return value if type(value) is not type(validated) and value == validated else validated
+
+
+def _argument_value(annotation: Any, raw: str) -> Any:
+    """String literal matches win, followed by int, float, bool and enum members.
+
+    Membership compares both value and type, so bool/int equality cannot select
+    a different literal. Annotation validators still run on the selected value.
+    """
+    choices = _literal_choices(annotation)
+    if choices is None:
+        return _validate(annotation, raw)
+    if any(type(choice) is str and choice == raw for choice in choices):
+        return _validated_literal(annotation, raw)
+    kinds = dict.fromkeys((int, float, bool, *(type(choice) for choice in choices if isinstance(choice, Enum))))
+    for kind in kinds:
+        if not any(type(choice) is kind for choice in choices):
+            continue
+        try:
+            value = _validate(kind, raw)
+        except ValidationError:
+            continue
+        if any(type(value) is type(choice) and value == choice for choice in choices):
+            return _validated_literal(annotation, value)
+    raise _ScalarTokenError
+
+
+def _default_value(annotation: Any, default: Any, name: str) -> Any:
+    choices = _literal_choices(annotation)
+    if (
+        choices is not None
+        and default is not None
+        and not any(type(default) is type(choice) and default == choice for choice in choices)
+    ):
+        raise ConfigurationError(f"Input '{name}' has an invalid default")
+    try:
+        return _validated_literal(annotation, default) if choices is not None else _validate(annotation, default)
+    except ValidationError:
+        raise ConfigurationError(f"Input '{name}' has an invalid default") from None
 
 
 def _targets(event: TelegramObject, reply: bool, selected: Message | None = None) -> tuple[Message, ...]:
@@ -244,26 +311,33 @@ async def _text(
     selected: Message | None,
 ) -> tuple[Message | None, str]:
     targets = _targets(event, declaration.reply, selected)
-    if tail and isinstance(event, Message):
+    if tail and isinstance(event, Message) and declaration.document != "prefer":
         return event, _check_text(tail, declaration)
+
+    async def document_text(target: Message) -> str | None:
+        candidates = [target.document, *rich_media(target)]
+        for item in candidates:
+            if isinstance(item, Document) and (item.mime_type or "").startswith("text/"):
+                stream = await _download(item, ctx, declaration.max_bytes, resources, downloads)
+                try:
+                    text = stream.getvalue().decode("utf-8")
+                except UnicodeDecodeError:
+                    raise InputError("text-encoding") from None
+                return _check_text(text, declaration)
+        return None
+
     for index, target in enumerate(targets):
+        if declaration.document == "prefer" and (text := await document_text(target)) is not None:
+            return target, text
         # For a selected command, None means a non-command event; an empty tail
         # must not fall back to the literal command token itself.
         text = target.text or target.caption or rich_text(target)
         if index == 0 and target is event and tail is not None:
-            text = ""
+            text = tail
         if text:
             return target, _check_text(text, declaration)
-        if declaration.document:
-            candidates = [target.document, *rich_media(target)]
-            for item in candidates:
-                if isinstance(item, Document) and (item.mime_type or "").startswith("text/"):
-                    stream = await _download(item, ctx, declaration.max_bytes, resources, downloads)
-                    try:
-                        text = stream.getvalue().decode("utf-8")
-                    except UnicodeDecodeError:
-                        raise InputError("text-encoding") from None
-                    return target, _check_text(text, declaration)
+        if declaration.document is True and (text := await document_text(target)) is not None:
+            return target, text
     return None, ""
 
 
@@ -495,25 +569,27 @@ async def prepare_arguments(
                 raw = tokens[position].group() if position < len(tokens) else _MISSING
                 position += 1
                 parsed: Any = _MISSING
-                if raw is not _MISSING:
+                if isinstance(raw, str):
                     try:
-                        parsed = _validate(annotation, raw)
-                    except ValidationError:
+                        parsed = _argument_value(annotation, raw)
+                    except ValidationError, _ScalarTokenError:
                         if rule.strict:
                             raise InputError("argument-invalid", parameter=name) from None
                 if parsed is _MISSING:
                     contiguous = False
                     if default is inspect.Parameter.empty:
                         raise InputError("argument-missing", parameter=name)
-                    try:
-                        parsed = _validate(annotation, default)
-                    except ValidationError:
-                        raise ConfigurationError(f"Argument '{name}' has an invalid default") from None
+                    parsed = _default_value(annotation, default, name)
                 elif contiguous:
                     consumed = tokens[position - 1].end()
-                if rule.clamp is not None and isinstance(parsed, (int, float)):
+                if rule.clamp is not None:
+                    if type(parsed) not in (int, float):
+                        raise ConfigurationError(f"Argument '{name}' requires numeric values for its clamp")
                     parsed = max(rule.clamp[0], min(rule.clamp[1], parsed))
-                    parsed = _validate(annotation, parsed)
+                    try:
+                        parsed = _validate(annotation, parsed)
+                    except ValidationError:
+                        raise ConfigurationError(f"Argument '{name}' has an incompatible clamp") from None
                 values[name] = parsed
             else:
                 if name in data:
@@ -527,6 +603,9 @@ async def prepare_arguments(
         remaining = (
             (command_tail[consumed:].lstrip() if consumed else command_tail) if command_tail is not None else None
         )
+        if plan.command and "_teleforge_text" in data:
+            # Custom grammars can keep argument tokens separate from body text.
+            remaining = data["_teleforge_text"]
         for name, annotation, default, declaration_text in text_parameters:
             source_message, value = await _text(
                 event, ctx, declaration_text, remaining, resources, downloads, ctx.input_sources.get(name)
@@ -534,8 +613,12 @@ async def prepare_arguments(
             if not value:
                 if default is inspect.Parameter.empty:
                     raise InputError("text-missing", parameter=name)
-                value = default
-            values[name] = _validate(annotation, value)
+                values[name] = _default_value(annotation, default, name)
+            else:
+                try:
+                    values[name] = _validate(annotation, value)
+                except ValidationError:
+                    raise InputError("text-invalid", parameter=name) from None
             if source_message is not None:
                 ctx.input_sources[name] = source_message
                 source_text = source_message
@@ -544,7 +627,7 @@ async def prepare_arguments(
             if media is None:
                 if default is inspect.Parameter.empty:
                     raise InputError("media-missing", parameter=name)
-                value_media = _validate(annotation, default)
+                value_media = _default_value(annotation, default, name)
             else:
                 try:
                     value_media = await _media_value(media, annotation, declaration_media, ctx, resources, downloads)
