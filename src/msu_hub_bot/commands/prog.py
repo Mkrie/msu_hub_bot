@@ -12,6 +12,7 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.filters.callback_data import CallbackData
 from aiogram.utils.markdown import hpre, hbold, hcode, hitalic
+from aiogram.utils.formatting import Bold, Code, Pre, Text
 from pydantic import BaseModel
 
 from msu_hub_bot.telegram.callbacks import CallbackCommandBase
@@ -117,6 +118,22 @@ class StdinDraft(BaseModel):
     prog_code: str
 
 
+async def stdin_source(message: Message, bot: Bot) -> tuple[str, str] | None:
+    """Resolve a compact preview's inline program or original source document."""
+    codes = [entity.extract_from(message.text or "") for entity in message.entities or () if entity.type == MessageEntityType.PRE]
+    code: str | None
+    if codes:
+        code = codes[0]
+    elif message.reply_to_message and message.reply_to_message.document:
+        code = await download_text(message.reply_to_message.document.file_id, bot)
+    else:
+        code = None
+    languages = [entity.extract_from(message.text or "") for entity in message.entities or () if entity.type == MessageEntityType.BOLD]
+    if code is None or not languages or languages[0] not in LANGUAGES:
+        return None
+    return languages[0], code
+
+
 class ProgCompiler(CallbackCommandBase):
     callback_data = ProgCallback
     replies: cachetools.LRUCache[tuple[int, int], int] = cachetools.LRUCache(maxsize=128)
@@ -175,24 +192,27 @@ class ProgCompiler(CallbackCommandBase):
     @classmethod
     async def process_stdin(cls, message: Message, meta: MetaInfo, bot: Bot, lang: str) -> Message | bool:
         target, text, doc = meta.extract_text_with_doc()
+        content: Text
         if text:
-            text = hpre(text)
+            content = Pre(text)
         else:
             if not doc:
                 return True
-            text = hcode(doc.file_name or "code.txt")
+            content = Code(doc.file_name or "code.txt")
 
-        text = f"{hbold(lang)} | {hbold(LANGUAGES[lang][1][-1][0])} | with stdin\n\n{text}"
+        preview = Text(Bold(lang), " | ", Bold(LANGUAGES[lang][1][-1][0]), " | with stdin\n\n", content)
 
         result = None
         if message_id := cls.replies.get(cls.cache_key(target)):
             with suppress(TelegramBadRequest):
-                edited = await bot.edit_message_text(text, chat_id=message.chat.id, message_id=message_id, reply_markup=cls.keyboard())
+                edited = await bot.edit_message_text(
+                    **preview.as_kwargs(), chat_id=message.chat.id, message_id=message_id, reply_markup=cls.keyboard()
+                )
                 if isinstance(edited, Message):
                     result = edited
 
         if result is None:
-            result = await target.reply(text, reply_markup=cls.keyboard())
+            result = await target.reply(**preview.as_kwargs(), reply_markup=cls.keyboard())
             cls.replies[cls.cache_key(target)] = result.message_id
 
         return result
@@ -219,19 +239,10 @@ class ProgCompiler(CallbackCommandBase):
 
         await query.answer("⬇️ Теперь ожидаю ввод", cache_time=3)
 
-        codes = [e.extract_from(m.text or "") for e in m.entities or [] if e.type == MessageEntityType.PRE]
-        code: str | None
-        if codes:
-            code = codes[0]
-        else:
-            if m.reply_to_message and m.reply_to_message.document:
-                code = await download_text(m.reply_to_message.document.file_id, bot)
-            else:
-                code = None
-        languages = [e.extract_from(m.text or "") for e in m.entities or [] if e.type == MessageEntityType.BOLD]
-        if code is None or not languages or languages[0] not in LANGUAGES:
+        source = await stdin_source(m, bot)
+        if source is None:
             return await m.edit_text(m.html_text + "\n\n⚠️ Сообщение с исходным кодом удалено")
-        lang = languages[0]
+        lang, code = source
 
         reply = await m.reply(f"{query.from_user.mention_html()}, ожидаю ввод ⬇️, или /cancel")
         data = StdinDraft(chat_id=reply.chat.id, inform_message_id=reply.message_id, prog_lang=lang, prog_code=code)

@@ -7,12 +7,15 @@ from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 from aiogram.utils.formatting import Bold, Pre, Text
-from teleforge import CallbackContext, Feature, MessageContext, TextInput, callback, command, enter, leave, step
+from teleforge import CallbackContext, Feature, MessageContext, callback, command, edited_message, enter, leave, step
 
-from msu_hub_bot.commands.prog import ProgCallback, ProgCompiler, StdinDraft, code_submit
-from msu_hub_bot.features.command import command as hub_command
+from msu_hub_bot.commands.prog import ProgCallback, ProgCompiler, StdinDraft, code_submit, stdin_source
+from msu_hub_bot.features.command import HubCommand, command as hub_command
 from msu_hub_bot.providers.jdoodle import LANGUAGES, ManyJDoodle
-from msu_hub_bot.telegram.filters import SlashCommand
+from msu_hub_bot.telegram.filters import MetaInfo, SlashCommand
+
+_ALIASES = ("py_stdin", "python_stdin", "pys", "pythons")
+_FLAGS = {"handler_key": "compile.stdin_prompt.python3", "fsm_release": False}
 
 
 class Compiler(Feature, key="compiler"):
@@ -24,20 +27,10 @@ class Compiler(Feature, key="compiler"):
         await leave(ctx)
         return "🆗 Ввод отменён"
 
-    @hub_command(
-        "py_stdin",
-        "python_stdin",
-        "pys",
-        "pythons",
-        code=TextInput(document="prefer"),
-        flags={"handler_key": "compile.stdin_prompt.python3", "fsm_release": False},
-    )
-    async def prompt(self, ctx: MessageContext, code: str) -> None:
-        await ctx.reply(
-            Text(Bold("python3"), " | ", Bold(LANGUAGES["python3"][1][-1][0]), " | with stdin\n\n", Pre(code)),
-            reply_markup=ProgCompiler.keyboard(),
-            fixed=True,
-        )
+    @hub_command(*_ALIASES, flags=_FLAGS)
+    @edited_message(HubCommand(*_ALIASES), StateFilter(None), flags=_FLAGS)
+    async def prompt(self, ctx: MessageContext, *, meta: MetaInfo) -> Message | bool:
+        return await ProgCompiler.process_stdin(ctx.message, meta, ctx.bot, "python3")
 
     @callback(ProgCallback, flags={"handler_key": "compile.stdin.input", "fsm_release": False})
     async def choose(self, ctx: CallbackContext, action: str, *, state: FSMContext) -> None:
@@ -59,13 +52,11 @@ class Compiler(Feature, key="compiler"):
         if current is not None:
             await ctx.answer("🔄 Бот уже ждёт твой ввод. /cancel — отменить.", show_alert=True)
             return
-        # This feature explicitly owns its code preview; arbitrary callback UI is
-        # never used as an input by TeleForge itself.
-        codes = [entity.extract_from(ui.text or "") for entity in ui.entities or () if entity.type == "pre"]
-        languages = [entity.extract_from(ui.text or "") for entity in ui.entities or () if entity.type == "bold"]
-        if len(codes) != 1 or not languages or languages[0] not in LANGUAGES:
+        source = await stdin_source(ui, ctx.bot)
+        if source is None:
             await ctx.answer("Сообщение с исходным кодом недоступно. Пришли код ещё раз.", show_alert=True)
             return
+        language, code = source
         await ctx.answer("⬇️ Теперь ожидаю ввод")
         prompt = await ctx.reply("Ожидаю ввод ⬇️, или /cancel", fixed=True)
         assert isinstance(prompt, Message)
@@ -75,8 +66,8 @@ class Compiler(Feature, key="compiler"):
             StdinDraft(
                 chat_id=prompt.chat.id,
                 inform_message_id=prompt.message_id,
-                prog_lang=languages[0],
-                prog_code=codes[0],
+                prog_lang=language,
+                prog_code=code,
             ),
         )
 
