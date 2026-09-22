@@ -34,7 +34,7 @@ def _state(ctx: Context) -> FSMContext:
     if not isinstance(message, Message) or user is None:
         raise ConversationError("A conversation requires a chat message and a human actor")
     if message.direct_messages_topic is not None:
-        # aiogram USER_IN_TOPIC currently keys forum message_thread_id only.
+        # aiogram USER_IN_TOPIC keys forum message_thread_id only.
         # A direct-message topic cannot safely fall back to the general chat.
         raise ConversationError("Direct-message topics require an explicit application conversation adapter")
     key = state.key

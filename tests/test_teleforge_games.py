@@ -1,4 +1,4 @@
-"""Real quiz state, leases and settlement through the candidate Telegram boundary."""
+"""Real quiz state, leases and settlement through native feature dispatch."""
 
 import asyncio
 from datetime import timedelta

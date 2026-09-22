@@ -4,7 +4,7 @@ import asyncio
 import math
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
-from typing import Any, Self, cast
+from typing import Any, Literal, Self, cast
 
 from aiogram import Bot, Dispatcher, Router
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
@@ -45,7 +45,23 @@ class DrainTimeout(RuntimeError):
 class _Dispatcher(Dispatcher):
     def __init__(self, app: App, **kwargs: Any) -> None:
         self._app = app
+        self._polling_phase: Literal["startup", "polling", "cleanup"] = "startup"
+        self._polling_stop_requested = False
         super().__init__(**kwargs)
+
+    def _reset_polling(self) -> None:
+        self._polling_phase = "startup"
+        self._polling_stop_requested = False
+
+    async def emit_startup(self, *args: Any, **kwargs: Any) -> None:
+        await super().emit_startup(*args, **kwargs)
+        if self._polling_stop_requested:
+            # A startup callback may have suppressed its cancellation. It must
+            # not start a fresh poller after the owner requested shutdown.
+            raise asyncio.CancelledError
+        # Native start_polling creates its tasks immediately after this returns,
+        # with no intervening await. Before this point cancellation is safe.
+        self._polling_phase = "polling"
 
     async def feed_update(self, bot: Bot, update: Update, **kwargs: Any) -> Any:
         # Enclose the native dispatcher, including its outer error middleware.
@@ -141,6 +157,7 @@ class App:
         self._updates_done = asyncio.Event()
         self._updates_done.set()
         self._drain_timeout, self._cancel_timeout = drain_timeout, cancel_timeout
+        self._polling_owned = False
 
     @asynccontextmanager
     async def _admit_update(self) -> AsyncIterator[None]:
@@ -287,11 +304,17 @@ class App:
         # before storage closes; this app owns that single shutdown boundary.
         dispatcher.shutdown.handlers.clear()
         dispatcher.startup.register(self.start)
-        dispatcher.shutdown.register(self.aclose)
+        dispatcher.shutdown.register(self._dispatcher_shutdown)
         dispatcher.include_router(self.build_router())
         self._dispatcher = dispatcher
         self._fsm_closed = False
         return dispatcher
+
+    async def _dispatcher_shutdown(self) -> None:
+        # run_polling closes resources after joining the complete native runner,
+        # preserving its primary error if application cleanup also fails.
+        if not self._polling_owned:
+            await self.aclose()
 
     async def start(self) -> None:
         async with self._lifecycle_lock:
@@ -311,8 +334,16 @@ class App:
                     await stack.enter_async_context(factory())
                 for feature in self.features:
                     await stack.enter_async_context(feature.lifespan(self))
-            except BaseException:
-                await stack.aclose()
+            except BaseException as primary:
+                if self._polling_owned and isinstance(self._dispatcher, _Dispatcher):
+                    # Failed startup already owns an unwind. Owner cancellation
+                    # must join it rather than interrupting earlier resources.
+                    self._dispatcher._polling_phase = "cleanup"
+                try:
+                    await stack.aclose()
+                except BaseException as cleanup:
+                    primary.add_note(f"Startup cleanup also failed ({type(cleanup).__name__}).")
+                    raise primary from cleanup
                 raise
             self._stack = stack
 
@@ -358,10 +389,89 @@ class App:
         selected = bot if bot is not None else self.bot
         if selected is None:
             raise TypeError("Supply a Bot to App or run_polling")
+        if self._polling_owned:
+            raise RuntimeError("This application already owns a polling runner")
         dispatcher = self._dispatcher or self.create_dispatcher()
+        assert isinstance(dispatcher, _Dispatcher)
+        dispatcher._reset_polling()
+        self._polling_owned = True
+        runner = asyncio.create_task(
+            self._polling_lifetime(dispatcher, selected, close_bot_session, options), name="teleforge.polling"
+        )
+        stopper: asyncio.Task[None] | None = None
+        primary: BaseException | None = None
+
+        async def stop() -> None:
+            if dispatcher._polling_phase == "polling":
+                await dispatcher.stop_polling()
+
+        while not runner.done():
+            try:
+                # Native runner and resource teardown share one task/context.
+                # Join without forwarding owner cancellation; retrieve the
+                # outcome once below, including after repeated cancellation.
+                await asyncio.wait((runner,))
+            except asyncio.CancelledError as error:
+                if primary is None:
+                    primary = error
+                if not runner.done() and not dispatcher._polling_stop_requested:
+                    dispatcher._polling_stop_requested = True
+                    if dispatcher._polling_phase == "polling":
+                        stopper = asyncio.create_task(stop(), name="teleforge.polling.stop")
+                    elif dispatcher._polling_phase == "startup":
+                        runner.cancel()
+        failures: list[BaseException] = []
         try:
-            await dispatcher.start_polling(selected, close_bot_session=False, **options)
-        finally:
+            runner.result()
+        except BaseException as error:  # noqa: BLE001 - preserve the original native/lifecycle error
+            failures.append(error)
+        if stopper is not None:
+            # A failing native shutdown does not set aiogram's stopped event.
+            # Our runner is joined, so retire the exact stop waiter we own.
+            if not stopper.done():
+                stopper.cancel()
+            while not stopper.done():
+                try:
+                    await asyncio.wait((stopper,))
+                except asyncio.CancelledError as error:
+                    if primary is None:
+                        primary = error
+            try:
+                stopper.result()
+            except asyncio.CancelledError:
+                pass
+            except BaseException as error:  # noqa: BLE001 - retain a secondary stop failure
+                failures.append(error)
+        self._polling_owned = False
+        if primary is None and failures:
+            primary = failures[0]
+        if primary is not None:
+            secondary = next(
+                (error for error in failures if error is not primary and not isinstance(error, asyncio.CancelledError)),
+                None,
+            )
+            if secondary is not None:
+                primary.add_note(f"Polling cleanup also failed ({type(secondary).__name__}).")
+                raise primary from secondary
+            raise primary
+
+    async def _polling_lifetime(
+        self, dispatcher: _Dispatcher, bot: Bot, close_bot_session: bool, options: dict[str, Any]
+    ) -> None:
+        primary: BaseException | None = None
+        try:
+            await dispatcher.start_polling(bot, close_bot_session=False, **options)
+        except BaseException as error:  # noqa: BLE001 - cleanup must preserve native errors and startup cancellation
+            primary = error
+        dispatcher._polling_phase = "cleanup"
+        try:
             await self.aclose()
             if close_bot_session:
-                await selected.session.close()
+                await bot.session.close()
+        except BaseException as cleanup:
+            if primary is None:
+                raise
+            primary.add_note(f"Polling cleanup also failed ({type(cleanup).__name__}).")
+            raise primary from cleanup
+        if primary is not None:
+            raise primary

@@ -1,4 +1,4 @@
-"""Candidate features run under Hub's real state middleware and ownership rules."""
+"""Feature routers run under Hub's real state middleware and ownership rules."""
 
 import asyncio
 from contextlib import asynccontextmanager
