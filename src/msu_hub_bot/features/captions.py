@@ -7,12 +7,12 @@ from contextlib import closing
 from PIL import Image
 from aiogram.enums import ChatAction, ChatType
 from aiogram.types import Animation, BufferedInputFile, Document, Message, Sticker, Video, VideoNote
-from teleforge import Feature, command
+from teleforge import Feature
 from teleforge.context import MessageContext
 from teleforge.inputs import MediaInput, TextInput
 
 from msu_hub_bot.execution.executor import TPExecutor
-from msu_hub_bot.features.command import HubCommand
+from msu_hub_bot.features.command import command as hub_command
 from msu_hub_bot.media.caption_layout import CaptionLayoutError, CaptionStyle, caption_image
 from msu_hub_bot.media.caption_video import caption_video
 from msu_hub_bot.telegram.chat_actioner import ChatActioner
@@ -26,9 +26,8 @@ class Captions(Feature, key="captions"):
     def __init__(self, executor: TPExecutor) -> None:
         self.executor = executor
 
-    @command(
+    @hub_command(
         "meme",
-        filter=HubCommand("meme"),
         text=TextInput(),
         media=MediaInput(kinds=("video", "image"), avatar=True),
         flags={"handler_key": "process_meme", "fsm_release": True},
@@ -36,12 +35,11 @@ class Captions(Feature, key="captions"):
     async def meme(self, ctx: MessageContext, text: str, media: DownloadableMedia) -> None:
         await self.render(ctx, text, media, "meme")
 
-    @command(
+    @hub_command(
         "lobster",
         "l",
         "л",
         "лобстер",
-        filter=HubCommand("lobster", "l", "л", "лобстер"),
         text=TextInput(),
         media=MediaInput(kinds=("video", "image"), avatar=True),
         flags={"handler_key": "process_lobster", "fsm_release": True},
@@ -49,12 +47,11 @@ class Captions(Feature, key="captions"):
     async def lobster(self, ctx: MessageContext, text: str, media: DownloadableMedia) -> None:
         await self.render(ctx, text, media, "lobster")
 
-    @command(
+    @hub_command(
         "demotivator",
         "de",
         "д",
         "де",
-        filter=HubCommand("demotivator", "de", "д", "де"),
         text=TextInput(),
         media=MediaInput(kinds=("video", "image"), avatar=True),
         flags={"handler_key": "process_demotivator", "fsm_release": True},

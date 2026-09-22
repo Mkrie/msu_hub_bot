@@ -5,7 +5,7 @@ from aiogram.enums import ContentType
 from aiogram.filters import StateFilter
 from aiogram.types import Message
 from teleforge.context import CallbackContext, MessageContext
-from teleforge.declarations import callback, command
+from teleforge.declarations import callback
 from teleforge.feature import Feature
 
 from msu_hub_bot.commands.feedback import Feedback
@@ -15,7 +15,7 @@ from msu_hub_bot.feedback.presentation import FeedbackCallback
 from msu_hub_bot.storage.base import BotRepository
 from msu_hub_bot.telegram.filters import MetaInfo
 
-from .command import HubCommand
+from .command import command as hub_command
 
 
 class FeedbackFeature(Feature, key="feedback"):
@@ -32,13 +32,12 @@ class FeedbackFeature(Feature, key="feedback"):
         self.repository = repository
         self.diagnostics = diagnostics
 
-    @command(
+    @hub_command(
         "feedback",
-        filter=HubCommand("feedback"),
         filters=(F.content_type == ContentType.TEXT,),
         flags={"handler_key": "Feedback.process", "fsm_release": True, "automatic_previews": False},
     )
-    async def process(self, ctx: MessageContext, meta: MetaInfo) -> Message | None:
+    async def process(self, ctx: MessageContext, *, meta: MetaInfo) -> Message | None:
         message = ctx.message
         assert isinstance(message, Message)
         return await Feedback.process(message, meta, self.service, self.repository, self.diagnostics)

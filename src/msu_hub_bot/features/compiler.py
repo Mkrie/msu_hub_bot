@@ -10,7 +10,7 @@ from aiogram.utils.formatting import Bold, Pre, Text
 from teleforge import CallbackContext, Feature, MessageContext, TextInput, callback, command, enter, leave, step
 
 from msu_hub_bot.commands.prog import ProgCallback, ProgCompiler, StdinDraft, code_submit
-from msu_hub_bot.features.command import HubCommand
+from msu_hub_bot.features.command import command as hub_command
 from msu_hub_bot.providers.jdoodle import LANGUAGES, ManyJDoodle
 from msu_hub_bot.telegram.filters import SlashCommand
 
@@ -24,12 +24,11 @@ class Compiler(Feature, key="compiler"):
         await leave(ctx)
         return "🆗 Ввод отменён"
 
-    @command(
+    @hub_command(
         "py_stdin",
         "python_stdin",
         "pys",
         "pythons",
-        filter=HubCommand("py_stdin", "python_stdin", "pys", "pythons"),
         code=TextInput(document=True),
         flags={"handler_key": "compile.stdin_prompt.python3", "fsm_release": False},
     )
@@ -41,7 +40,7 @@ class Compiler(Feature, key="compiler"):
         )
 
     @callback(ProgCallback, flags={"handler_key": "compile.stdin.input", "fsm_release": False})
-    async def choose(self, ctx: CallbackContext, action: str, state: FSMContext) -> None:
+    async def choose(self, ctx: CallbackContext, action: str, *, state: FSMContext) -> None:
         ui = ctx.message
         if not isinstance(ui, Message) or ui.from_user is None or ui.from_user.id != ctx.bot.id:
             await ctx.answer("Открой команду с кодом ещё раз.")

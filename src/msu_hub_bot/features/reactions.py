@@ -5,13 +5,12 @@ from aiogram.filters import StateFilter
 from aiogram.types import Message
 from teleforge.cards import Button, Card, action, card, show
 from teleforge.context import CallbackContext, Context
-from teleforge.declarations import command
 from teleforge.feature import Feature
 
 from msu_hub_bot.commands.reactions import Days, ReactionCallback, Reactions, View, render_scoreboard
 from msu_hub_bot.storage.base import BotRepository
 
-from .command import HubCommand
+from .command import command as hub_command
 
 _GROUPS = {ChatType.GROUP, ChatType.SUPERGROUP}
 _GROUP_GUIDANCE = "Рейтинг живёт в групповом чате: напиши там /reactions. Для сбора реакций мне нужны права администратора."
@@ -21,10 +20,9 @@ class ReactionsFeature(Feature, key="reactions"):
     def __init__(self, repository: BotRepository) -> None:
         self.repository = repository
 
-    @command(
+    @hub_command(
         "reactions",
         "реакции",
-        filter=HubCommand("reactions", "реакции"),
         flags={"handler_key": "Reactions.process", "fsm_release": True},
     )
     async def process(self, ctx: Context) -> Message:
@@ -66,6 +64,7 @@ class ReactionsFeature(Feature, key="reactions"):
         return Card(content, buttons=rows)
 
     @action(
+        key="navigate",
         card="scoreboard",
         ack="early",
         coalesce=True,

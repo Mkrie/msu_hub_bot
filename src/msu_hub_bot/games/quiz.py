@@ -8,7 +8,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TypeVar
+from typing import Protocol, TypeVar
 from uuid import uuid4
 
 from aiogram import Bot
@@ -73,11 +73,16 @@ class LocalLock:
     users: int = 0
 
 
+class QuizSender(Protocol):
+    async def __call__[T](self, method: TelegramMethod[T], request_timeout: int | None = None) -> T: ...
+
+
 class QuizService:
     """Database state is authoritative; restarting loses only rendering caches."""
 
-    def __init__(self, bot: Bot, store: FeatureStore, worker: FeatureWorker) -> None:
+    def __init__(self, bot: Bot, store: FeatureStore, worker: FeatureWorker, *, sender: QuizSender | None = None) -> None:
         self.bot, self.store, self.worker = bot, store, worker
+        self._sender = sender if sender is not None else bot
         self.clock: Callable[[], datetime] = lambda: datetime.now(UTC)
         self.collections: dict[str, Collections] = {}
         self._locks: dict[tuple[str, int], LocalLock] = {}
@@ -109,7 +114,7 @@ class QuizService:
 
     async def _send(self, method: TelegramMethod[_Result]) -> _Result:
         async with asyncio.timeout(SEND_TIMEOUT):
-            return await self.bot(method, request_timeout=SEND_TIMEOUT)
+            return await self._sender(method, request_timeout=SEND_TIMEOUT)
 
     def _tx(self, feature: str, scope: Scope) -> Transaction:
         return self.store.transaction(feature, scope, operation_id=uuid4().hex)
