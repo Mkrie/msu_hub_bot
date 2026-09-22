@@ -1,116 +1,63 @@
-# Derp routing examples
+# Derp inline feature
 
-`features.py` contains a small text/inline answer sample and native payment
-routing. Construct it with `create_app(answers, payments)`. The answer service
-receives the current Telegram message, selected native media and already-selected
-model messages. `/ask` accepts attached or replied media with no textual prompt;
-empty requests use application guidance. This string-response sample does not
-replace Derp's full chat handler, context accounting, deferred tools, hydrated
-history or multiple outputs. Those remain in the existing native host routes.
+`inline.py` replaces the complete inline router from Derp PR29: empty-query help,
+question previews and chosen-result answers. It uses the existing concrete
+`InlineChatFeatureService`, native account models, privacy projection and UUID
+request identity. The service continues to own consent, execution and accounting.
+Derp's legacy main branch has a different service interface and is not the target.
 
-`native.py` is an optional concrete paid-image routing bridge. It imports Derp's
-actual `ImageOperationCoordinator`, `DeferredToolApprovalService`,
-`DeliveryService`, `DatabaseManager`, models, filters and public handlers. Import
-it only in a Derp environment satisfying TeleForge's declared dependencies.
-The normal Hub test/import graph does not require Derp.
+The feature shares placeholder construction and translates outcomes through one
+edit path. It retains the native `MessageSender` for Markdown/HTML conversion,
+inline truncation and the host's HTML-error fallback. TeleForge contributes typed,
+inspectable declarations and the shared test entrypoint; it does not supply new
+accounting guarantees or apply its managed output policy to this native sender.
 
-This bridge targets the paid-operation coordinator architecture developed in
-Derp PR29, including deferred image approvals and durable delivery. Derp's legacy
-main-branch image handlers use a different service interface; satisfying the
-Python/aiogram requirements alone does not supply the required coordinator API.
+Import this optional module only in a compatible Derp environment. The validated
+environment uses Python 3.14 and aiogram 3.31; the authoritative dependency range
+is in `packages/teleforge/pyproject.toml`. PR29's original aiogram 3.30 lock needs a
+separate dependency upgrade before using TeleForge. The Hub import/test graph
+does not need Derp.
 
-The supported integration environment uses Python 3.14 and aiogram 3.31; the
-authoritative dependency range is in `packages/teleforge/pyproject.toml`. Keep a
-separate host environment when evaluating a dependency upgrade, and install
-TeleForge into that environment instead of changing the host's existing lock:
-
-```sh
-uv pip install --python /path/to/derp/.venv-teleforge/bin/python -e packages/teleforge
-```
-
-Construct `NativeImages(image_operations=..., approvals=..., delivery=..., db=...)`
-with the existing application services and embed `App(native_images).build_router()`
-before the existing native image and tool-approval routers. **Keep both native
-routers and their normal middleware installed.** Derp selects model dependencies
-by the deepest matched router name. Extend its native plans for the bridge's
-message and callback observers, replacing the host's default
-`setup_route_dependencies` call with this single middleware installation:
+During native host construction, keep its middleware and replace the final
+`dispatcher.include_routers(*APPLICATION_ROUTERS)` call with:
 
 ```python
-from derp.handlers.image import router as image_router
-from derp.handlers.tool_approvals import router as tool_approval_router
-from derp.middlewares.route_dependencies import (
-    ROUTE_DEPENDENCY_PLANS,
-    RouteDependencyKey,
-    RouteDependencyMiddleware,
-    RouteDependencyPlan,
-    RouteEvent,
-)
+from derp.application import APPLICATION_ROUTERS
+from derp.handlers.inline import router as native_inline_router
 from teleforge import App
 
-app = App(native_images)
-plans = dict(ROUTE_DEPENDENCY_PLANS)
-for event in (RouteEvent.MESSAGE, RouteEvent.CALLBACK_QUERY):
-    plans[RouteDependencyKey(event, native_images.key)] = RouteDependencyPlan(models=True)
-route_dependencies = RouteDependencyMiddleware(db, plans)
-for event in RouteEvent:
-    dispatcher.observers[event.value].middleware(route_dependencies)
-dispatcher.include_routers(app.build_router(), image_router, tool_approval_router)
+from examples.derp.inline import InlineAnswers
+
+app = App(InlineAnswers(runtime.inline_chat_service))
+inline_router = app.build_router()
+dispatcher.include_routers(*(inline_router if router is native_inline_router else router for router in APPLICATION_ROUTERS))
 ```
 
-Here `image_router` and `tool_approval_router` are the existing native routers
-from `derp.handlers.image` and `derp.handlers.tool_approvals`. Retain the host's
-other router registrations. Do not also call `setup_route_dependencies`: this
-mapping extends every existing plan and loads models in the native short read
-session, without holding that session around provider execution.
+Run the existing host loop within `app.lifespan()`. This replacement belongs
+before the routers are attached; do not append it after the normal dispatcher
+constructor has already registered the native inline router. The feature key
+`inline` preserves native `RouteDependencyMiddleware` model loading without extra
+plans. Keep the native i18n and session middleware installed.
 
-The bridge owns only these selected entrypoints:
+All other routes remain in `APPLICATION_ROUTERS`. In particular, paid images,
+saved-result resend and the complete image approval family retain their native
+handlers and services. The approval router is already nested under the native
+chat router; do not attach it separately. This avoids duplicating aliases,
+upload flags, consent controls and commerce-policy forwarding in another class.
+Full contextual chat, payments and their workers also remain native.
 
-| Entry | Existing application handler |
-| --- | --- |
-| Image creation aliases and native hashtag grammar | `handle_imagine` |
-| Image editing aliases and native hashtag grammar | `handle_edit` |
-| `ImageApprovalCallback` with the `RUN` action | `approve_image_tool` |
-| `DeliveryResendCallback` | `resend_image_delivery` |
-
-Cancel, style, personal-funding decisions, malformed-token fallbacks and every
-other native callback remain owned by the host routers. The host still injects
-native `user_model` and `chat_model` per invocation, plus its optional
-`actor_role_resolver` and concrete `commerce_policy`. Database UUIDs, Telegram
-identities and the policy instance cross unchanged. Omitted commerce policy
-retains Derp's closed-intake default. Image commands retain the native
-`upload_photo` chat-action flag with its two-second initial delay, interpreted
-by the host's existing `ChatActionMiddleware`.
-The native handlers own callback acknowledgement, so both bridge callbacks use
-manual acknowledgement and do not add another answer or presentation.
-
-The bridge preserves Derp's existing input extraction, immutable quote and
-approval persistence, operation identity, execution claims, saved result,
-settlement, progress and delivery recovery. It introduces no second operation
-state machine or transcript schema. Uncertain delivery and explicit resend use
-Derp's own typed outcomes and authorization. Native i18n, funding, expiry,
-known-provider-failure and refund decisions remain with those handlers.
-
-This is a routing compatibility example, not evidence that wrapping a native
-handler reduces total application code. Production adoption still requires the
-chosen host dependency upgrade and real PostgreSQL settlement tests. An offline
-native journey with synthetic storage/provider/Telegram edges cannot establish
-financial migration or deployment readiness.
-
-The optional `bind_jobs(app, worker)` convenience registers
-`derp.commerce.recover-payment` for the simple commerce sample. The application
-must commit payment acceptance and recovery enqueue together; its worker owns
-claims, retries and transaction context. Duplicate payments and repeated job
-delivery still reach that application boundary. Inline answers preserve their
-native inline-message identity and do not invent a destination chat.
-
-Run the normal offline sample checks with:
+The optional tests use the real inline service and native model-loading/session
+middleware with synthetic SQL, accounting, provider and Telegram edges. They
+cover both placeholder variants, selected answers, privacy changes, all native
+failure outcomes, request identity and formatted output. Run them in a separate
+process from an isolated PR29 checkout with its dependencies and TeleForge
+installed, passing its pytest configuration explicitly:
 
 ```sh
-uv run --no-sync pytest -q tests/test_teleforge_derp.py
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /path/to/derp/.venv-teleforge/bin/python -m pytest -p pytest_asyncio.plugin -c /path/to/derp/pyproject.toml /path/to/hub/examples/derp/tests
 ```
 
-Validate the optional bridge separately with the actual Derp package and its
-native tests under a supported environment. Use synthetic provider, persistence
-and Telegram edges; never import research checkout runtime state into Hub tests
-or initialize live provider clients for validation.
+The test conftest refuses environment files, sets synthetic configuration and
+blocks network before test imports. These tests establish native integration
+across synthetic edges; they do not establish PostgreSQL settlement, process
+restart behavior, a production dependency upgrade or deployment readiness.

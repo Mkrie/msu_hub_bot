@@ -1,1 +1,1 @@
-"""Executable Derp-facing adapters with injected application services."""
+"""Optional complete features using Derp's concrete application services."""
