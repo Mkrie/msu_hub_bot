@@ -23,6 +23,7 @@ from aiogram.types import (
     CallbackQuery,
     Chat,
     ChosenInlineResult,
+    ErrorEvent,
     InaccessibleMessage,
     InputMediaPhoto,
     Message,
@@ -34,7 +35,7 @@ from aiogram.types import (
 from teleforge.app import App
 from teleforge.cards import Button, Card, action, card, prepare_card, show
 from teleforge.context import CallbackContext, MessageContext
-from teleforge.declarations import Declaration, attach_declaration, callback, chosen_inline_result, command
+from teleforge.declarations import Declaration, attach_declaration, callback, chosen_inline_result, command, event
 from teleforge.delivery import DeliveryError
 from teleforge.feature import Feature
 from teleforge.formatting import ResponseError
@@ -94,6 +95,28 @@ async def test_native_event_types_bind_descriptive_names_without_middleware_shad
         )
     assert seen == [(10, bot.id), ("click", 4, "middleware-selected source"), ("choice", bot.id)]
     assert [request.__api_method__ for request in bot.requests] == ["answerCallbackQuery"]
+
+
+async def test_native_error_observer_receives_its_synthetic_event_by_type() -> None:
+    observed: list[ErrorEvent] = []
+    failure = RuntimeError("application failure")
+
+    class Errors(Feature):
+        @command("fail")
+        async def fail(self) -> None:
+            raise failure
+
+        @event("error")
+        async def capture(self, failure: ErrorEvent) -> None:
+            observed.append(failure)
+
+    bot = RecordingBot()
+    async with App(Errors(), data={"failure": object()}) as app:
+        assert app.check() == ()
+        await app.feed_update(bot, incoming("/fail"))
+    assert len(observed) == 1 and observed[0].exception is failure
+    assert observed[0].update.message.text == "/fail"
+    assert bot.requests == []
 
 
 def clicked(data: str) -> Update:

@@ -30,6 +30,7 @@ from aiogram.types import (
     Audio,
     CallbackQuery,
     Document,
+    ErrorEvent,
     Message,
     PhotoSize,
     Sticker,
@@ -189,7 +190,13 @@ def compile_parameters(
             error("job-payload", f"Parameter '{job_argument}' must match its declared job payload model")
 
     event_field = Update.model_fields.get(declaration.event or "")
-    event_type = representation(event_field.annotation) if event_field is not None else None
+    event_type = (
+        ErrorEvent
+        if declaration.event == "error"
+        else representation(event_field.annotation)
+        if event_field is not None
+        else None
+    )
     for name in ("ctx", "context"):
         if name not in hints or declaration.kind in {"job", "web"}:
             continue
