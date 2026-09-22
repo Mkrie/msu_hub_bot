@@ -1,13 +1,15 @@
-"""The reaction scoreboard as one feature, using the existing application read model."""
+"""Chat-local reaction rankings with one native callback schema and redraw path."""
 
-from aiogram.enums import ChatType
+from aiogram.enums import ChatMemberStatus, ChatType
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import StateFilter
 from aiogram.types import Message
-from teleforge.cards import Button, Card, action, card, show
-from teleforge.context import CallbackContext, Context
+from cachetools import TTLCache
+from teleforge.cards import Card, action, card, show
+from teleforge.context import CallbackContext, Context, MessageContext
 from teleforge.feature import Feature
 
-from msu_hub_bot.commands.reactions import Days, ReactionCallback, Reactions, View, render_scoreboard
+from msu_hub_bot.commands.reactions import Days, ReactionCallback, View, keyboard, render_scoreboard
 from msu_hub_bot.storage.base import BotRepository
 
 from .command import command as hub_command
@@ -17,78 +19,49 @@ _GROUP_GUIDANCE = "Рейтинг живёт в групповом чате: н�
 
 
 class ReactionsFeature(Feature, key="reactions"):
-    def __init__(self, repository: BotRepository) -> None:
-        self.repository = repository
+    def __init__(self) -> None:
+        self.permissions: TTLCache[tuple[int, int], bool] = TTLCache(maxsize=512, ttl=60)
 
-    @hub_command(
-        "reactions",
-        "реакции",
-        flags={"handler_key": "Reactions.process", "fsm_release": True},
-    )
-    async def process(self, ctx: Context) -> Message:
-        message = ctx.message
-        assert isinstance(message, Message)
-        if message.chat.type not in _GROUPS:
-            return await ctx.bot.send_message(
-                chat_id=message.chat.id,
-                text=_GROUP_GUIDANCE,
-                reply_parameters=message.as_reply_parameters(),
-            )
-        result = await show(
-            ctx,
-            self.scoreboard,
-            view="getters",
-            days=30,
-            chat_id=message.chat.id,
-            topic_id=message.message_thread_id if message.is_topic_message else None,
-        )
-        assert isinstance(result, Message)
-        return result
+    @hub_command("reactions", "реакции", flags={"handler_key": "Reactions.process", "fsm_release": True})
+    async def process(self, ctx: MessageContext) -> Message | list[Message]:
+        if ctx.message.chat.type not in _GROUPS:
+            return await ctx.reply(_GROUP_GUIDANCE)
+        return await show(ctx, self.scoreboard, view="getters", days=30)
 
     @card
-    async def scoreboard(self, ctx: Context, view: View, days: Days, chat_id: int, topic_id: int | None) -> Card:
+    async def scoreboard(self, ctx: Context, view: View, days: Days, *, db: BotRepository) -> Card:
         message = ctx.message
-        if not isinstance(message, Message) or not self._origin(message, chat_id, topic_id):
-            raise ValueError("Reaction card origin changed")
-        board = await self.repository.reaction_scoreboard(message.chat.id, days=days)
-        content = render_scoreboard(board, message, view, administrator=await Reactions._administrator(message.as_(ctx.bot)))
-        rows = []
-        # Share the maintained Russian copy and layout with the native adapter.
-        for row in Reactions.keyboard(view, days).inline_keyboard:
-            buttons = []
-            for native in row:
-                assert native.callback_data is not None
-                value = ReactionCallback.unpack(native.callback_data)
-                buttons.append(Button(native.text, self.process_cb, view=value.view, days=value.days))
-            rows.append(buttons)
-        return Card(content, buttons=rows)
+        assert isinstance(message, Message) and message.chat.type in _GROUPS
+        board = await db.reaction_scoreboard(message.chat.id, days=days)
+        content = render_scoreboard(board, message, view, administrator=await self._administrator(message.as_(ctx.bot)))
+        return Card(content, buttons=keyboard(view, days))
 
     @action(
         key="navigate",
         card="scoreboard",
-        ack="early",
+        payload=ReactionCallback,
         coalesce=True,
         filters=(StateFilter(None),),
         flags={"handler_key": "Reactions.process_cb", "fsm_release": True},
     )
-    async def process_cb(
-        self,
-        ctx: CallbackContext,
-        view: View,
-        days: Days,
-        chat_id: int,
-        topic_id: int | None,
-    ) -> bool | None:
-        message = ctx.message
-        # This is a shared group scoreboard: any human participant may navigate it.
-        # Guard the clicked origin before the renderer performs a database read.
-        if ctx.user is None or ctx.user.is_bot or not isinstance(message, Message):
+    async def process_cb(self, ctx: CallbackContext) -> bool | None:
+        # The wire stores only view/period. Telegram's actual clicked message is
+        # the group/topic source; the card boundary verifies this bot authored it.
+        if ctx.user is None or ctx.user.is_bot or not isinstance(ctx.message, Message) or ctx.message.chat.type not in _GROUPS:
+            await ctx.answer("Открой /reactions в групповом чате.")
             return False
-        if not self._origin(message, chat_id, topic_id):
-            return False
+        await ctx.answer()
         return None
 
-    @staticmethod
-    def _origin(message: Message, chat_id: int, topic_id: int | None) -> bool:
-        actual_topic = message.message_thread_id if message.is_topic_message else None
-        return message.chat.type in _GROUPS and message.chat.id == chat_id and actual_topic == topic_id
+    async def _administrator(self, message: Message) -> bool | None:
+        assert message.bot is not None
+        key = (message.bot.id, message.chat.id)
+        if key in self.permissions:
+            return self.permissions[key]
+        try:
+            member = await message.bot.get_chat_member(message.chat.id, message.bot.id)
+        except TelegramAPIError:
+            return None
+        result = member.status in {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}
+        self.permissions[key] = result
+        return result

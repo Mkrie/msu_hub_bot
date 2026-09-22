@@ -18,6 +18,9 @@ class HubIsolationBridge(BaseMiddleware):
         event: TelegramObject,
         data: dict[str, Any],
     ) -> Any:
+        selected = data.get("handler")
+        if not getattr(selected, "flags", {}).get("feature_key") or "_teleforge_isolation" in data:
+            return await handler(event, data)
         state_context = data.get("state_context")
         if not isinstance(state_context, UpdateStateContext):
             raise RuntimeError("Hub state context middleware must precede the TeleForge bridge")

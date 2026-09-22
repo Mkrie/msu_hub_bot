@@ -34,6 +34,20 @@ from telemetry_helpers import Capture, config
 CONTRACT = json.loads((Path(__file__).parent / "fixtures/routing_contract.json").read_text())
 
 
+# Physical entrypoints may move; aliases, ordering and telemetry identities remain contractual.
+def implementation(original):
+    return {
+        "process_lobster": "Captions.caption",
+        "process_demotivator": "Captions.caption",
+        "process_meme": "Captions.caption",
+        "process_roll": "Roll.roll",
+        "process_dice": "Roll.dice",
+        "process_figlet": "FigletFeature.process_figlet",
+        "Reactions.process": "ReactionsFeature.process",
+        "Reactions.process_cb": "ReactionsFeature.process_cb",
+    }.get(original, original)
+
+
 class Selection(BaseMiddleware):
     async def __call__(self, handler, event, data):
         selected = data["handler"]
@@ -92,7 +106,7 @@ def test_every_route_preserves_order_and_aliases():
         expected = [route for route in CONTRACT["routes"] if route["event"] == kind]
         assert len(retained) == len(expected)
         for handler, prior in zip(retained, expected):
-            assert handler.callback.__qualname__ == prior["handler"]
+            assert handler.callback.__qualname__ == implementation(prior["handler"])
             assert aliases(handler) == [alias.lower() for alias in prior["aliases"]]
             assert isinstance(handler.flags["handler_key"], str)
             assert isinstance(handler.flags["fsm_release"], bool)
@@ -130,7 +144,7 @@ async def test_captured_selection_through_real_dispatch(case):
             assert result is UNHANDLED
         else:
             handler, meta = result
-            assert handler.callback.__qualname__ == expected["handler"]
+            assert handler.callback.__qualname__ == implementation(expected["handler"])
             if "meta" in case and "approved_target" not in case:
                 for key, value in case["meta"].items():
                     assert getattr(meta, key) == value
@@ -187,7 +201,7 @@ async def test_chess_commands_select_real_routes_with_case_and_mentions(chess_se
         assert result is UNHANDLED
     else:
         handler, meta = result
-        assert handler.callback.__qualname__ == expected
+        assert handler.callback.__qualname__ == implementation(expected)
         assert handler.flags["handler_key"] == expected
         assert meta is not None
     assert bot.session.methods == []
@@ -213,7 +227,7 @@ async def test_reaction_aliases_select_the_real_chat_scoreboard_route(chess_sele
         assert result is UNHANDLED
     else:
         handler, meta = result
-        assert handler.callback.__qualname__ == expected and handler.flags["handler_key"] == expected
+        assert handler.callback.__qualname__ == implementation(expected) and handler.flags["handler_key"] == expected
         assert handler.flags["fsm_release"] is True and meta is not None
     assert bot.session.methods == []
 
@@ -230,7 +244,7 @@ async def test_reaction_buttons_select_real_typed_callback_routes(chess_selectio
         data=ReactionCallback(view=view, days=days).pack(),
     )
     handler, _ = await asyncio.create_task(dispatcher.feed_update(bot, Update(update_id=1, callback_query=callback)))
-    assert handler.callback.__qualname__ == "Reactions.process_cb"
+    assert handler.callback.__qualname__ == implementation("Reactions.process_cb")
     assert handler.flags["handler_key"] == "Reactions.process_cb" and handler.flags["fsm_release"] is True
     assert bot.session.methods == []
 
@@ -318,7 +332,7 @@ async def test_caption_styles_select_real_routes_in_text_and_media_captions(
     else:
         handler, meta = result
         assert handler.flags["handler_key"] == expected
-        assert handler.callback.__qualname__ == expected
+        assert handler.callback.__qualname__ == implementation(expected)
         assert meta.text == expected_text
     assert bot.session.methods == []
 
@@ -345,7 +359,7 @@ async def test_chess_and_geoguess_callbacks_select_separate_real_routes(chess_se
     )
     result = await asyncio.create_task(dispatcher.feed_update(bot, Update(update_id=1, callback_query=callback)))
     handler, _ = result
-    assert handler.callback.__qualname__ == expected
+    assert handler.callback.__qualname__ == implementation(expected)
     assert handler.flags["handler_key"] == expected
     assert bot.session.methods == []
 
@@ -378,7 +392,7 @@ async def test_quiz_buttons_preserve_active_conversations_and_other_topics(callb
     )
     try:
         handler, _ = await asyncio.create_task(dispatcher.feed_update(bot, Update(update_id=1, callback_query=query)))
-        assert handler.callback.__qualname__ == expected and handler.flags["fsm_release"] is True
+        assert handler.callback.__qualname__ == implementation(expected) and handler.flags["fsm_release"] is True
         assert await state.get_state() == conversation
         assert await state.get_data() == {"draft": "Keep this input"}
         assert await other.get_state() == "ProgStates:stdin"

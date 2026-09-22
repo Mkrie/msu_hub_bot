@@ -1,4 +1,4 @@
-"""Native dispatch proof for Derp's application-owned service boundaries."""
+"""Synthetic dispatch checks for typed inputs, identities and application-owned effects."""
 
 import asyncio
 from collections.abc import Sequence
@@ -25,7 +25,7 @@ from teleforge import App
 from teleforge.jobs import JobHandler, bind_jobs
 from teleforge.testing import RecordingBot
 
-from examples.derp.features import Assistant, NativeMedia, RequestScope, create_app
+from teleforge_service_fixtures import Assistant, NativeMedia, RequestScope, create_app
 
 ACTOR = User(id=700, is_bot=False, first_name="User")
 
@@ -274,7 +274,7 @@ async def test_native_precheckout_facts_and_service_decision_are_preserved(reaso
 async def test_duplicate_payment_updates_and_recovery_rely_on_application_idempotency() -> None:
     payments, worker, bot = Payments(), Worker(), RecordingBot()
     app = create_app(Answers(), payments)
-    assert bind_jobs(app, worker) == ("derp.commerce.recover-payment",)
+    assert bind_jobs(app, worker) == ("test.commerce.recover-payment",)
     assert not payments.outbox
     native = SuccessfulPayment(
         currency="XTR",
@@ -291,7 +291,7 @@ async def test_duplicate_payment_updates_and_recovery_rely_on_application_idempo
         assert set(payments.receipts) == {"receipt-1"}
         assert payments.receipts["receipt-1"].model_dump() == native.model_dump()
         assert payments.outbox == [{"receipt_id": "receipt-1"}]
-        recover = worker.handlers["derp.commerce.recover-payment"]
+        recover = worker.handlers["test.commerce.recover-payment"]
         await recover(payments.outbox[0])
         await recover(payments.outbox[0])
     assert payments.recovery_calls == ["receipt-1", "receipt-1"]
@@ -303,5 +303,5 @@ async def test_invalid_recovery_payload_cannot_reach_application_service() -> No
     payments, worker = Payments(), Worker()
     bind_jobs(create_app(Answers(), payments), worker)
     with pytest.raises(ValidationError):
-        await worker.handlers["derp.commerce.recover-payment"]({"receipt_id": "receipt", "actor_id": 700})
+        await worker.handlers["test.commerce.recover-payment"]({"receipt_id": "receipt", "actor_id": 700})
     assert not payments.recovery_calls

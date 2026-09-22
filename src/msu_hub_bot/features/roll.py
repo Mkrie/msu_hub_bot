@@ -1,7 +1,9 @@
 """A small feature: typed arguments, literal formatting and native dice."""
 
+import random
 from typing import Annotated
 
+from aiogram.enums import DiceEmoji
 from aiogram.types import Message
 from aiogram.utils.formatting import Code, Text
 from pydantic import BeforeValidator
@@ -14,8 +16,10 @@ from msu_hub_bot.features.command import command as hub_command
 
 
 def _unsigned(value: object) -> object:
-    if isinstance(value, str) and not value.isdigit():
-        raise ValueError("Use unsigned digits")
+    if isinstance(value, str):
+        if not value.isdigit():
+            raise ValueError("Use unsigned digits")
+        return int(value)
     return value
 
 
@@ -33,7 +37,8 @@ class Roll(Feature, key="roll"):
         roll, name = get_roll(digits)
         return Text(Code(roll), f" — {name}" if name else "")
 
-    @hub_command("dice")
+    @hub_command("dice", flags={"handler_key": "process_dice", "fsm_release": True})
     async def dice(self, ctx: MessageContext) -> Message:
         assert isinstance(ctx.message, Message)
-        return await ctx.message.reply_dice()
+        emojis = (DiceEmoji.DICE, DiceEmoji.DART, DiceEmoji.BASKETBALL, DiceEmoji.FOOTBALL, DiceEmoji.SLOT_MACHINE)
+        return await ctx.message.reply_dice(emoji=random.choice(emojis))

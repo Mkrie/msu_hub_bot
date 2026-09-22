@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, TypeVar, cast, get_type_hints
 
 from aiogram.filters import Filter
+from aiogram.filters.callback_data import CallbackData
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageEntity
 from aiogram.utils.formatting import Text
 from pydantic import TypeAdapter, ValidationError
@@ -22,7 +23,7 @@ from .context import CallbackContext, Context
 from .declarations import Declaration, attach_declaration, declarations_of
 from .delivery import MediaSource
 from .feature import Feature
-from .inputs import _ValidatedPayload
+from .inputs import InputError, _ValidatedPayload
 from .parameters import ParameterPlan, checked_dependency, compile_parameters
 
 if TYPE_CHECKING:
@@ -170,6 +171,13 @@ def _schema(action_method: Callable[..., Any]) -> tuple[str, list[_Parameter], C
         if previous is None:
             parameters.append(parameter)
             by_name[parameter.name] = parameter
+    if declaration.payload is not None:
+        fields = declaration.payload.model_fields
+        for parameter in parameters:
+            if parameter.name not in fields or parameter.annotation != fields[parameter.name].annotation:
+                raise CardError(f"Card argument {parameter.name!r} must match its native CallbackData field")
+        # Native CallbackData owns the wire identity, defaults and validators.
+        return "", parameters, renderer
     # Annotation repr can contain function addresses (Annotated validators), so
     # buttons would stop matching after every process restart. The public input
     # schema is stable; validators still run on each decoded callback.
@@ -234,6 +242,14 @@ def _validate(
 
 def _pack(method: Callable[..., Any], arguments: Mapping[str, object]) -> str:
     identity, parameters, _ = _schema(method)
+    payload = _declaration(method, "card_action").payload
+    if payload is not None:
+        if unknown := arguments.keys() - payload.model_fields.keys():
+            raise CardError(f"Unknown card arguments: {', '.join(sorted(unknown))}")
+        try:
+            return payload.model_validate(arguments).pack()
+        except (ValueError, TypeError) as exc:
+            raise CardError("Invalid native card callback arguments") from exc
     values = _validate(parameters, arguments)
     raw = [parameter.adapter.dump_python(values[parameter.name], mode="json") for parameter in parameters]
     encoded = _PREFIX + identity + ":" + json.dumps(raw, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
@@ -245,9 +261,23 @@ def _pack(method: Callable[..., Any], arguments: Mapping[str, object]) -> str:
 class _ActionFilter(Filter):
     def __init__(self, method: Callable[..., Any]) -> None:
         self.identity, self.parameters, _ = _schema(method)
+        payload = _declaration(method, "card_action").payload
+        self.native = payload.filter() if payload is not None else None
 
     async def __call__(self, query: CallbackQuery) -> bool | dict[str, Any]:
-        if not query.data or len(query.data.encode()) > 64 or not query.data.startswith(_PREFIX + self.identity + ":"):
+        if not query.data or len(query.data.encode()) > 64:
+            return False
+        if self.native is not None:
+            matched = await self.native(query)
+            if not matched:
+                return False
+            payload = matched["callback_data"]
+            return {
+                **matched,
+                "_teleforge_payload": payload,
+                "_teleforge_card_arguments": _ValidatedPayload(payload.model_dump(mode="python")),
+            }
+        if not query.data.startswith(_PREFIX + self.identity + ":"):
             return False
         try:
             values = json.loads(query.data[len(_PREFIX) + len(self.identity) + 1 :])
@@ -395,6 +425,7 @@ def action(
     *,
     key: str,
     card: str,
+    payload: type[CallbackData] | None = None,
     refresh: bool = True,
     ack: Literal["auto", "early"] = "auto",
     coalesce: bool = False,
@@ -406,6 +437,8 @@ def action(
     Early acknowledgement happens before the card lock and forfeits later alert
     results. Coalescing drops clicks while the same UI is busy: opt in only for
     disposable refresh requests, never for mutations that each need to run.
+    A native CallbackData payload preserves its existing wire format and model
+    validation while using the same lock, acknowledgement and refresh pipeline.
     """
     if ack not in {"auto", "early"}:
         raise CardError("Managed action acknowledgement must be 'auto' or 'early'")
@@ -425,7 +458,8 @@ def action(
                 raise CardError("Managed actions require a callback context")
             message = ctx.event.message
             if not isinstance(message, Message) or message.from_user is None or message.from_user.id != ctx.bot.id:
-                raise CardError("Managed actions require an accessible message sent by this bot")
+                await ctx.guide(InputError("callback-invalid"))
+                return None
             arguments = cast(dict[str, object], data["_teleforge_card_arguments"])
             renderer = cast(Callable[..., Any], getattr(feature, card))
             _declaration(renderer, "card")
@@ -452,6 +486,7 @@ def action(
             Declaration(
                 kind="callback",
                 event="callback_query",
+                payload=payload,
                 flags=flags or {},
                 filters=filters,
                 filter_factory=bound_filters,

@@ -18,6 +18,7 @@ from aiogram.types import (
     Audio,
     Document,
     Message,
+    MessageOriginUser,
     PhotoSize,
     Sticker,
     TelegramObject,
@@ -365,10 +366,12 @@ def _pick_media(message: Message, kinds: tuple[str, ...]) -> Downloadable | None
             return media
         if isinstance(media, Document):
             mime = media.mime_type or ""
+            base, _, subtype = mime.partition("/")
             if (
                 "document" in kinds
                 or "image" in kinds
-                and mime.startswith("image/")
+                and base == "image"
+                and subtype.endswith(("jpeg", "png", "tiff", "bmp", "gif", "webp"))
                 or "video" in kinds
                 and mime.startswith("video/")
             ):
@@ -396,8 +399,13 @@ async def _select_media(
             return target, media
     if isinstance(declaration, (ImageInput, MediaInput)) and declaration.avatar:
         for target in reversed(targets):
+            users = []
+            if isinstance(target.forward_origin, MessageOriginUser):
+                users.append(target.forward_origin.sender_user)
             if target.from_user is not None:
-                photos = await ctx.bot.get_user_profile_photos(target.from_user.id, limit=1)
+                users.append(target.from_user)
+            for user in users:
+                photos = await ctx.bot.get_user_profile_photos(user.id, limit=1)
                 if photos.photos and photos.photos[0]:
                     return target, photos.photos[0][-1]
     return None, None

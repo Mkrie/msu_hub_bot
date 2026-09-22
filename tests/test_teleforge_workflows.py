@@ -1,27 +1,27 @@
-"""Feature entrypoints preserve the real feedback and leased-work service contracts."""
+"""Native feedback and worker ownership compose without feature facades."""
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
-from typing import cast
 
 import pytest
+from aiogram import Router
+from aiogram.filters import StateFilter
 from aiogram.methods import AnswerCallbackQuery, EditMessageText, SendPhoto
 from aiogram.types import CallbackQuery, Chat, Message, Update, User
 from teleforge.app import App
 from teleforge.testing import RecordingBot
 
-from msu_hub_bot.features.feedback import FeedbackFeature
-from msu_hub_bot.features.workers import DurableWorkers
+from msu_hub_bot.commands.feedback import Feedback
+from msu_hub_bot.telegram.runtime import Supervisor
 from msu_hub_bot.feedback import FeedbackContext, FeedbackOrigin, FeedbackService
 from msu_hub_bot.feedback.models import FeedbackDraft
 from msu_hub_bot.feedback.presentation import FeedbackCallback
 from msu_hub_bot.games.chess_play import service as chess_service
 from msu_hub_bot.games.chess_play.service import ChessMatchService
 from msu_hub_bot.reminders import ReminderService, Schedule
-from msu_hub_bot.storage.base import BotRepository
 from msu_hub_bot.storage.features import FeatureStore, FeatureWorker, Record
 from quiz_helpers import FeatureFixture
 
@@ -91,9 +91,24 @@ def click(rig: WorkflowRig, record: Record[FeedbackDraft], action: str, *, autho
     )
 
 
-def feature(rig: WorkflowRig) -> FeedbackFeature:
-    # Callback proofs need no archive read; the captured draft is already frozen.
-    return FeedbackFeature(rig.feedback, cast(BotRepository, SimpleNamespace()))
+def native_app(rig: WorkflowRig) -> App:
+    # These callbacks consume an already captured draft and need no archive access.
+    app = App(data={"feedback": rig.feedback})
+    router = Router()
+    router.callback_query.register(Feedback.process_cb, FeedbackCallback.filter(), StateFilter(None))
+    app.create_dispatcher().include_router(router)
+    return app
+
+
+@asynccontextmanager
+async def running_worker(worker: FeatureWorker) -> AsyncIterator[asyncio.Task[None]]:
+    supervisor = Supervisor()
+    task = supervisor.create_job(worker.run, trace=False)
+    try:
+        yield task
+    finally:
+        worker.stop()
+        await supervisor.drain(timeout=2, cancel_timeout=0.5)
 
 
 async def current(rig: WorkflowRig, key: str) -> Record[FeedbackDraft]:
@@ -109,7 +124,7 @@ async def eventually(predicate: Callable[[], Awaitable[bool]]) -> None:
 async def test_exact_preview_then_submit_keeps_real_atomic_report_and_job(rig: WorkflowRig) -> None:
     record = await draft(rig)
     expected = rig.feedback.build_report(record).rendered_text
-    async with App(feature(rig)) as app:
+    async with native_app(rig) as app:
         await app.feed_update(rig.bot, click(rig, record, "p"))
         preview = await current(rig, record.key)
         assert preview.value.preview_digest is not None
@@ -132,7 +147,7 @@ async def test_exact_preview_then_submit_keeps_real_atomic_report_and_job(rig: W
 async def test_failed_preview_cannot_make_draft_submittable(rig: WorkflowRig) -> None:
     record = await draft(rig)
     rig.bot.recording.responses.append(TimeoutError())
-    async with App(feature(rig)) as app:
+    async with native_app(rig) as app:
         await app.feed_update(rig.bot, click(rig, record, "p"))
         pending = await current(rig, record.key)
         assert pending.value.preview_digest is None
@@ -143,7 +158,7 @@ async def test_failed_preview_cannot_make_draft_submittable(rig: WorkflowRig) ->
 
 async def test_committed_submit_survives_failed_ui_refresh_without_second_job(rig: WorkflowRig) -> None:
     record = await draft(rig)
-    async with App(feature(rig)) as app:
+    async with native_app(rig) as app:
         await app.feed_update(rig.bot, click(rig, record, "p"))
         ready = await current(rig, record.key)
         rig.bot.recording.responses.append(TimeoutError())
@@ -157,7 +172,7 @@ async def test_committed_submit_survives_failed_ui_refresh_without_second_job(ri
 
 async def test_feedback_callback_cannot_borrow_another_authors_preview(rig: WorkflowRig) -> None:
     record = await draft(rig)
-    async with App(feature(rig)) as app:
+    async with native_app(rig) as app:
         await app.feed_update(rig.bot, click(rig, record, "p", author=8))
     assert (await current(rig, record.key)).etag == record.etag
     assert all(isinstance(request, AnswerCallbackQuery) for request in rig.bot.requests)
@@ -175,14 +190,13 @@ async def test_worker_lifespan_delivers_existing_reminder_and_stops_before_retur
         schedule=Schedule(due_at=rig.backend.now + timedelta(seconds=1), text="A reminder"),
     )
     rig.backend.now += timedelta(seconds=2)
-    workers = DurableWorkers(rig.worker)
 
     async def delivered() -> bool:
         return (await reminders.get(AUTHOR, record.key)).value.status == "delivered"
 
-    async with App(workers):
+    async with running_worker(rig.worker) as task:
         await eventually(delivered)
-    assert workers._task is not None and workers._task.done()
+    assert task.done()
     assert len(rig.bot.requests) == 1
     assert rig.bot.requests[0].message_thread_id == TOPIC
     assert await rig.worker.run_once() == 0
@@ -210,7 +224,7 @@ async def test_worker_preserves_uncertain_chess_publication_without_resending(ri
         record = await matches.get(CHAT, token)
         return record is not None and record.value.publication == "abandoned"
 
-    async with App(DurableWorkers(rig.worker)):
+    async with running_worker(rig.worker):
         await eventually(abandoned)
     after = await matches.get(CHAT, token)
     assert after is not None and after.value.game.status == "finished"

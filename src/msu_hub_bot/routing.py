@@ -3,6 +3,7 @@
 from aiogram import F, Router
 from aiogram.enums import ContentType
 from aiogram.filters import StateFilter
+from teleforge import App
 from msu_hub_bot.telegram.filters import MetaCommand, SlashCommand
 from msu_hub_bot.telegram.state import UpdateStateContext
 from msu_hub_bot.settings import Settings
@@ -37,7 +38,7 @@ from msu_hub_bot.commands.externals import (
     process_which_anime,
     process_ud,
 )
-from msu_hub_bot.commands.figlet import process_figlet
+from msu_hub_bot.commands.figlet import FigletFeature
 from msu_hub_bot.commands.fun import matches_pokakats, process_beer, process_pokakats, process_puk
 from msu_hub_bot.commands.genders import process_gender
 from msu_hub_bot.commands.geoguess import Geoguess
@@ -59,7 +60,7 @@ from msu_hub_bot.commands.infra import (
 from msu_hub_bot.commands.latex import Latex
 from msu_hub_bot.commands.likes import Like
 from msu_hub_bot.commands.lingvanex import process_langs, process_translate, process_en, process_ru
-from msu_hub_bot.commands.lobster import process_lobster, process_demotivator, process_meme, process_atmta, process_atmta_v
+from msu_hub_bot.commands.lobster import process_atmta, process_atmta_v
 from msu_hub_bot.commands.location import process_location
 from msu_hub_bot.commands.minecraft import MinecraftStatus
 from msu_hub_bot.commands.other import (
@@ -81,19 +82,21 @@ from msu_hub_bot.commands.rolls import (
     Randoms,
     Rolls,
     process_d6,
-    process_dice,
     process_mash,
     process_or,
     process_others_dice,
     process_random,
-    process_roll,
     process_truth,
 )
 from msu_hub_bot.commands.sed import process_sed
 from msu_hub_bot.commands.settings import process_settings
 from msu_hub_bot.commands.song import process_song
 from msu_hub_bot.commands.stats import Stats
-from msu_hub_bot.commands.reactions import Reactions
+from msu_hub_bot.features.captions import Captions
+from msu_hub_bot.features.command import format_input_error
+from msu_hub_bot.features.integration import HubIsolationBridge
+from msu_hub_bot.features.reactions import ReactionsFeature
+from msu_hub_bot.features.roll import Roll
 from msu_hub_bot.commands.remind import Remind
 from msu_hub_bot.commands.feedback import Feedback
 from msu_hub_bot.commands.app import is_app_start, process_app, process_app_start
@@ -123,6 +126,10 @@ def fsm_callback_allowed(query: object, state_context: UpdateStateContext) -> bo
 def build_router(*, wit: Wit, wolfram: WolframAPI, config: Settings) -> Router:
     settings = config
     root = Router(name="hub")
+    captions, roll, reactions, figlet = Captions(), Roll(), ReactionsFeature(), FigletFeature()
+    features = App(captions, roll, reactions, figlet, input_formatter=format_input_error)
+    root.startup.register(features.start)
+    root.shutdown.register(features.aclose)
     current: Router | None = None
     domain = ""
 
@@ -132,6 +139,8 @@ def build_router(*, wit: Wit, wolfram: WolframAPI, config: Settings) -> Router:
             current = Router(name=f"{len(root.sub_routers)}:{name}")
             root.include_router(current)
             domain = name
+            current.message.middleware(HubIsolationBridge())
+            current.callback_query.middleware(HubIsolationBridge())
         return current
 
     kek_pek_id, test_chat_id = settings.forward_chat_ids
@@ -204,18 +213,7 @@ def build_router(*, wit: Wit, wolfram: WolframAPI, config: Settings) -> Router:
         StateFilter(None),
         flags={"handler_key": "HelpMessage.process_cb", "fsm_release": True},
     )
-    group("reactions").message.register(
-        Reactions.process,
-        MetaCommand("reactions", "реакции"),
-        StateFilter(None),
-        flags={"handler_key": "Reactions.process", "fsm_release": True},
-    )
-    group("reactions").callback_query.register(
-        Reactions.process_cb,
-        Reactions.callback_data.filter(),
-        StateFilter(None),
-        flags={"handler_key": "Reactions.process_cb", "fsm_release": True},
-    )
+    features.register(group("reactions"), reactions.process, reactions.process_cb)
     group("control").message.register(
         process_cancel,
         SlashCommand("cancel"),
@@ -429,24 +427,7 @@ def build_router(*, wit: Wit, wolfram: WolframAPI, config: Settings) -> Router:
     group("prog").message.register(
         process_code, MetaCommand("prog", "pr"), StateFilter(None), flags={"handler_key": "process_code", "fsm_release": True}
     )
-    group("lobster").message.register(
-        process_lobster,
-        MetaCommand("lobster", "l", "л", "лобстер"),
-        StateFilter(None),
-        flags={"handler_key": "process_lobster", "fsm_release": True},
-    )
-    group("lobster").message.register(
-        process_demotivator,
-        MetaCommand("demotivator", "de", "д", "де"),
-        StateFilter(None),
-        flags={"handler_key": "process_demotivator", "fsm_release": True},
-    )
-    group("lobster").message.register(
-        process_meme,
-        MetaCommand("meme"),
-        StateFilter(None),
-        flags={"handler_key": "process_meme", "fsm_release": True},
-    )
+    features.register(group("lobster"), captions.caption)
     group("lobster").message.register(
         process_atmta,
         MetaCommand("atmta", "атмта", "атм", "atm"),
@@ -776,9 +757,7 @@ def build_router(*, wit: Wit, wolfram: WolframAPI, config: Settings) -> Router:
     group("rate").callback_query.register(
         Rate.process_cb, Rate.callback_data.filter(), StateFilter(None), flags={"handler_key": "Rate.process_cb", "fsm_release": True}
     )
-    group("rolls").message.register(
-        process_roll, MetaCommand("roll", "ролл"), StateFilter(None), flags={"handler_key": "process_roll", "fsm_release": True}
-    )
+    features.register(group("rolls"), roll.roll)
     group("rolls").message.register(
         Rolls.process,
         MetaCommand("rolls", "роллим", "рулетка"),
@@ -830,9 +809,7 @@ def build_router(*, wit: Wit, wolfram: WolframAPI, config: Settings) -> Router:
     group("rolls").message.register(
         process_d6, MetaCommand("d6"), StateFilter(None), flags={"handler_key": "process_d6", "fsm_release": True}
     )
-    group("rolls").message.register(
-        process_dice, MetaCommand("dice"), StateFilter(None), flags={"handler_key": "process_dice", "fsm_release": True}
-    )
+    features.register(group("rolls"), roll.dice)
     group("rolls").message.register(
         process_others_dice,
         StateFilter(None),
@@ -846,13 +823,7 @@ def build_router(*, wit: Wit, wolfram: WolframAPI, config: Settings) -> Router:
         F.content_type == ContentType.TEXT,
         flags={"handler_key": "process_zalgo", "fsm_release": True},
     )
-    group("figlet").message.register(
-        process_figlet,
-        MetaCommand("figlet"),
-        StateFilter(None),
-        F.content_type == ContentType.TEXT,
-        flags={"handler_key": "process_figlet", "fsm_release": True},
-    )
+    features.register(group("figlet"), figlet.process_figlet)
     group("excuses").message.register(
         process_excuse,
         MetaCommand("excuse", "e"),

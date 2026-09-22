@@ -14,6 +14,8 @@ from teleforge import App
 from teleforge.testing import RecordingBot
 
 from msu_hub_bot.features import captions
+from msu_hub_bot.features import roll
+from msu_hub_bot.execution.executor import TPExecutor
 from msu_hub_bot.features.compiler import Compiler
 from msu_hub_bot.features.roll import Roll
 
@@ -32,7 +34,17 @@ def message(bot, *, text=None, message_id=1, actor=7, topic=55, **kwargs):
 
 
 @pytest.mark.parametrize(
-    "text,length", [("/roll", 3), ("/roll xyz", 3), ("/roll -6", 3), ("/roll +6", 3), ("/roll 6", 6), ("#ролл_7", 7), ("/roll 101", 100)]
+    "text,length",
+    [
+        ("/roll", 3),
+        ("/roll xyz", 3),
+        ("/roll -6", 3),
+        ("/roll +6", 3),
+        ("/roll 6", 6),
+        ("#ролл_7", 7),
+        ("/roll 101", 100),
+        ("/roll ١٢", 12),
+    ],
 )
 async def test_roll_grammar_and_typed_default(text, length):
     bot = RecordingBot()
@@ -44,6 +56,20 @@ async def test_roll_grammar_and_typed_default(text, length):
         assert sent.entities[0].type == "code"
         assert sent.message_thread_id == 55
         assert sent.reply_parameters.message_id == 1
+    finally:
+        await app.aclose()
+
+
+@pytest.mark.parametrize("index,emoji", [(0, "🎲"), (1, "🎯"), (2, "🏀"), (3, "⚽"), (4, "🎰")])
+async def test_dice_retains_all_native_variants(monkeypatch, index, emoji):
+    monkeypatch.setattr(roll.random, "choice", lambda values: values[index])
+    bot = RecordingBot()
+    app = App().include(Roll())
+    try:
+        await app.feed_update(bot, Update(update_id=1, message=message(bot, text="/dice")))
+        sent = bot.requests[-1]
+        assert sent.__api_method__ == "sendDice" and sent.emoji == emoji
+        assert sent.reply_parameters.message_id == 1 and sent.message_thread_id == 55
     finally:
         await app.aclose()
 
@@ -70,7 +96,8 @@ async def test_caption_sources_delivery_and_resource_ownership(monkeypatch, kind
 
     monkeypatch.setattr(captions, "ChatActioner", action)
     source = message(bot, message_id=8, **fields)
-    app = App().include(captions.Captions(SimpleNamespace()))
+    executor = TPExecutor(1)
+    app = App(data={"cpu_executor": executor}).include(captions.Captions())
     try:
         await app.feed_update(bot, Update(update_id=1, message=message(bot, text="/meme длинная подпись", reply_to_message=source)))
         call = renderer.call_args.args
@@ -87,6 +114,7 @@ async def test_caption_sources_delivery_and_resource_ownership(monkeypatch, kind
             assert output.closed
     finally:
         await app.aclose()
+        executor.shutdown(wait=False)
 
 
 async def test_compiler_draft_survives_new_feature_instance_and_isolates_actor_topic(monkeypatch):

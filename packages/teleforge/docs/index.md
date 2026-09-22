@@ -26,6 +26,8 @@ Declarations are named after parameters. Undeclared command services are keyword
 
 Attached media takes precedence over replied media. `/meme Hello` replying to a photo selects the command's text and the replied photo: successful output replies to the photo, guidance to the command. `ctx.input_sources` records each source separately. Callback UI is never implicitly interpreted as input; select a source deliberately or load an application record.
 
+Image acquisition accepts JPEG, PNG, TIFF, BMP, GIF and WebP documents. Arbitrary documents remain available through `DocumentInput` or a `MediaInput` with the `document` kind. Avatar fallback tries the known original author of a forwarded message before its forwarding user, preferring the replied message over the invocation.
+
 Downloads are bounded even when Telegram omits their size. Streams, files and decoded images stay alive through returned-output delivery, then close. Never retain them on the feature, enqueue temporary paths, or pass them to detached tasks. Decode work joins on cancellation. Application executors still own their processing limits.
 
 The default matcher is native, case-insensitive aiogram `Command`. Applications can supply `filter=...` returning `_teleforge_tail` for argument parsing. An optional `_teleforge_text` supplies a separate body to `TextInput`; omitting it uses the unconsumed tail. Both values must be strings. MSU's `HubCommand` uses these channels to retain slash aliases and in-text hashtags without confusing hashtag arguments with surrounding text. Explicit filters, flags, native routers and middleware remain available.
@@ -47,6 +49,8 @@ Only finite local media and Telegram file IDs are accepted by default. Remote UR
 ## Callbacks and managed cards
 
 Raw `@callback(Payload)` projects validated native `CallbackData` fields into typed parameters. Use explicit `ctx.answer`, `ctx.edit` or `ctx.reply`; a returned string is not guessed to mean an alert or an edit. `ack="manual"` transfers acknowledgement ownership to an existing native handler. Otherwise normal completion supplies an empty acknowledgement only if none was attempted.
+
+An existing native button format can use the same redraw lifecycle: `@action(key="navigate", card="board", payload=PageCallback)`. Pass its native buttons directly to `Card`; payload fields supply renderer arguments and keyword-only renderer services still come from middleware. This avoids inventing another encoding or invalidating existing buttons. Inaccessible or foreign card messages receive localizable guidance without running the action or reading application state.
 
 Use a managed card when an action should reload and redraw the same UI:
 
@@ -109,13 +113,15 @@ Automatic acquisition errors are structured `InputError` values with a safe code
 
 ## Jobs, HTTP and persistence
 
-The optional registration helpers are convenience APIs, outside the stable Telegram invocation contract. Use native host registration when it is clearer. `@job("name", payload=Model)` and `bind_jobs(app, adapter)` expose validated methods to the application's worker under `feature_key.name`; renaming the Python method does not change that durable identity. Enqueue with the application's transaction API. TeleForge does not provide atomic state-plus-enqueue, exactly-once execution, leases, retry policy or retention. Those belong to the durable worker and repository. MSU's worker feature owns its existing worker lifecycle without re-registering reminder/game handlers.
+The optional registration helpers are convenience APIs, outside the stable Telegram invocation contract. Use native host registration when it is clearer. `@job("name", payload=Model)` and `bind_jobs(app, adapter)` expose validated methods to the application's worker under `feature_key.name`; renaming the Python method does not change that durable identity. Enqueue with the application's transaction API. TeleForge does not provide atomic state-plus-enqueue, exactly-once execution, leases, retry policy or retention. Those belong to the durable worker and repository. MSU keeps its worker in the existing host supervisor; its quiz service calls `send_response` and `edit_response` directly, including from background jobs.
 
 `@web("POST", "/path")` and `bind_web(app, adapter)` attach ordinary bound request methods to a host HTTP router. Auth, body limits, request services, transactions and native responses remain with that host. Shared services can serve Telegram, jobs and HTTP; a live request transaction must never live on shared `self`.
 
 ## Composition, inheritance and diagnostics
 
 `App().include(feature)` preserves feature order. `build_router()` returns a fresh native router for an existing dispatcher; the host wraps its runtime in `async with app.lifespan()`. `create_dispatcher()`/`run_polling()` own standalone startup, feature lifespans, shutdown and FSM cleanup. Pass `close_bot_session=True` only when transferring session ownership to polling. Resource factories unwind in reverse order, including partial startup failures.
+
+For a mixed bot whose native routing order must stay intact, `app.register(router, feature.command, feature.callback)` installs selected declared methods at that position. All stacked declarations are included in order; aliases, filters and flags remain on the methods. Services still come from native middleware. Register only methods of included features; duplicate registration on the same router is rejected. Each native router has one App owner so dependency defaults and ownership registries cannot mix. The host retains startup, shutdown and FSM ownership. A clean native handler needs no forwarding Feature merely to use platform delivery helpers.
 
 Use `App.run_polling()` as the polling owner. Cancelling it requests native stop and joins the poller and stop waiter before closing feature resources or an owned session; cancellation during startup unwinds startup before polling tasks are created. Repeated cancellation cannot abandon that cleanup. Resources enter and exit in the same task and context. The caller's cancellation or the error reported by aiogram remains primary if application cleanup also fails, with the cleanup failure attached as its cause. Native aiogram shutdown hooks retain aiogram's exception policy. A failed update drain leaves resources and the session open for the owner to finish shutdown. Stop or cancel and await the polling owner before separately calling `aclose()`.
 

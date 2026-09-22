@@ -4,8 +4,9 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
 import pytest
+from aiogram import Dispatcher, Router
 from aiogram.dispatcher.event.bases import SkipHandler
-from aiogram.filters import StateFilter
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -18,6 +19,116 @@ from teleforge.declarations import command, event
 from teleforge.feature import Feature
 from teleforge.isolation import IsolationError
 from teleforge.testing import RecordingBot
+
+
+async def test_feature_methods_interleave_with_native_routes_without_redeclaring_metadata() -> None:
+    seen: list[object] = []
+
+    class Tools(Feature):
+        @command("early", flags={"handler_key": "existing-key"})
+        async def early(self, count: int = 3, *, service: object) -> None:
+            seen.append((count, service))
+
+        @command("late")
+        async def late(self) -> None:
+            raise AssertionError("The earlier native route must win")
+
+    async def native(message: Message) -> None:
+        seen.append("native")
+
+    service = object()
+    feature = Tools()
+    app = App(feature, data={"service": service})
+    router = Router()
+    app.register(router, feature.early)
+    router.message.register(native, Command("late"))
+    app.register(router, feature.late)
+    assert router.message.handlers[0].flags["handler_key"] == "existing-key"
+    dispatcher = Dispatcher()
+    dispatcher.include_router(router)
+    bot = RecordingBot()
+    try:
+        await dispatcher.feed_update(bot, message_update("/early 7"))
+        await dispatcher.feed_update(bot, message_update("/late"))
+        assert seen == [(7, service), "native"]
+    finally:
+        await dispatcher.fsm.close()
+        await app.aclose()
+
+
+async def test_built_router_root_filters_receive_app_defaults_and_native_overrides() -> None:
+    feature, observed = Commands(), []
+    app = App(feature, data={"enabled": True})
+    router = app.build_router()
+
+    async def allow(message: Message, enabled: bool) -> bool:
+        observed.append(enabled)
+        return enabled
+
+    router.message.filter(allow)
+    dispatcher = Dispatcher(disable_fsm=True)
+    dispatcher.include_router(router)
+    try:
+        await dispatcher.feed_update(RecordingBot(), message_update("/ordinary"))
+        await dispatcher.feed_update(RecordingBot(), message_update("/ordinary"), enabled=False)
+        assert observed == [True, False] and feature.seen == ["ordinary"]
+    finally:
+        await dispatcher.fsm.close()
+        await app.aclose()
+
+
+def test_fragment_registration_rejects_foreign_and_duplicate_methods_before_mutation() -> None:
+    feature = Commands()
+    app, router = App(feature), Router()
+    with pytest.raises(ValueError, match="included"):
+        app.register(router, Commands().begin)
+    assert router.message.handlers == []
+    app.register(router, feature.begin)
+    with pytest.raises(ValueError, match="already registered"):
+        app.register(router, feature.ordinary, feature.begin)
+    assert len(router.message.handlers) == 1
+
+
+def test_fragment_registration_uses_feature_identity_without_custom_equality() -> None:
+    class EqualCommands(Commands):
+        def __eq__(self, other: object) -> bool:
+            return True
+
+    included, foreign = EqualCommands(), EqualCommands()
+    app, router = App(included), Router()
+    with pytest.raises(ValueError, match="included"):
+        app.register(router, foreign.begin)
+    assert router.message.handlers == []
+    app.register(router, included.begin)
+    assert len(router.message.handlers) == 1
+
+
+async def test_fragment_registration_rejects_a_second_app_owner_before_mutation() -> None:
+    seen = []
+
+    class Owned(Feature):
+        @command("owned")
+        async def run(self, ctx: MessageContext, *, service: str) -> None:
+            seen.append((service, ctx.data["_teleforge_card_locks"] is first._card_locks))
+
+    feature, other = Owned(), Owned()
+    first, second = App(feature, data={"service": "first"}), App(other, data={"service": "second"})
+    router = Router()
+    first.register(router, feature.run)
+    middleware = tuple(router.message.outer_middleware)
+    with pytest.raises(ValueError, match="only one App"):
+        second.register(router, other.run)
+    assert len(router.message.handlers) == 1
+    assert tuple(router.message.outer_middleware) == middleware
+    dispatcher = Dispatcher(disable_fsm=True)
+    dispatcher.include_router(router)
+    try:
+        await dispatcher.feed_update(RecordingBot(), message_update("/owned"))
+        assert seen == [("first", True)]
+    finally:
+        await dispatcher.fsm.close()
+        await first.aclose()
+        await second.aclose()
 
 
 def message_update(text: str, *, topic: int | None = None, update_id: int = 1) -> Update:

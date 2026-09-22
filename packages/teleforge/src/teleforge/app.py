@@ -5,6 +5,7 @@ import math
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from typing import Any, Literal, Self, cast
+from weakref import WeakKeyDictionary
 
 from aiogram import Bot, Dispatcher, Router
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
@@ -158,6 +159,7 @@ class App:
         self._updates_done.set()
         self._drain_timeout, self._cancel_timeout = drain_timeout, cancel_timeout
         self._polling_owned = False
+        self._registrations: WeakKeyDictionary[Router, set[str]] = WeakKeyDictionary()
 
     @asynccontextmanager
     async def _admit_update(self) -> AsyncIterator[None]:
@@ -250,33 +252,68 @@ class App:
         """Build a fresh native router for embedding; the host owns its lifecycle/FSM."""
         handlers = self.iter_handlers()
         root = Router(name="teleforge")
-        for observer in root.observers.values():
-            observer.outer_middleware(_Workflow(self))
+        self._register(root, ())
         for feature in self.features:
             router = Router(name=feature.key)
-            for compiled in handlers:
-                if compiled.feature is not feature or compiled.declaration.event is None:
-                    continue
-                declaration = compiled.declaration
-                assert declaration.event is not None
-                filters = list(declaration.filters)
-                if declaration.filter_factory is not None:
-                    filters.extend(declaration.filter_factory(feature))
-                if declaration.kind == "command":
-                    if not any(isinstance(item, StateFilter) for item in filters):
-                        filters.insert(0, StateFilter(None))
-                    custom_filter = declaration.metadata.get("_command_filter")
-                    filters.append(
-                        cast(NativeFilter, custom_filter)
-                        if custom_filter is not None
-                        else Command(*declaration.names, ignore_case=True)
-                    )
-                flags = dict(declaration.flags)
-                flags.setdefault("handler_key", compiled.key)
-                flags.setdefault("feature_key", feature.key)
-                router.observers[declaration.event].register(adapter_for(compiled), *filters, flags=flags)
+            self._register(
+                router,
+                tuple(item for item in handlers if item.feature is feature and item.declaration.event is not None),
+            )
             root.include_router(router)
         return root
+
+    def register(self, router: Router, *methods: Callable[..., Any]) -> None:
+        """Place declared methods among native routes without repeating their filters or flags."""
+        handlers = self.iter_handlers()
+        selected: list[CompiledHandler] = []
+        for method in methods:
+            matches = [
+                item
+                for item in handlers
+                if getattr(item.handler, "__self__", None) is getattr(method, "__self__", None)
+                and getattr(item.handler, "__func__", item.handler) is getattr(method, "__func__", method)
+                and item.declaration.event is not None
+            ]
+            if not matches:
+                raise ValueError("Register a declared Telegram method from a feature included in this app")
+            selected.extend(matches)
+        self._register(router, tuple(selected))
+
+    def _register(self, router: Router, handlers: tuple[CompiledHandler, ...]) -> None:
+        if any(
+            isinstance(middleware, _Workflow) and middleware.app is not self
+            for observer in router.observers.values()
+            for middleware in observer.outer_middleware
+        ):
+            raise ValueError("A native router can belong to only one App")
+        existing = self._registrations.get(router, set())
+        identities = [item.key for item in handlers]
+        if existing.intersection(identities) or len(identities) != len(set(identities)):
+            raise ValueError("A declared handler is already registered on this router")
+        if router not in self._registrations:
+            for observer in router.observers.values():
+                observer.outer_middleware(_Workflow(self))
+            self._registrations[router] = existing
+        for compiled in handlers:
+            declaration = compiled.declaration
+            assert declaration.event is not None
+            filters = list(declaration.filters)
+            if declaration.filter_factory is not None:
+                filters.extend(declaration.filter_factory(compiled.feature))
+            if declaration.kind == "command":
+                if not any(isinstance(item, StateFilter) for item in filters):
+                    filters.insert(0, StateFilter(None))
+                custom_filter = declaration.metadata.get("_command_filter")
+                filters.append(
+                    cast(NativeFilter, custom_filter)
+                    if custom_filter is not None
+                    else Command(*declaration.names, ignore_case=True)
+                )
+            flags = dict(declaration.flags)
+            flags.setdefault("handler_key", compiled.key)
+            flags.setdefault("feature_key", compiled.feature.key)
+            router.observers[declaration.event].register(adapter_for(compiled), *filters, flags=flags)
+            existing.add(compiled.key)
 
     def create_dispatcher(
         self,

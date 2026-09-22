@@ -2,25 +2,23 @@
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import AnswerCallbackQuery, EditMessageText, GetChatMember, SendMessage
 from aiogram.types import CallbackQuery, Chat, Message, Update, User
-from cachetools import TTLCache
 from teleforge.app import App
 from teleforge.testing import RecordingBot, RecordingSession
 
-from msu_hub_bot.commands.reactions import PERIODS, TITLES, Reactions
+from msu_hub_bot.commands.reactions import PERIODS, TITLES, ReactionCallback
 from msu_hub_bot.features.reactions import ReactionsFeature
 from telegram_helpers import make_message
-from test_reactions_command import scoreboard
+from test_reactions_command import reaction_repository, scoreboard
 
 
 @pytest.fixture
-async def reaction_feature(monkeypatch):
+async def reaction_feature():
     session = RecordingSession()
     options = SimpleNamespace(status=ChatMemberStatus.ADMINISTRATOR, edit_error=None)
 
@@ -33,11 +31,11 @@ async def reaction_feature(monkeypatch):
 
     session.responder = respond
     bot = RecordingBot(session=session, bot_id=123456789)
-    monkeypatch.setattr(Reactions, "permissions", TTLCache(maxsize=512, ttl=60))
-    repository = SimpleNamespace(reaction_scoreboard=AsyncMock(side_effect=lambda chat_id, *, days=30: scoreboard(days=days)))
-    feature = ReactionsFeature(repository)
+    repository = reaction_repository()
+    feature = ReactionsFeature()
     app = App(feature)
     dispatcher = app.create_dispatcher()
+    dispatcher["db"] = repository
     source = make_message(
         bot,
         message_id=100,
@@ -92,6 +90,7 @@ async def test_command_aliases_keep_copy_keyboard_and_reply_target(reaction_feat
     assert sent.reply_parameters.message_id == rig.source.message_id
     assert sent.message_thread_id == 17 and sent.link_preview_options.is_disabled
     assert [len(row) for row in card.reply_markup.inline_keyboard] == [2, 2, 3, 1]
+    assert all(button.callback_data.startswith("react:") for row in card.reply_markup.inline_keyboard for button in row)
     assert all(len(button.callback_data.encode()) <= 64 for row in card.reply_markup.inline_keyboard for button in row)
     compiled = rig.app.build_router().sub_routers[0]
     assert compiled.message.handlers[0].flags["handler_key"] == "Reactions.process"
@@ -137,14 +136,17 @@ async def test_private_command_keeps_group_guidance_without_storage(reaction_fea
 
 
 @pytest.mark.parametrize("change", [{"chat": Chat(id=-100999999999, type="supergroup")}, {"message_thread_id": 18}])
-async def test_copied_card_data_cannot_read_another_chat_or_topic(reaction_feature, change):
+async def test_native_payload_uses_telegram_actual_clicked_chat_and_topic(reaction_feature, change):
     rig = reaction_feature
     card = await open_card(rig)
     rig.repository.reaction_scoreboard.reset_mock()
     start = len(rig.bot.requests)
-    await rig.dispatcher.feed_update(rig.bot, click(rig, card.model_copy(update=change)))
-    rig.repository.reaction_scoreboard.assert_not_awaited()
-    assert not any(isinstance(request, EditMessageText) for request in rig.bot.requests[start:])
+    actual = card.model_copy(update=change)
+    await rig.dispatcher.feed_update(rig.bot, click(rig, actual, data="react:getters:30"))
+    rig.repository.reaction_scoreboard.assert_awaited_once_with(actual.chat.id, days=30)
+    edited = next(request for request in rig.bot.requests[start:] if isinstance(request, EditMessageText))
+    assert (edited.chat_id, edited.message_id) == (actual.chat.id, actual.message_id)
+    assert ReactionCallback.unpack(edited.reply_markup.inline_keyboard[-1][0].callback_data).view == "getters"
 
 
 async def test_overlapping_public_refreshes_acknowledge_both_and_only_query_once(reaction_feature):

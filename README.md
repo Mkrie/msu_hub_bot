@@ -91,8 +91,8 @@ cp .env.example .env
 
 The [TeleForge package](packages/teleforge/) provides feature classes, typed inputs,
 managed cards and native aiogram composition. Its [authoring guide](packages/teleforge/docs/index.md)
-and [bot adapters](src/msu_hub_bot/features/) show explicit integration boundaries;
-the production router is composed separately in `routing.py`.
+and [bot features](src/msu_hub_bot/features/) show reusable inputs and presentation;
+`routing.py` places their declared methods among native routes without duplicating filters.
 Run its additional checks with `uv run pytest -q packages/teleforge/tests` and
 `uv run mypy --config-file packages/teleforge/pyproject.toml packages/teleforge/src/teleforge packages/teleforge/examples examples`.
 

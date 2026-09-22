@@ -7,7 +7,7 @@ import pytest
 from aiogram.types import CallbackQuery, Chat, Document, Message, PhotoSize, User
 
 from teleforge.context import context_for
-from teleforge.inputs import Argument, DocumentInput, ImageInput, InputError, TextInput, prepare_arguments
+from teleforge.inputs import Argument, DocumentInput, ImageInput, InputError, MediaInput, TextInput, prepare_arguments
 from teleforge.testing import RecordingBot
 
 
@@ -156,6 +156,36 @@ async def test_native_media_respects_known_size_budget_without_downloading():
     with pytest.raises(InputError, match="too large"):
         async with prepare_arguments(handler, event, context_for(bot, event), {}, {"image": ImageInput(max_bytes=1)}):
             pytest.fail("Oversized native input reached handler")
+    assert not bot.requests
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subtype", ["jpeg", "png", "tiff", "bmp", "gif", "webp"])
+async def test_image_document_acquisition_keeps_supported_raster_types(subtype):
+    async def handler(media: Document):
+        pass
+
+    attachment = Document(file_id="image", file_unique_id="i", mime_type=f"image/{subtype}")
+    event = message(document=attachment)
+    bot = RecordingBot()
+    async with prepare_arguments(
+        handler, event, context_for(bot, event), {}, {"media": MediaInput(kinds=("image",))}
+    ) as values:
+        assert values["media"] is attachment
+    assert not bot.requests
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rule", [DocumentInput(), MediaInput()])
+async def test_raw_document_acquisition_still_accepts_svg(rule):
+    async def handler(media: Document):
+        pass
+
+    attachment = Document(file_id="svg", file_unique_id="s", mime_type="image/svg+xml")
+    event = message(document=attachment)
+    bot = RecordingBot()
+    async with prepare_arguments(handler, event, context_for(bot, event), {}, {"media": rule}) as values:
+        assert values["media"] is attachment
     assert not bot.requests
 
 

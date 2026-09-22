@@ -3,12 +3,22 @@ from __future__ import annotations
 import asyncio
 import io
 from datetime import UTC, datetime
-from typing import Annotated, Literal
+from typing import Annotated, ClassVar, Literal
 
 import pytest
+from aiogram.filters.callback_data import CallbackData
 from aiogram.methods import AnswerCallbackQuery, EditMessageText, SendMessage
-from aiogram.types import CallbackQuery, Chat, InlineKeyboardButton, Message, MessageEntity, Update, User
-from pydantic import AfterValidator
+from aiogram.types import (
+    CallbackQuery,
+    Chat,
+    InaccessibleMessage,
+    InlineKeyboardButton,
+    Message,
+    MessageEntity,
+    Update,
+    User,
+)
+from pydantic import AfterValidator, field_validator
 
 from teleforge.app import App
 from teleforge.binding import invoke_handler
@@ -147,7 +157,7 @@ async def test_concurrent_different_buttons_share_ui_lock() -> None:
     assert feature.max_active == 1 and feature.revision == 1
 
 
-@pytest.mark.parametrize("alteration", ["actor", "message", "topic", "chat", "bot"])
+@pytest.mark.parametrize("alteration", ["actor", "message", "topic", "chat"])
 async def test_application_guards_and_native_ui_boundary(alteration: str) -> None:
     bot, feature = RecordingBot(), Counter()
     ui, callbacks = await open_card(bot, feature)
@@ -158,8 +168,6 @@ async def test_application_guards_and_native_ui_boundary(alteration: str) -> Non
         update["message_thread_id"] = 9
     elif alteration == "chat":
         update["chat"] = Chat(id=-200, type="supergroup")
-    elif alteration == "bot":
-        update["from_user"] = User(id=99, is_bot=True, first_name="Other bot")
     with pytest.raises((PermissionError, CardError)):
         await click(bot, feature, ui.model_copy(update=update), callbacks[0], actor=8 if alteration == "actor" else 7)
     assert feature.value == 0
@@ -610,5 +618,177 @@ async def test_preview_delivery_barrier_survives_preparation_and_explicit_refres
         await app.feed_update(bot, update_for(payload_of(prepared), update_id=2))
         assert feature.submissions == 1
         assert len([request for request in bot.requests if isinstance(request, EditMessageText)]) == 1
+    finally:
+        await app.aclose()
+
+
+class NativeAction(CallbackData, prefix="native"):
+    item: int
+    delta: int = 1
+    validations: ClassVar[int] = 0
+
+    @field_validator("item")
+    @classmethod
+    def count_validation(cls, value: int) -> int:
+        cls.validations += 1
+        return value
+
+
+async def test_native_schema_preserves_old_wire_after_renames_and_dependency_additions() -> None:
+    class Before(Feature, key="native-before"):
+        @card
+        def panel(self, item: int) -> Card:
+            return Card("Before", buttons=((Button("+", self.increase, delta=1),),))
+
+        @action(key="increase", card="panel", payload=NativeAction)
+        async def increase(self, item: int, delta: int) -> None:
+            pass
+
+    class After(Feature, key="native-after"):
+        @card
+        def renamed_panel(self, item: int, *, store: CardStore) -> Card:
+            store.rendered.append(item)
+            native = InlineKeyboardButton(text="+", callback_data=NativeAction(item=item).pack())
+            return Card(f"Value {store.value}", buttons=((native,),))
+
+        @action(key="renamed", card="renamed_panel", payload=NativeAction, ack="early")
+        async def renamed_action(self, item: int, delta: int, *, store: CardStore) -> None:
+            assert item == 3
+            store.value += delta
+
+    old = await prepare_card(Before().panel, item=3)
+    assert payload_of(old) == "native:3:1"
+    feature, store = After(), CardStore()
+    assert payload_of(await prepare_card(feature.renamed_panel, item=3, data={"store": store})) == payload_of(old)
+    app = App(feature, data={"store": store, "item": 999, "delta": 999})
+    bot = RecordingBot()
+    NativeAction.validations = 0
+    try:
+        await app.feed_update(bot, update_for(payload_of(old)))
+        assert store.value == 1 and store.rendered == [3, 3]
+        # One unpack and one new native button construction; binding/rendering
+        # do not run the native validator again on an already validated payload.
+        assert NativeAction.validations == 2
+        assert isinstance(bot.requests[0], AnswerCallbackQuery)
+        edit = next(request for request in bot.requests if isinstance(request, EditMessageText))
+        assert edit.text == "Value 1" and edit.message_id == 10
+        assert edit.reply_markup is not None
+        assert edit.reply_markup.inline_keyboard[0][0].callback_data == "native:3:1"
+    finally:
+        await app.aclose()
+
+
+@pytest.mark.parametrize("wire", ["native:x:1", "native:3", "native:3:1:2", "other:3:1", "native:3:" + "1" * 60])
+async def test_native_invalid_wire_never_invokes_action_or_renderer(wire: str) -> None:
+    class Native(Feature):
+        @card
+        def panel(self, item: int) -> Card:
+            pytest.fail("renderer must not run")
+
+        @action(key="go", card="panel", payload=NativeAction)
+        async def go(self, item: int) -> None:
+            pytest.fail("action must not run")
+
+    app, bot = App(Native()), RecordingBot()
+    try:
+        await app.feed_update(bot, update_for(wire))
+        assert not bot.requests
+    finally:
+        await app.aclose()
+
+
+@pytest.mark.parametrize("field", ["missing", "type"])
+async def test_native_card_schema_errors_agree_before_send(field: str) -> None:
+    class Wrong(CallbackData, prefix="wrong"):
+        item: str
+
+    class Missing(CallbackData, prefix="missing"):
+        other: int
+
+    class Broken(Feature):
+        @card
+        def panel(self, item: int) -> Card:
+            return Card("Broken", buttons=((Button("Go", self.go),),))
+
+        @action(key="go", card="panel", payload=Missing if field == "missing" else Wrong)
+        async def go(self) -> None:
+            pass
+
+    feature = Broken()
+    app = App(feature)
+    errors = app.check()
+    assert errors
+    with pytest.raises(CompilationError):
+        app.build_router()
+    with pytest.raises(CardError, match="native CallbackData field") as prepared:
+        await prepare_card(feature.panel, item=1)
+    assert any(error.message == str(prepared.value) for error in errors)
+
+
+async def test_native_button_rejects_unknown_arguments_and_wire_overflow() -> None:
+    class Label(CallbackData, prefix="label"):
+        value: str
+
+    class Native(Feature):
+        @card
+        def panel(self) -> Card:
+            return Card("Panel")
+
+        @action(key="go", card="panel", payload=Label)
+        async def go(self, value: str) -> None:
+            pass
+
+    feature = Native()
+    with pytest.raises(CardError, match="Unknown"):
+        await prepare_card(Card(buttons=((Button("Go", feature.go, value="x", typo=1),),)))
+    with pytest.raises(CardError, match="native card"):
+        await prepare_card(Card(buttons=((Button("Go", feature.go, value="x" * 70),),)))
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("source", ["inline", "inaccessible", "other-bot", "missing-author"])
+async def test_unavailable_card_source_guides_without_action_or_presentation(native: bool, source: str) -> None:
+    class Guarded(Feature):
+        @card
+        def panel(self, item: int) -> Card:
+            pytest.fail("unavailable source must not reach renderer")
+
+        @action(key="go", card="panel", payload=NativeAction if native else None)
+        async def go(self, item: int) -> None:
+            pytest.fail("unavailable source must not reach domain action")
+
+    feature = Guarded()
+    data = payload_of(await prepare_card(Card(buttons=((Button("Go", feature.go, item=3),),))))
+    incoming = update_for(data)
+    query = incoming.callback_query
+    assert query is not None
+    if source == "inline":
+        query = query.model_copy(update={"message": None, "inline_message_id": "inline-card"})
+    elif source == "inaccessible":
+        query = query.model_copy(
+            update={"message": InaccessibleMessage(chat=Chat(id=-100, type="supergroup"), message_id=10, date=0)}
+        )
+    else:
+        ui = message(actor=99) if source == "other-bot" else message().model_copy(update={"from_user": None})
+        query = query.model_copy(update={"message": ui})
+    app = App(feature, input_formatter=lambda issue: "Open again: " + issue.code)
+    bot = RecordingBot()
+    outcomes = []
+    dispatcher = app.create_dispatcher()
+
+    async def observe(handler, event, values):
+        try:
+            return await handler(event, values)
+        finally:
+            outcomes.append(values["teleforge_invocation"].outcome)
+
+    dispatcher.callback_query.middleware(observe)
+    try:
+        await dispatcher.feed_update(bot, incoming.model_copy(update={"callback_query": query}))
+        assert len(bot.requests) == 1
+        assert isinstance(bot.requests[0], AnswerCallbackQuery)
+        assert bot.requests[0].text == "Open again: callback-invalid" and bot.requests[0].show_alert
+        assert not outcomes[0].handler_returned and not outcomes[0].presentations
+        assert outcomes[0].acknowledgement.confirmed and outcomes[0].input_issue.code == "callback-invalid"
     finally:
         await app.aclose()

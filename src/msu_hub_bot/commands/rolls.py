@@ -50,16 +50,6 @@ def get_roll(digits: int) -> Tuple[str, str]:
     return roll, name
 
 
-async def process_roll(message: Message, meta: MetaInfo) -> Message | bool:
-    args = meta.arguments
-    digits = min(max(int(args[0]), 1), 100) if len(args) > 0 and args[0].isdigit() else 3
-
-    roll, name = get_roll(digits)
-    note = f" — {name}" if name else ""
-
-    return await message.reply(hcode(roll) + note)
-
-
 async def process_random(message: Message, meta: MetaInfo) -> Message | bool:
     args = meta.arguments
     if len(args) > 1:
@@ -250,11 +240,6 @@ async def process_d6(message: Message, meta: MetaInfo) -> Message | bool:
     dices = " ".join(r[1] for r in result)
 
     return await message.reply(text=f"{dices} | {dices_sum} ({count * len(d6)})")
-
-
-async def process_dice(message: Message) -> Message | bool:
-    dices = (DiceEmoji.DICE, DiceEmoji.DART, DiceEmoji.BASKETBALL, DiceEmoji.FOOTBALL, DiceEmoji.SLOT_MACHINE)
-    return await message.reply_dice(emoji=random.choice(dices))
 
 
 async def process_others_dice(message: Message) -> Message | bool:

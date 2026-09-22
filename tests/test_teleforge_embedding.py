@@ -40,6 +40,7 @@ async def test_real_host_state_scopes_allow_same_user_refresh_coalescing(reactio
     rig = reaction_feature
     async with embed(rig.app) as dispatcher:
         rig.dispatcher = dispatcher
+        dispatcher["db"] = rig.repository
         ui = await open_card(rig)
         started, release = asyncio.Event(), asyncio.Event()
         original = rig.repository.reaction_scoreboard.side_effect
