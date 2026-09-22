@@ -18,6 +18,7 @@ from .context import MessageContext as MessageContext
 from .conversations import ConversationError as ConversationError
 from .conversations import enter as enter
 from .conversations import leave as leave
+from .conversations import read_draft as read_draft
 from .conversations import step as step
 from .declarations import callback as callback
 from .declarations import chosen_inline_result as chosen_inline_result

@@ -7,7 +7,7 @@ from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 from aiogram.utils.formatting import Bold, Pre, Text
-from teleforge import CallbackContext, Feature, MessageContext, callback, command, edited_message, enter, leave, step
+from teleforge import CallbackContext, Feature, MessageContext, callback, command, edited_message, enter, leave, read_draft, step
 
 from msu_hub_bot.commands.prog import ProgCallback, ProgCompiler, StdinDraft, code_submit, stdin_source
 from msu_hub_bot.features.command import HubCommand, command as hub_command
@@ -43,6 +43,9 @@ class Compiler(Feature, key="compiler"):
             if current != "teleforge:compiler:stdin":
                 await ctx.answer("💁🏻‍♂️ Вы не в процессе ввода")
                 return
+            draft = await read_draft(ctx, StdinDraft)
+            with suppress(TelegramBadRequest):
+                await ctx.bot.delete_message(draft.chat_id, draft.inform_message_id)
             await leave(ctx)
             await ctx.answer("🆗 Ввод отменён")
             return
@@ -77,6 +80,7 @@ class Compiler(Feature, key="compiler"):
         with suppress(TelegramBadRequest):
             await ctx.bot.delete_message(draft.chat_id, draft.inform_message_id)
         await leave(ctx)
+        await ctx.release_isolation()
         header = Text(Bold(draft.prog_lang), " | ", Bold(LANGUAGES[draft.prog_lang][1][-1][0]), "\n\n")
         progress = await ctx.reply(Text(header, "🔄 Ожидание..."), fixed=True)
         assert isinstance(progress, Message)

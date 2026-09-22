@@ -63,11 +63,46 @@ def _step(method: Callable[..., Any]) -> tuple[Feature, Declaration]:
     return feature, declarations[0]
 
 
-def _draft(model: type[BaseModel], value: object) -> BaseModel:
+def _draft[DraftModel: BaseModel](model: type[DraftModel], value: object) -> DraftModel:
     try:
         return model.model_validate_json(json.dumps(value, allow_nan=False), strict=True)
     except (TypeError, ValueError, ValidationError) as exc:
         raise ConversationError("The conversation draft does not match its declared model") from exc
+
+
+async def _read_draft[DraftModel: BaseModel](
+    ctx: Context, model: type[DraftModel], *, expected_state: str | None = None
+) -> DraftModel:
+    if not inspect.isclass(model) or not issubclass(model, BaseModel):
+        raise ConversationError("A conversation draft must use a Pydantic model")
+    state = _state(ctx)
+    current = await state.get_state()
+    if expected_state is not None and current != expected_state:
+        raise ConversationError("The conversation has already changed")
+    if current is None or not current.startswith(_PREFIX):
+        raise ConversationError("There is no active managed conversation step")
+    envelope = (await state.get_data()).get(_DRAFT)
+    if (
+        not isinstance(envelope, dict)
+        or not isinstance(envelope.get("feature"), str)
+        or not isinstance(envelope.get("step"), str)
+        or not envelope["feature"]
+        or not envelope["step"]
+        or current != f"{_PREFIX}{envelope['feature']}:{envelope['step']}"
+        or "value" not in envelope
+    ):
+        raise ConversationError("The saved draft belongs to a different conversation step")
+    return _draft(model, envelope["value"])
+
+
+async def read_draft[DraftModel: BaseModel](ctx: Context, model: type[DraftModel]) -> DraftModel:
+    """Read an active, scope-checked draft before leaving or releasing isolation.
+
+    The caller selects the intended step with its route/state check. This reader
+    verifies that the saved envelope agrees with the active managed state and
+    strictly validates its value using the supplied model, without changing FSM data.
+    """
+    return await _read_draft(ctx, model)
 
 
 async def enter(ctx: Context, destination: Callable[..., Any], draft: BaseModel) -> None:
@@ -114,18 +149,7 @@ def step(name: str, *, draft: type[BaseModel], event: str = "message") -> Callab
         async def hook(
             feature: Feature, ctx: Context, data: dict[str, Any], invoke: Callable[[], Awaitable[object]]
         ) -> object:
-            state = _state(ctx)
-            if await state.get_state() != _name(feature, name):
-                raise ConversationError("The conversation has already changed")
-            envelope = (await state.get_data()).get(_DRAFT)
-            if (
-                not isinstance(envelope, dict)
-                or envelope.get("feature") != feature.key
-                or envelope.get("step") != name
-                or "value" not in envelope
-            ):
-                raise ConversationError("The saved draft belongs to a different conversation step")
-            data["draft"] = _draft(draft, envelope["value"])
+            data["draft"] = await _read_draft(ctx, draft, expected_state=_name(feature, name))
             return await invoke()
 
         attach_declaration(

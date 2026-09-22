@@ -7,12 +7,13 @@ import pytest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Chat, DirectMessagesTopic, Message, User
+from aiogram.types import Chat, DirectMessagesTopic, Message, Update, User
 from pydantic import BaseModel, ConfigDict
 
+from teleforge import App, IsolationError
 from teleforge.context import Context
-from teleforge.conversations import ConversationError, enter, leave, step
-from teleforge.declarations import declarations_of
+from teleforge.conversations import ConversationError, enter, leave, read_draft, step
+from teleforge.declarations import command, declarations_of
 from teleforge.feature import Feature
 from teleforge.testing import RecordingBot
 
@@ -76,6 +77,8 @@ async def test_saved_draft_is_strictly_validated_before_handler(value: dict[str,
     await state.update_data({"__teleforge_draft__": {"feature": "titles", "step": "title", "value": value}})
     with pytest.raises(ConversationError, match="draft"):
         await invoke(ctx, feature)
+    with pytest.raises(ConversationError, match="draft"):
+        await read_draft(ctx, Draft)
     assert feature.seen == []
 
 
@@ -86,6 +89,8 @@ async def test_fsm_key_must_match_actor_chat_topic_and_bot(field: str, value: in
     ctx.data["state"] = FSMContext(MemoryStorage(), StorageKey(**values))  # type: ignore[arg-type]
     with pytest.raises(ConversationError, match="isolate"):
         await enter(ctx, feature.title, Draft(source_id=12))
+    with pytest.raises(ConversationError, match="isolate"):
+        await read_draft(ctx, Draft)
 
 
 async def test_other_feature_or_step_draft_is_never_dispatched() -> None:
@@ -188,3 +193,54 @@ async def test_enter_does_not_take_over_another_active_workflow(active: str) -> 
         await enter(ctx, feature.title, Draft(source_id=12))
     assert await state.get_state() == active
     assert await state.get_data() == before
+
+
+async def test_read_draft_is_typed_and_does_not_modify_state() -> None:
+    ctx, feature = context(), Titles()
+    state: FSMContext = ctx.data["state"]
+    await state.update_data({"application": "preserved"})
+    await enter(ctx, feature.title, Draft(source_id=12))
+    before = await state.get_data()
+    draft = await read_draft(ctx, Draft)
+    assert isinstance(draft, Draft) and draft.source_id == 12
+    assert await state.get_state() == "teleforge:titles:title"
+    assert await state.get_data() == before
+    await leave(ctx)
+    with pytest.raises(ConversationError, match="no active"):
+        await read_draft(ctx, Draft)
+    assert await state.get_data() == {"application": "preserved"}
+
+
+@pytest.mark.parametrize("active", [None, "native:payment", "teleforge:other:title"])
+async def test_read_draft_requires_active_state_and_matching_envelope(active: str | None) -> None:
+    ctx, feature = context(), Titles()
+    state: FSMContext = ctx.data["state"]
+    await enter(ctx, feature.title, Draft(source_id=12))
+    await state.set_state(active)
+    with pytest.raises(ConversationError):
+        await read_draft(ctx, Draft)
+
+
+async def test_read_draft_rejects_the_wrong_requested_model() -> None:
+    class OtherDraft(BaseModel):
+        text: str
+
+    ctx, feature = context(), Titles()
+    await enter(ctx, feature.title, Draft(source_id=12))
+    with pytest.raises(ConversationError, match="declared model"):
+        await read_draft(ctx, OtherDraft)
+
+
+async def test_read_draft_is_rejected_after_native_isolation_release() -> None:
+    class Workflow(Titles):
+        @command("open")
+        async def open(self, ctx: Context) -> None:
+            await enter(ctx, self.title, Draft(source_id=12))
+            await ctx.release_isolation()
+            await read_draft(ctx, Draft)
+
+    ctx = context()
+    event = ctx.event.model_copy(update={"text": "/open"})
+    async with App(Workflow()) as app:
+        with pytest.raises(IsolationError, match="after terminal"):
+            await app.feed_update(ctx.bot, Update(update_id=1, message=event))
