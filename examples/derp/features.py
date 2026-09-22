@@ -1,12 +1,16 @@
-"""Derp product entrypoints without provider, pricing or persistence decisions."""
+"""Simple Derp-facing text, inline and payment routing examples."""
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
 from aiogram import F
 from aiogram.methods import AnswerInlineQuery, AnswerPreCheckoutQuery
 from aiogram.types import (
+    Animation,
+    Audio,
     ChosenInlineResult,
+    Document,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQuery,
@@ -15,14 +19,17 @@ from aiogram.types import (
     Message,
     PhotoSize,
     PreCheckoutQuery,
+    Sticker,
+    Video,
+    VideoNote,
+    Voice,
 )
 from pydantic import BaseModel, ConfigDict, Field
 from teleforge import (
     App,
     Context,
     Feature,
-    ImageInput,
-    InputError,
+    MediaInput,
     MessageContext,
     TextInput,
     chosen_inline_result,
@@ -32,6 +39,15 @@ from teleforge import (
     job,
     pre_checkout_query,
 )
+
+type NativeMedia = PhotoSize | Document | Sticker | Video | Animation | VideoNote | Audio | Voice
+
+
+class ContextHistory(Protocol):
+    """Already-selected model messages for this simple text-response example."""
+
+    @property
+    def messages(self) -> Sequence[object]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,11 +61,9 @@ class RequestScope:
     business_connection_id: str | None = None
 
 
-def _scope(ctx: MessageContext, prompt: str) -> RequestScope:
-    if not prompt.strip():
-        raise InputError("Send a prompt or reply to the text you want to use.")
-    if ctx.user is None or not isinstance(ctx.event, Message):
-        raise InputError("This request needs an identifiable sender.")
+def _scope(ctx: MessageContext) -> RequestScope:
+    if ctx.user is None:
+        raise ValueError("An identified sender is required after access validation")
     message = ctx.event
     return RequestScope(
         request_key=f"message:{ctx.bot.id}:{message.business_connection_id or '-'}:{message.chat.id}:{message.message_id}",
@@ -61,18 +75,51 @@ def _scope(ctx: MessageContext, prompt: str) -> RequestScope:
 
 
 class AnswerService(Protocol):
-    async def answer(self, prompt: str, scope: RequestScope) -> str:
-        """Derp owns model selection, context, access and request deduplication."""
+    async def answer(
+        self,
+        prompt: str,
+        scope: RequestScope,
+        *,
+        message: Message | None = None,
+        media: NativeMedia | None = None,
+        media_message: Message | None = None,
+        recent_messages: Sequence[object] = (),
+    ) -> str:
+        """Example text-response service with opaque application-owned history.
+
+        The host selects recent context within its topic/privacy/token budget;
+        this adapter neither serializes a prompt transcript nor downloads media.
+        Inline input has no chat or history. Derp's full native chat handler,
+        accounting, hydrated history and multiple outputs stay in the host.
+        """
         ...
 
 
 class Assistant(Feature, key="derp.assistant"):
-    def __init__(self, answers: AnswerService) -> None:
+    def __init__(self, answers: AnswerService, *, translate: Callable[[str], str] = str) -> None:
         self.answers = answers
+        self.tr = translate
 
-    @command("ask", "derp", prompt=TextInput(reply=True))
-    async def ask(self, ctx: MessageContext, prompt: str) -> str:
-        return await self.answers.answer(prompt, _scope(ctx, prompt))
+    @command("ask", "derp", prompt=TextInput(reply=True), media=MediaInput(reply=True))
+    async def ask(
+        self, ctx: MessageContext, prompt: str = "", media: NativeMedia | None = None, *, history: ContextHistory | None = None
+    ) -> str | None:
+        if ctx.user is None:
+            await ctx.guide(self.tr("I couldn't verify your account. Try again."))
+            return None
+        if not prompt.strip() and media is None:
+            await ctx.guide(self.tr("Send a prompt or reply to the text or media you want to use."))
+            return None
+        # Reply to the invocation even when its image or context came from a reply.
+        ctx.response_target = ctx.event
+        return await self.answers.answer(
+            prompt,
+            _scope(ctx),
+            message=ctx.event,
+            media=media,
+            media_message=ctx.input_sources.get("media"),
+            recent_messages=history.messages if history is not None else (),
+        )
 
     @inline_query()
     async def offer_inline(self, ctx: Context, event: InlineQuery) -> AnswerInlineQuery:
@@ -80,11 +127,11 @@ class Assistant(Feature, key="derp.assistant"):
             return event.answer([], cache_time=0, is_personal=True)
         article = InlineQueryResultArticle(
             id="answer",
-            title="Ask Derp",
-            input_message_content=InputTextMessageContent(message_text="Preparing your answer…", parse_mode=None),
+            title=self.tr("Ask Derp"),
+            input_message_content=InputTextMessageContent(message_text=self.tr("Preparing your answer…"), parse_mode=None),
             # Telegram supplies inline_message_id for the selected result with a keyboard.
             reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="Ask another", switch_inline_query_current_chat="")]]
+                inline_keyboard=[[InlineKeyboardButton(text=self.tr("Ask another"), switch_inline_query_current_chat="")]]
             ),
         )
         return event.answer([article], cache_time=0, is_personal=True)
@@ -100,33 +147,6 @@ class Assistant(Feature, key="derp.assistant"):
         )
         answer = await self.answers.answer(result.query, scope)
         await ctx.edit(answer, kind="text")
-
-
-@dataclass(frozen=True, slots=True)
-class CreatedImage:
-    data: bytes
-    caption: str | None = None
-
-
-class ImageService(Protocol):
-    async def create(self, prompt: str, scope: RequestScope, *, source: PhotoSize | None = None) -> CreatedImage:
-        """A real service may authorize or defer work; no fabricated agent transcript is needed."""
-        ...
-
-
-class Images(Feature, key="derp.images"):
-    def __init__(self, images: ImageService) -> None:
-        self.images = images
-
-    @command("imagine", "image", prompt=TextInput(reply=True))
-    async def imagine(self, ctx: MessageContext, prompt: str) -> None:
-        result = await self.images.create(prompt, _scope(ctx, prompt))
-        await ctx.reply(result.caption, photo=result.data)
-
-    @command("edit", prompt=TextInput(reply=False), source=ImageInput(reply=True))
-    async def edit(self, ctx: MessageContext, prompt: str, source: PhotoSize) -> None:
-        result = await self.images.create(prompt, _scope(ctx, prompt), source=source)
-        await ctx.reply(result.caption, photo=result.data)
 
 
 class RecoverPayment(BaseModel):
@@ -166,5 +186,6 @@ class Commerce(Feature, key="derp.commerce"):
         await self.payments.recover(payload.receipt_id)
 
 
-def create_app(answers: AnswerService, images: ImageService, payments: Payments) -> App:
-    return App(Assistant(answers), Images(images), Commerce(payments))
+def create_app(answers: AnswerService, payments: Payments) -> App:
+    """Build the simple answer/commerce sample; native paid images are optional."""
+    return App(Assistant(answers), Commerce(payments))

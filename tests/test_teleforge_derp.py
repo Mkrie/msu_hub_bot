@@ -1,26 +1,31 @@
 """Native dispatch proof for Derp's application-owned service boundaries."""
 
 import asyncio
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import pytest
-from aiogram.methods import AnswerInlineQuery, AnswerPreCheckoutQuery, EditMessageText, SendMessage, SendRichMessage
+from aiogram.methods import AnswerInlineQuery, AnswerPreCheckoutQuery, EditMessageText, SendMessage
 from aiogram.types import (
     Chat,
     ChosenInlineResult,
+    Document,
     InlineQuery,
     Message,
     PhotoSize,
     PreCheckoutQuery,
     SuccessfulPayment,
+    Voice,
     Update,
     User,
 )
 from pydantic import ValidationError
+from teleforge import App
 from teleforge.jobs import JobHandler, bind_jobs
 from teleforge.testing import RecordingBot
 
-from examples.derp.features import CreatedImage, RequestScope, create_app
+from examples.derp.features import Assistant, NativeMedia, RequestScope, create_app
 
 ACTOR = User(id=700, is_bot=False, first_name="User")
 
@@ -43,19 +48,21 @@ def incoming(text: str | None = None, **fields: object) -> Message:
 class Answers:
     def __init__(self) -> None:
         self.calls: list[tuple[str, RequestScope]] = []
+        self.inputs: list[tuple[Message | None, NativeMedia | None, Message | None, Sequence[object]]] = []
 
-    async def answer(self, prompt: str, scope: RequestScope) -> str:
+    async def answer(
+        self,
+        prompt: str,
+        scope: RequestScope,
+        *,
+        message: Message | None = None,
+        media: NativeMedia | None = None,
+        media_message: Message | None = None,
+        recent_messages: Sequence[object] = (),
+    ) -> str:
         self.calls.append((prompt, scope))
+        self.inputs.append((message, media, media_message, recent_messages))
         return f"Answer to: {prompt}"
-
-
-class Images:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, RequestScope, PhotoSize | None]] = []
-
-    async def create(self, prompt: str, scope: RequestScope, *, source: PhotoSize | None = None) -> CreatedImage:
-        self.calls.append((prompt, scope, source))
-        return CreatedImage(b"synthetic image bytes", "Created image")
 
 
 class Payments:
@@ -108,8 +115,8 @@ class Worker:
 
 
 async def test_text_creation_preserves_actor_request_and_topic_with_native_reply() -> None:
-    answers, images, payments, bot = Answers(), Images(), Payments(), RecordingBot()
-    async with create_app(answers, images, payments) as app:
+    answers, payments, bot = Answers(), Payments(), RecordingBot()
+    async with create_app(answers, payments) as app:
         await app.feed_update(bot, Update(update_id=1, message=incoming("/ask explain <b>this</b>")))
     assert answers.calls == [
         ("explain <b>this</b>", RequestScope("message:42:example-business:-100321:20", 700, -100321, 17, "example-business"))
@@ -119,29 +126,98 @@ async def test_text_creation_preserves_actor_request_and_topic_with_native_reply
     assert sent[0].text == "Answer to: explain <b>this</b>"
     assert sent[0].parse_mode is None
     assert sent[0].message_thread_id == 17
-    assert not images.calls and not payments.updates
+    assert not payments.updates
 
 
-async def test_image_create_and_edit_share_service_without_agent_transcript_or_download() -> None:
-    answers, images, payments, bot = Answers(), Images(), Payments(), RecordingBot()
-    photo = PhotoSize(file_id="telegram-photo", file_unique_id="unique-photo", width=64, height=64)
-    source = incoming(None, message_id=9, photo=[photo])
-    async with create_app(answers, images, payments) as app:
-        await app.feed_update(bot, Update(update_id=1, message=incoming("/imagine a fox")))
-        await app.feed_update(bot, Update(update_id=2, message=incoming("/edit make it blue", message_id=21, reply_to_message=source)))
-    assert [(prompt, item.file_id if item else None) for prompt, _scope, item in images.calls] == [
-        ("a fox", None),
-        ("make it blue", "telegram-photo"),
-    ]
-    assert all(scope.actor_id == 700 and scope.thread_id == 17 for _prompt, scope, _photo in images.calls)
-    assert len([method for method in bot.requests if isinstance(method, SendRichMessage)]) == 2
+@dataclass(frozen=True)
+class LoadedHistory:
+    messages: tuple[object, ...]
+
+
+@pytest.mark.parametrize(
+    "attachment",
+    [
+        {"document": Document(file_id="pdf", file_unique_id="pdf-1", mime_type="application/pdf")},
+        {"voice": Voice(file_id="voice", file_unique_id="voice-1", duration=4, mime_type="audio/ogg")},
+        {"photo": [PhotoSize(file_id="photo", file_unique_id="photo-1", width=64, height=64)]},
+    ],
+)
+async def test_contextual_followup_keeps_native_media_history_and_current_reply_target(attachment: dict[str, object]) -> None:
+    answers, bot = Answers(), RecordingBot()
+    source = incoming(None, message_id=9, **attachment)
+    message = incoming("/ask explain the previous answer using this", reply_to_message=source)
+    # Opaque native model messages are selected by the host history service.
+    # The adapter must not turn them into strings, drop tools, or choose history.
+    native_model_message = object()
+    history = LoadedHistory((native_model_message,))
+    async with create_app(answers, Payments()) as app:
+        await app.feed_update(bot, Update(update_id=1, message=message), history=history)
+    received, media, media_message, recent = answers.inputs[0]
+    assert received is not None and received.message_id == 20
+    assert media is not None and media.file_id in {"pdf", "voice", "photo"}
+    assert media_message is not None and media_message.message_id == 9
+    assert recent is history.messages and recent[0] is native_model_message
+    sent = next(method for method in bot.requests if isinstance(method, SendMessage))
+    assert sent.reply_parameters is not None and sent.reply_parameters.message_id == 20
+    assert sent.message_thread_id == 17 and sent.business_connection_id == "example-business"
     assert all(method.__api_method__ != "getFile" for method in bot.requests)
-    assert all(list(upload.values()) == [b"synthetic image bytes"] for upload in bot.recording.uploads if upload)
+
+
+@pytest.mark.parametrize("attached", [False, True])
+@pytest.mark.parametrize(
+    "attachment",
+    [
+        {"photo": [PhotoSize(file_id="photo", file_unique_id="photo-1", width=64, height=64)]},
+        {"voice": Voice(file_id="voice", file_unique_id="voice-1", duration=4, mime_type="audio/ogg")},
+        {"document": Document(file_id="pdf", file_unique_id="pdf-1", mime_type="application/pdf")},
+    ],
+)
+async def test_media_only_ask_reaches_answer_service_with_empty_prompt(attachment: dict[str, object], attached: bool) -> None:
+    answers, bot = Answers(), RecordingBot()
+    source = incoming(None, message_id=9, **attachment)
+    message = incoming(None, caption="/ask", **attachment) if attached else incoming("/ask", reply_to_message=source)
+    async with create_app(answers, Payments()) as app:
+        await app.feed_update(bot, Update(update_id=1, message=message))
+    assert len(answers.calls) == 1 and answers.calls[0][0] == ""
+    current, media, selected, _history = answers.inputs[0]
+    assert current is not None and current.message_id == 20
+    assert media is not None and media.file_id in {"photo", "voice", "pdf"}
+    assert selected is not None and selected.message_id == (20 if attached else 9)
+    response = next(method for method in bot.requests if isinstance(method, SendMessage))
+    assert response.reply_parameters is not None and response.reply_parameters.message_id == 20
+    assert response.message_thread_id == 17 and response.business_connection_id == "example-business"
+
+
+async def test_empty_ask_without_media_uses_translated_application_guidance() -> None:
+    answers, bot = Answers(), RecordingBot()
+    translations = {
+        "Send a prompt or reply to the text or media you want to use.": "Напишите вопрос или ответьте на текст, картинку или голосовое."
+    }
+    async with App(Assistant(answers, translate=lambda text: translations.get(text, text))) as app:
+        await app.feed_update(bot, Update(update_id=1, message=incoming("/ask")))
+    assert not answers.calls
+    assert isinstance(bot.requests[-1], SendMessage)
+    assert bot.requests[-1].text == translations["Send a prompt or reply to the text or media you want to use."]
+
+
+async def test_attached_media_precedes_replied_media() -> None:
+    answers, bot = Answers(), RecordingBot()
+    source = incoming(None, message_id=9, photo=[PhotoSize(file_id="replied", file_unique_id="r", width=64, height=64)])
+    message = incoming(
+        None,
+        caption="/ask",
+        reply_to_message=source,
+        photo=[PhotoSize(file_id="attached", file_unique_id="a", width=64, height=64)],
+    )
+    async with create_app(answers, Payments()) as app:
+        await app.feed_update(bot, Update(update_id=1, message=message))
+    assert answers.inputs[0][1].file_id == "attached"
+    assert answers.inputs[0][2].message_id == 20
 
 
 async def test_inline_offer_does_not_generate_until_selected_and_edits_inline_identity() -> None:
-    answers, images, payments, bot = Answers(), Images(), Payments(), RecordingBot()
-    async with create_app(answers, images, payments) as app:
+    answers, payments, bot = Answers(), Payments(), RecordingBot()
+    async with create_app(answers, payments) as app:
         await app.feed_update(
             bot, Update(update_id=1, inline_query=InlineQuery(id="inline-query", from_user=ACTOR, query="explain stars", offset=""))
         )
@@ -166,7 +242,7 @@ async def test_inline_offer_does_not_generate_until_selected_and_edits_inline_id
 @pytest.mark.parametrize("result_id,inline_id", [("unrelated-result", "inline"), ("answer", None)])
 async def test_unrelated_or_uneditable_inline_result_does_not_call_provider(result_id: str, inline_id: str | None) -> None:
     answers, bot = Answers(), RecordingBot()
-    async with create_app(answers, Images(), Payments()) as app:
+    async with create_app(answers, Payments()) as app:
         await app.feed_update(
             bot,
             Update(
@@ -184,7 +260,7 @@ async def test_native_precheckout_facts_and_service_decision_are_preserved(reaso
     payments, bot = Payments(), RecordingBot()
     payments.rejection = reason
     native = PreCheckoutQuery(id="checkout", from_user=ACTOR, currency="XTR", total_amount=7, invoice_payload="application-owned-invoice")
-    async with create_app(Answers(), Images(), payments) as app:
+    async with create_app(Answers(), payments) as app:
         await app.feed_update(bot, Update(update_id=1, pre_checkout_query=native))
     assert len(payments.queries) == 1
     assert payments.queries[0].model_dump() == native.model_dump()
@@ -197,7 +273,7 @@ async def test_native_precheckout_facts_and_service_decision_are_preserved(reaso
 
 async def test_duplicate_payment_updates_and_recovery_rely_on_application_idempotency() -> None:
     payments, worker, bot = Payments(), Worker(), RecordingBot()
-    app = create_app(Answers(), Images(), payments)
+    app = create_app(Answers(), payments)
     assert bind_jobs(app, worker) == ("derp.commerce.recover-payment",)
     assert not payments.outbox
     native = SuccessfulPayment(
@@ -225,7 +301,7 @@ async def test_duplicate_payment_updates_and_recovery_rely_on_application_idempo
 
 async def test_invalid_recovery_payload_cannot_reach_application_service() -> None:
     payments, worker = Payments(), Worker()
-    bind_jobs(create_app(Answers(), Images(), payments), worker)
+    bind_jobs(create_app(Answers(), payments), worker)
     with pytest.raises(ValidationError):
         await worker.handlers["derp.commerce.recover-payment"]({"receipt_id": "receipt", "actor_id": 700})
     assert not payments.recovery_calls
