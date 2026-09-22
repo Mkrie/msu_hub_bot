@@ -8,3 +8,4 @@
 - Application adapters own persistence/transactions. Jobs must preserve an application's atomic state-plus-enqueue contract. A process-local lock is not durable concurrency control.
 - Documentation and examples are executable contracts for coding agents. Maintain concise guides, actionable diagnostics and offline pytest fixtures; avoid a second registry or testing language.
 - Verify framework details in the workspace's ignored upstream references. Run Ruff, strict mypy, package tests and wheel checks; include tests for uncertain delivery, cancellation, inherited routes and cross-feature isolation.
+- For cross-bot/framework comparisons, inspect `references/derp` and `references/grammy`. If absent, clone with `gh repo clone uburuntu/derp references/derp` or `gh repo clone grammyjs/grammY references/grammy -- --depth=1`; preserve local reference changes. Use actual source to settle behavior.
