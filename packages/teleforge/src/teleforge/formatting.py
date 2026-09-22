@@ -51,7 +51,18 @@ _SPLITTABLE = frozenset(
     }
 )
 _RICH_ENTITIES = frozenset(
-    {"bold", "italic", "underline", "strikethrough", "spoiler", "code", "text_link", "text_mention", "custom_emoji", "url"}
+    {
+        "bold",
+        "italic",
+        "underline",
+        "strikethrough",
+        "spoiler",
+        "code",
+        "text_link",
+        "text_mention",
+        "custom_emoji",
+        "url",
+    }
 )
 
 
@@ -124,7 +135,9 @@ def format_text(value: str | Text | None, entities: Sequence[MessageEntity] | No
     if entities is not None and len(entities) > MAX_ENTITIES:
         raise ResponseLimitError("Response entities exceed the configured budget.")
     # Telegram objects are frozen; avoid copying a user's bound Bot/session.
-    copied = tuple(sorted((entity.model_copy() for entity in entities or ()), key=lambda entity: (entity.offset, -entity.length)))
+    copied = tuple(
+        sorted((entity.model_copy() for entity in entities or ()), key=lambda entity: (entity.offset, -entity.length))
+    )
     wanted: set[int] = set()
     stack: list[int] = []
     metadata_bytes = 0
@@ -193,7 +206,11 @@ def split_text(
             for entity in value.entities:
                 if entity.type not in _SPLITTABLE and entity.offset < boundary < entity.offset + entity.length:
                     boundary = entity.offset
-            overlapping = [entity for entity in value.entities if entity.offset < boundary and entity.offset + entity.length > start_units]
+            overlapping = [
+                entity
+                for entity in value.entities
+                if entity.offset < boundary and entity.offset + entity.length > start_units
+            ]
             if len(overlapping) > max_entities:
                 boundary = min(boundary, overlapping[max_entities].offset)
             if boundary == previous:
