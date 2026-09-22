@@ -256,6 +256,8 @@ def compile_parameters(
             source = "dependency"
         elif isinstance(rule, Argument):
             source = "argument"
+        elif event_type is not None and representation(annotation) is event_type:
+            source = "event"
         elif declaration.kind == "command" and parameter.kind == parameter.POSITIONAL_OR_KEYWORD:
             source = "argument"
             if not ordinary(annotation):

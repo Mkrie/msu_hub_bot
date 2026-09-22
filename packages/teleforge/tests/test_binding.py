@@ -19,12 +19,22 @@ from aiogram.methods import (
     SendMessage,
     TelegramMethod,
 )
-from aiogram.types import CallbackQuery, Chat, InaccessibleMessage, InputMediaPhoto, Message, MessageId, Update, User
+from aiogram.types import (
+    CallbackQuery,
+    Chat,
+    ChosenInlineResult,
+    InaccessibleMessage,
+    InputMediaPhoto,
+    Message,
+    MessageId,
+    Update,
+    User,
+)
 
 from teleforge.app import App
 from teleforge.cards import Button, Card, action, card, prepare_card, show
 from teleforge.context import CallbackContext, MessageContext
-from teleforge.declarations import Declaration, attach_declaration, callback, command
+from teleforge.declarations import Declaration, attach_declaration, callback, chosen_inline_result, command
 from teleforge.delivery import DeliveryError
 from teleforge.feature import Feature
 from teleforge.formatting import ResponseError
@@ -48,6 +58,42 @@ def incoming(text: str) -> Update:
 
 class Count(CallbackData, prefix="count"):
     count: int
+
+
+async def test_native_event_types_bind_descriptive_names_without_middleware_shadowing() -> None:
+    seen: list[object] = []
+
+    class NativeNames(Feature):
+        @command("native")
+        async def native(self, _message: Message) -> None:
+            seen.append((_message.message_id, _message.bot.id))
+
+        @callback(Count)
+        async def press(self, callback: CallbackQuery, count: int, *, source: Message) -> None:
+            seen.append((callback.id, count, source.text))
+
+        @chosen_inline_result()
+        async def chosen(self, chosen_result: ChosenInlineResult) -> None:
+            seen.append((chosen_result.result_id, chosen_result.bot.id))
+
+    source = incoming("middleware-selected source").message
+    bot = RecordingBot()
+    async with App(
+        NativeNames(), data={"_message": object(), "callback": object(), "chosen_result": object(), "source": source}
+    ) as app:
+        await app.feed_update(bot, incoming("/native"))
+        await app.feed_update(bot, clicked(Count(count=4).pack()))
+        await app.feed_update(
+            bot,
+            Update(
+                update_id=3,
+                chosen_inline_result=ChosenInlineResult(
+                    result_id="choice", from_user=User(id=7, is_bot=False, first_name="actor"), query="question"
+                ),
+            ),
+        )
+    assert seen == [(10, bot.id), ("click", 4, "middleware-selected source"), ("choice", bot.id)]
+    assert [request.__api_method__ for request in bot.requests] == ["answerCallbackQuery"]
 
 
 def clicked(data: str) -> Update:

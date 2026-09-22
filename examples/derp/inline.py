@@ -28,7 +28,7 @@ from derp.features.inline_chat import (
 from derp.inference.privacy import project_inference_privacy
 from derp.models import User as UserModel
 from derp.observability import report_exception
-from teleforge import Context, Feature, chosen_inline_result, inline_query
+from teleforge import Feature, chosen_inline_result, inline_query
 
 _REQUEST_NAMESPACE = uuid.UUID("a14fc0e4-cc5c-4d91-ae24-8aa260b680de")
 
@@ -111,25 +111,25 @@ class InlineAnswers(Feature, key="inline"):
         return event.answer([result], button=button, cache_time=300, is_personal=True)
 
     @chosen_inline_result()
-    async def answer(self, ctx: Context, event: ChosenInlineResult, *, user_model: UserModel | None = None) -> None:
-        if not event.inline_message_id:
+    async def answer(self, chosen_result: ChosenInlineResult, *, user_model: UserModel | None = None) -> None:
+        if not chosen_result.inline_message_id:
             return
         if user_model is None:
             text, markup = _unverified()
         else:
             try:
-                request_id = _request_id(user_model.id, event.result_id, event.inline_message_id)
+                request_id = _request_id(user_model.id, chosen_result.result_id, chosen_result.inline_message_id)
             except TypeError, ValueError, AttributeError:
                 text, markup = _unverified()
             else:
                 try:
                     outcome = await self.service.answer(
-                        InlineChatInvocation(request_id, user_model.id, event.query, project_inference_privacy(user_model))
+                        InlineChatInvocation(request_id, user_model.id, chosen_result.query, project_inference_privacy(user_model))
                     )
                 except Exception as exc:
-                    report_exception("inline_handler_failed", exception=exc, telegram_user_id=event.from_user.id)
+                    report_exception("inline_handler_failed", exception=exc, telegram_user_id=chosen_result.from_user.id)
                     text, markup = _("I couldn't answer that here. Try again."), _retry()
                 else:
                     text, markup = _presentation(outcome)
         # Keep Derp's Markdown/HTML conversion and fixed-inline fallback intact.
-        await MessageSender(bot=ctx.bot, chat_id=0).edit_inline(event.inline_message_id, text, reply_markup=markup)
+        await MessageSender(bot=chosen_result.bot, chat_id=0).edit_inline(chosen_result.inline_message_id, text, reply_markup=markup)
