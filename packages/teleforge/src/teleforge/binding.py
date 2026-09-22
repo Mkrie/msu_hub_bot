@@ -12,13 +12,22 @@ from aiogram.utils.formatting import Text
 from pydantic import BaseModel
 
 from .context import CallbackContext, Context, context_for
-from .delivery import MediaSource, ResponsePolicy
+from .delivery import DeliveryError, MediaSource, ResponsePolicy
 from .feature import CompiledHandler
 from .formatting import ResponseError
 from .inputs import Declaration as InputDeclaration
 from .inputs import InputError, prepare_arguments
 
 type Adapter = Callable[..., Awaitable[object]]
+
+
+def _notification(text: str) -> str:
+    used = 0
+    for index, character in enumerate(text):
+        used += 2 if ord(character) > 0xFFFF else 1
+        if used > 180:
+            return text[:index]
+    return text
 
 
 async def _deliver(ctx: Context, value: object, compiled: CompiledHandler) -> object:
@@ -101,15 +110,24 @@ async def invoke_handler(compiled: CompiledHandler, event: TelegramObject, **dat
             if ctx.has_effects:
                 raise
             # Input guidance is a new reply to the invocation, never a replacement UI.
-            if isinstance(ctx, CallbackContext):
-                if not ctx.acknowledgement.attempted and ctx.acknowledgement.owned:
-                    await ctx.answer(str(error)[:180], show_alert=True)
-                else:
-                    await ctx.reply(str(error), to=ctx.message, policy=ResponsePolicy(rich=False, soft_messages=1))
-            elif isinstance(event, Message):
-                await ctx.reply(str(error), to=event, policy=ResponsePolicy(rich=False, soft_messages=1))
-            else:
+            can_answer = (
+                isinstance(ctx, CallbackContext) and not ctx.acknowledgement.attempted and ctx.acknowledgement.owned
+            )
+            if not can_answer and not isinstance(ctx.message, Message):
+                # Inline/inaccessible callbacks cannot establish a safe destination.
                 raise
+            try:
+                if can_answer:
+                    assert isinstance(ctx, CallbackContext)
+                    await ctx.answer(_notification(str(error)), show_alert=True)
+                elif isinstance(ctx, CallbackContext):
+                    await ctx.reply(str(error), to=ctx.message, policy=ResponsePolicy(rich=False, soft_messages=1))
+                else:
+                    assert isinstance(event, Message)
+                    await ctx.reply(str(error), to=event, policy=ResponsePolicy(rich=False, soft_messages=1))
+            except (DeliveryError, ResponseError) as guidance_error:
+                error.add_note(f"Input guidance could not be delivered ({type(guidance_error).__name__}).")
+                raise error from None
             delivered = None
         await ctx.finish()
         return delivered

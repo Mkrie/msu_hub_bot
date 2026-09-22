@@ -130,6 +130,8 @@ class Context:
         target = to if to is not None else self.response_target
         if target is None:
             raise ResponseError("This event has no response target; supply to explicitly")
+        if to is None and isinstance(target, InaccessibleMessage):
+            raise ResponseError("The callback message is inaccessible; supply an explicit DeliveryTarget for a reply")
         options.setdefault("policy", self.policy)
         progress = options.get("progress") or DeliveryProgress()
         options["progress"] = self.delivery_progress = progress
@@ -174,6 +176,17 @@ class Context:
 class MessageContext(Context):
     """A message invocation; its acquired inputs need not come from that message."""
 
+    event: Message
+
+    def __init__(
+        self, bot: Bot, event: Message, *, data: dict[str, Any] | None = None, policy: ResponsePolicy | None = None
+    ) -> None:
+        super().__init__(bot, event, data=data, policy=policy)
+
+    @property
+    def message(self) -> Message:
+        return self.event
+
 
 @dataclass(slots=True)
 class Acknowledgement:
@@ -184,6 +197,8 @@ class Acknowledgement:
 
 
 class CallbackContext(Context):
+    event: CallbackQuery
+
     def __init__(
         self,
         bot: Bot,
@@ -213,8 +228,13 @@ class CallbackContext(Context):
         state = self.acknowledgement
         if state.attempted:
             return None
-        if text is not None and units(text) > 200:
-            raise ResponseError("Callback notifications must fit 200 UTF-16 units")
+        if text is not None:
+            try:
+                size = units(text)
+            except UnicodeError:
+                raise ResponseError("The callback notification contains invalid Unicode") from None
+            if size > 200:
+                raise ResponseError("Callback notifications must fit 200 UTF-16 units")
         if type(cache_time) is not int or cache_time < 0:
             raise ResponseError("Callback cache_time must be nonnegative")
         method = AnswerCallbackQuery(

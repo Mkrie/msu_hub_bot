@@ -5,7 +5,7 @@ import io
 import math
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import islice
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -175,6 +175,7 @@ class DeliveryError(Exception):
 
     def __init__(self, progress: DeliveryProgress, cause: Exception) -> None:
         super().__init__("Telegram delivery was not completed")
+        self.progress = replace(progress)
         self.confirmed = progress.confirmed
         self.attempted_part = progress.attempted_part
         self.total_parts = progress.total_parts
@@ -597,6 +598,9 @@ async def send_response(
                 state.phase = "complete"
     except asyncio.CancelledError:
         state.phase = "cancelled"
+        raise
+    except ResponseError:
+        state.phase = "failed"
         raise
     except TimeoutError as error:
         state.phase = "failed"

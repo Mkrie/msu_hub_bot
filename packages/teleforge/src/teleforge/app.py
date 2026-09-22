@@ -1,6 +1,7 @@
 """Application composition on native aiogram routers and dispatcher lifecycle."""
 
 import asyncio
+import math
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from typing import Any, Self, cast
@@ -21,6 +22,29 @@ from .feature import CompilationError, CompiledHandler, Diagnostic, Feature, com
 
 type ResourceFactory = Callable[[], AbstractAsyncContextManager[object]]
 type NextHandler = Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]]
+
+
+class AdmissionClosed(RuntimeError):
+    """The standalone application has stopped accepting Telegram updates."""
+
+
+class DrainTimeout(RuntimeError):
+    """Updates did not release application resources after cancellation."""
+
+    def __init__(self, remaining: int) -> None:
+        self.remaining = remaining
+        super().__init__(f"{remaining} update task(s) still own application resources")
+
+
+class _Dispatcher(Dispatcher):
+    def __init__(self, app: App, **kwargs: Any) -> None:
+        self._app = app
+        super().__init__(**kwargs)
+
+    async def feed_update(self, bot: Bot, update: Update, **kwargs: Any) -> Any:
+        # Enclose the native dispatcher, including its outer error middleware.
+        async with self._app._admit_update():
+            return await super().feed_update(bot, update, **kwargs)
 
 
 class _Workflow(BaseMiddleware):
@@ -58,28 +82,77 @@ class App:
         bot: Bot | None = None,
         data: Mapping[str, Any] | None = None,
         media_concurrency: int = 2,
+        drain_timeout: float = 30,
+        cancel_timeout: float = 5,
     ) -> None:
         if type(media_concurrency) is not int or media_concurrency < 1:
             raise ValueError("media_concurrency must be a positive integer")
+        if not all(math.isfinite(value) and value >= 0 for value in (drain_timeout, cancel_timeout)):
+            raise ValueError("Update drain timeouts must be finite and nonnegative")
         self.bot = bot
         self.data = dict(data or {})
-        self.features: list[Feature] = list(features)
+        self._features: list[Feature] = list(features)
         self._media_slots = asyncio.Semaphore(media_concurrency)
         self._resources: list[ResourceFactory] = []
         self._stack: AsyncExitStack | None = None
+        self._configuration_closed = False
         self._lifecycle_lock = asyncio.Lock()
         self._dispatcher: Dispatcher | None = None
         self._fsm_closed = False
+        self._accepting = True
+        self._updates: dict[asyncio.Task[Any], int] = {}
+        self._updates_done = asyncio.Event()
+        self._updates_done.set()
+        self._drain_timeout, self._cancel_timeout = drain_timeout, cancel_timeout
+
+    @asynccontextmanager
+    async def _admit_update(self) -> AsyncIterator[None]:
+        if not self._accepting:
+            raise AdmissionClosed("The application is shutting down")
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("Update handling requires an asyncio task")
+        self._updates[task] = self._updates.get(task, 0) + 1
+        self._updates_done.clear()
+        try:
+            yield
+        finally:
+            depth = self._updates[task] - 1
+            if depth:
+                self._updates[task] = depth
+            else:
+                del self._updates[task]
+            if not self._updates:
+                self._updates_done.set()
+
+    async def _drain_updates(self) -> None:
+        if not self._updates:
+            return
+        try:
+            async with asyncio.timeout(self._drain_timeout):
+                await self._updates_done.wait()
+        except TimeoutError:
+            for task in tuple(self._updates):
+                task.cancel()
+            try:
+                async with asyncio.timeout(self._cancel_timeout):
+                    await self._updates_done.wait()
+            except TimeoutError:
+                raise DrainTimeout(len(self._updates)) from None
+
+    @property
+    def features(self) -> tuple[Feature, ...]:
+        return tuple(self._features)
 
     def include(self, feature: Feature) -> App:
-        if self._stack is not None or self._dispatcher is not None:
+        if self._configuration_closed or self._dispatcher is not None:
             raise RuntimeError("Include features before building the standalone dispatcher or starting the application")
-        self.features.append(feature)
+        self._features.append(feature)
         return self
 
     def resource(self, factory: ResourceFactory) -> App:
         """Own a context-manager factory; ordinary closures wire its dependencies."""
-        if self._stack is not None:
+        if self._configuration_closed:
             raise RuntimeError("Register resources before application startup")
         self._resources.append(factory)
         return self
@@ -158,9 +231,12 @@ class App:
         events_isolation: BaseEventIsolation | None = None,
         fsm_strategy: FSMStrategy = FSMStrategy.USER_IN_TOPIC,
     ) -> Dispatcher:
+        if not self._accepting:
+            raise AdmissionClosed("A closed application cannot create a dispatcher")
         if self._dispatcher is not None:
             raise RuntimeError("This application already has a standalone dispatcher; use build_router for embedding")
-        dispatcher = Dispatcher(
+        dispatcher = _Dispatcher(
+            self,
             storage=storage if storage is not None else MemoryStorage(),
             events_isolation=events_isolation if events_isolation is not None else SimpleEventIsolation(),
             fsm_strategy=fsm_strategy,
@@ -181,6 +257,8 @@ class App:
 
     async def start(self) -> None:
         async with self._lifecycle_lock:
+            if not self._accepting:
+                raise AdmissionClosed("A closed application cannot restart")
             if self._stack is not None:
                 return
             if self._fsm_closed:
@@ -188,6 +266,7 @@ class App:
             errors = self.check()
             if errors:
                 raise CompilationError(errors)
+            self._configuration_closed = True
             stack = AsyncExitStack()
             try:
                 for factory in self._resources:
@@ -200,7 +279,14 @@ class App:
             self._stack = stack
 
     async def aclose(self) -> None:
+        if asyncio.current_task() in self._updates:
+            raise RuntimeError("An update cannot close its own application; request shutdown from the owner")
         async with self._lifecycle_lock:
+            self._configuration_closed = True
+            self._accepting = False
+            # Leave clients open if a running update cannot be joined. The
+            # application owner can terminate the process or retry shutdown.
+            await self._drain_updates()
             stack, self._stack = self._stack, None
             try:
                 if stack is not None:
@@ -236,6 +322,8 @@ class App:
             raise TypeError("Supply a Bot to App or run_polling")
         dispatcher = self._dispatcher or self.create_dispatcher()
         try:
-            await dispatcher.start_polling(selected, close_bot_session=close_bot_session, **options)
+            await dispatcher.start_polling(selected, close_bot_session=False, **options)
         finally:
             await self.aclose()
+            if close_bot_session:
+                await selected.session.close()

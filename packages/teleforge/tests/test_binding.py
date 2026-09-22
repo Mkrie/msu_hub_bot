@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 from aiogram.filters.callback_data import CallbackData
 from aiogram.methods import AnswerCallbackQuery, SendMessage
-from aiogram.types import CallbackQuery, Chat, Message, MessageId, Update, User
+from aiogram.types import CallbackQuery, Chat, InaccessibleMessage, Message, MessageId, Update, User
 
 from teleforge.app import App
 from teleforge.cards import Button, Card, action, card, show
@@ -16,7 +16,7 @@ from teleforge.context import CallbackContext, MessageContext
 from teleforge.declarations import callback, command
 from teleforge.feature import Feature
 from teleforge.formatting import ResponseError
-from teleforge.inputs import Argument, TextInput
+from teleforge.inputs import Argument, InputError, TextInput
 from teleforge.testing import RecordingBot
 
 
@@ -266,3 +266,66 @@ async def test_managed_card_uses_native_compiled_callback_and_strict_payload() -
         "editMessageText",
         "answerCallbackQuery",
     ]
+
+
+@pytest.mark.parametrize("inaccessible", [False, True])
+async def test_manual_ack_guidance_never_guesses_unavailable_ui_scope(inaccessible: bool) -> None:
+    primary = InputError("Provide the missing value")
+
+    class Missing(Feature):
+        @callback(Count, ack="manual")
+        async def press(self, count: int) -> None:
+            raise primary
+
+    bot = RecordingBot()
+    update = clicked(Count(count=1).pack())
+    query = update.callback_query
+    assert query is not None
+    update = update.model_copy(
+        update={
+            "callback_query": query.model_copy(
+                update={
+                    "message": InaccessibleMessage(chat=Chat(id=-100, type="supergroup"), message_id=5, date=0)
+                    if inaccessible
+                    else None,
+                    "inline_message_id": None if inaccessible else "inline",
+                }
+            )
+        }
+    )
+    async with App(Missing()) as app:
+        with pytest.raises(InputError) as caught:
+            await app.feed_update(bot, update)
+    assert caught.value is primary
+    assert not bot.requests
+
+
+async def test_failed_guidance_preserves_primary_error_and_does_not_ack_success() -> None:
+    primary = InputError("Missing value")
+
+    class Missing(Feature):
+        @callback(Count)
+        async def press(self, count: int) -> None:
+            raise primary
+
+    bot = RecordingBot()
+    bot.recording.responses.append(TimeoutError())
+    async with App(Missing()) as app:
+        with pytest.raises(InputError) as caught:
+            await app.feed_update(bot, clicked(Count(count=1).pack()))
+    assert caught.value is primary
+    assert len(bot.requests) == 1
+    assert "could not be delivered" in primary.__notes__[0]
+
+
+async def test_callback_error_alert_obeys_utf16_budget() -> None:
+    class Missing(Feature):
+        @callback(Count)
+        async def press(self, count: int) -> None:
+            raise InputError("😀" * 150)
+
+    bot = RecordingBot()
+    async with App(Missing()) as app:
+        await app.feed_update(bot, clicked(Count(count=1).pack()))
+    assert len(bot.requests) == 1
+    assert bot.requests[0].text == "😀" * 90

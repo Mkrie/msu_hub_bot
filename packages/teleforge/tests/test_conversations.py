@@ -7,7 +7,7 @@ import pytest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Chat, Message, User
+from aiogram.types import Chat, DirectMessagesTopic, Message, User
 from pydantic import BaseModel, ConfigDict
 
 from teleforge.context import Context
@@ -120,3 +120,71 @@ async def test_nonforum_message_thread_hint_does_not_create_a_topic_scope() -> N
     await enter(ctx, feature.title, Draft(source_id=12))
     await invoke(ctx, feature)
     assert feature.seen == [12]
+
+
+async def test_business_connection_must_match_fsm_storage_identity() -> None:
+    ctx, feature = context(), Titles()
+    ctx.event = ctx.event.model_copy(update={"business_connection_id": "business-a"})
+    with pytest.raises(ConversationError, match="business connection"):
+        await enter(ctx, feature.title, Draft(source_id=12))
+    ctx.data["state"] = FSMContext(
+        MemoryStorage(),
+        StorageKey(bot_id=42, chat_id=-100, user_id=7, thread_id=5, business_connection_id="business-a"),
+    )
+    await enter(ctx, feature.title, Draft(source_id=12))
+    await invoke(ctx, feature)
+    assert feature.seen == [12]
+
+
+async def test_direct_message_topic_cannot_silently_use_general_chat_state() -> None:
+    ctx, feature = context(), Titles()
+    ctx.event = ctx.event.model_copy(
+        update={
+            "is_topic_message": False,
+            "message_thread_id": None,
+            "direct_messages_topic": DirectMessagesTopic(topic_id=9),
+        }
+    )
+    ctx.data["state"] = FSMContext(MemoryStorage(), StorageKey(bot_id=42, chat_id=-100, user_id=7))
+    with pytest.raises(ConversationError, match="Direct-message topics"):
+        await enter(ctx, feature.title, Draft(source_id=12))
+    assert await ctx.data["state"].get_data() == {}
+
+
+async def test_failed_state_write_cannot_dispatch_previous_step_with_new_draft() -> None:
+    class Storage(MemoryStorage):
+        fail = False
+
+        async def set_state(self, key: StorageKey, state: Any = None) -> None:
+            if self.fail:
+                raise ConnectionError("state write failed")
+            await super().set_state(key, state)
+
+    class Workflow(Titles):
+        @step("next", draft=Draft)
+        async def next(self, ctx: Context, draft: Draft) -> None:
+            self.seen.append(draft.source_id)
+
+    ctx, feature, storage = context(), Workflow(), Storage()
+    state = FSMContext(storage, StorageKey(bot_id=42, chat_id=-100, user_id=7, thread_id=5))
+    ctx.data["state"] = state
+    await enter(ctx, feature.title, Draft(source_id=12))
+    storage.fail = True
+    with pytest.raises(ConnectionError):
+        await enter(ctx, feature.next, Draft(source_id=99))
+    with pytest.raises(ConversationError, match="different"):
+        await invoke(ctx, feature)
+    assert feature.seen == []
+
+
+@pytest.mark.parametrize("active", ["native:payment", "teleforge:another:title"])
+async def test_enter_does_not_take_over_another_active_workflow(active: str) -> None:
+    ctx, feature = context(), Titles()
+    state: FSMContext = ctx.data["state"]
+    await state.set_state(active)
+    await state.set_data({"application": "keep", "__teleforge_draft__": {"feature": "another"}})
+    before = await state.get_data()
+    with pytest.raises(ConversationError, match="Another workflow"):
+        await enter(ctx, feature.title, Draft(source_id=12))
+    assert await state.get_state() == active
+    assert await state.get_data() == before

@@ -33,14 +33,19 @@ def _state(ctx: Context) -> FSMContext:
     message, user = ctx.message, ctx.user
     if not isinstance(message, Message) or user is None:
         raise ConversationError("A conversation requires a chat message and a human actor")
+    if message.direct_messages_topic is not None:
+        # aiogram USER_IN_TOPIC currently keys forum message_thread_id only.
+        # A direct-message topic cannot safely fall back to the general chat.
+        raise ConversationError("Direct-message topics require an explicit application conversation adapter")
     key = state.key
-    if (key.bot_id, key.chat_id, key.user_id, key.thread_id) != (
+    if (key.bot_id, key.chat_id, key.user_id, key.thread_id, key.business_connection_id) != (
         ctx.bot.id,
         message.chat.id,
         user.id,
         message.message_thread_id if message.is_topic_message else None,
+        message.business_connection_id,
     ):
-        raise ConversationError("FSM storage must isolate this bot, actor, chat and topic")
+        raise ConversationError("FSM storage must isolate this bot, actor, chat, topic and business connection")
     return state
 
 
@@ -74,6 +79,11 @@ async def enter(ctx: Context, destination: Callable[..., Any], draft: BaseModel)
     step_name = cast(str, declaration.metadata["step"])
     payload = _draft(model, draft.model_dump(mode="json")).model_dump(mode="json")
     state = _state(ctx)
+    current = await state.get_state()
+    if current is not None and not current.startswith(f"{_PREFIX}{feature.key}:"):
+        raise ConversationError(
+            "Another workflow is active; cancel or clear it explicitly before entering this feature"
+        )
     await state.update_data({_DRAFT: {"feature": feature.key, "step": step_name, "value": payload}})
     await state.set_state(_name(feature, step_name))
 

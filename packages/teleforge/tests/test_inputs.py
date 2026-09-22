@@ -144,3 +144,41 @@ async def test_decoded_image_is_closed_after_invocation():
         assert image.getpixel((0, 0)) == (0, 0, 0)
     with pytest.raises(ValueError, match="closed"):
         image.getpixel((0, 0))
+
+
+@pytest.mark.asyncio
+async def test_native_media_respects_known_size_budget_without_downloading():
+    async def handler(image: PhotoSize):
+        pass
+
+    event = message(photo=[PhotoSize(file_id="photo", file_unique_id="p", width=3, height=2, file_size=100)])
+    bot = RecordingBot()
+    with pytest.raises(InputError, match="too large"):
+        async with prepare_arguments(handler, event, context_for(bot, event), {}, {"image": ImageInput(max_bytes=1)}):
+            pytest.fail("Oversized native input reached handler")
+    assert not bot.requests
+
+
+@pytest.mark.asyncio
+async def test_retained_buffer_does_not_mask_handler_exception():
+    async def handler(stream: io.BytesIO):
+        pass
+
+    bot = RecordingBot()
+
+    async def download(file, *, destination, timeout):
+        destination.write(b"hello")
+
+    bot.download = AsyncMock(side_effect=download)
+    event = message(document=Document(file_id="doc", file_unique_id="d"))
+    primary = RuntimeError("original handler failure")
+    with pytest.raises(RuntimeError) as caught:
+        async with prepare_arguments(
+            handler, event, context_for(bot, event), {}, {"stream": DocumentInput()}
+        ) as values:
+            retained = values["stream"].getbuffer()
+            raise primary
+    assert caught.value is primary
+    assert primary.__notes__ == ["Input cleanup also failed (BufferError)"]
+    retained.release()
+    values["stream"].close()

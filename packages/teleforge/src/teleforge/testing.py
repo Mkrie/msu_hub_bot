@@ -3,7 +3,7 @@
 from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any, cast, get_args
 
 from aiogram import Bot
 from aiogram.client.session.base import BaseSession
@@ -40,6 +40,8 @@ class RecordingSession(BaseSession):
         elif isinstance(value, BaseModel):
             for name in type(value).model_fields:
                 await self._uploads(bot, getattr(value, name), f"{path}.{name}" if path else name, output)
+            for name, extra in (value.model_extra or {}).items():
+                await self._uploads(bot, extra, f"{path}.{name}" if path else name, output)
         elif isinstance(value, list | tuple):
             for index, item in enumerate(value):
                 await self._uploads(bot, item, f"{path}.{index}", output)
@@ -70,7 +72,11 @@ class RecordingSession(BaseSession):
         name = method.__api_method__
         if name == "getMe":
             return User(id=bot.id, is_bot=True, first_name="TeleForge test bot", username="teleforge_test_bot")
-        if name.startswith(("send", "editMessage")):
+        if method.__returning__ is bool:
+            return True
+        if name.startswith(("send", "editMessage")) and (
+            method.__returning__ is Message or Message in get_args(method.__returning__)
+        ):
             if getattr(method, "inline_message_id", None):
                 return True
             chat_id = getattr(method, "chat_id", None)
@@ -110,8 +116,6 @@ class RecordingSession(BaseSession):
                         blocks.append(block.model_dump())
                 values["rich_message"] = {"blocks": blocks}
             return Message.model_validate(values).as_(bot)
-        if name.startswith(("answer", "delete", "set", "unpin", "pin")):
-            return True
         raise AssertionError(f"Configure an offline response for {name}")
 
     @staticmethod

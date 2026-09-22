@@ -4,8 +4,8 @@ import asyncio
 import inspect
 import io
 import re
-from collections.abc import AsyncIterator, Callable, Mapping
-from contextlib import ExitStack, asynccontextmanager
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from contextlib import ExitStack, asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -39,6 +39,27 @@ type Downloadable = PhotoSize | Document | Video | Animation | VideoNote | Stick
 
 class InputError(ValueError):
     """Brief, safe guidance for a selected invocation's unusable input."""
+
+
+class _ValidatedPayload(dict[str, Any]):
+    """Internal card-codec output; do not execute its field validators again."""
+
+
+@contextmanager
+def _owned_inputs() -> Iterator[ExitStack]:
+    resources = ExitStack()
+    try:
+        yield resources
+    except BaseException as primary:
+        try:
+            resources.close()
+        except Exception as cleanup:  # noqa: BLE001 - retain the primary operation/cancellation failure
+            # A retained BytesIO view can prevent close. Preserve the operation's
+            # error while ExitStack still attempts every other resource cleanup.
+            primary.add_note(f"Input cleanup also failed ({type(cleanup).__name__})")
+        raise
+    else:
+        resources.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,6 +388,8 @@ async def _media_value(
     resources: ExitStack,
     downloads: dict[str, io.BytesIO],
 ) -> Any:
+    if (media.file_size or 0) > declaration.max_bytes:
+        raise InputError("The attachment is too large. Please send a smaller file.")
     requested = representation(annotation)
     is_image = getattr(requested, "__module__", "") == "PIL.Image" and getattr(requested, "__name__", "") == "Image"
     if requested not in (bytes, io.BytesIO, Path) and not is_image:
@@ -420,7 +443,7 @@ async def prepare_arguments(
     media_parameters: list[tuple[str, Any, Any, MediaDeclaration]] = []
     source_text: Message | None = None
     source_media: Message | None = None
-    with ExitStack() as resources:
+    with _owned_inputs() as resources:
         downloads: dict[str, io.BytesIO] = {}
         for name, parameter in signature.parameters.items():
             if name in {"self", "cls"}:
@@ -449,6 +472,11 @@ async def prepare_arguments(
             elif name in payload_values:
                 if name in data:
                     raise InputError(f"Callback field '{name}' conflicts with a supplied dependency.")
+                if isinstance(payload, BaseModel | _ValidatedPayload):
+                    # Native CallbackData and the managed codec already validated
+                    # these fields. Re-running a transforming validator changes IDs.
+                    values[name] = payload_values[name]
+                    continue
                 try:
                     # Pydantic CallbackData has already run its validators. The
                     # function's compatible annotation cannot change its values.

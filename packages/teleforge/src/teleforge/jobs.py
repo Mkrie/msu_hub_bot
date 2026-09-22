@@ -43,8 +43,12 @@ def job(name: str, *, payload: type[BaseModel], argument: str = "payload") -> Ca
 
 def bind_jobs(app: App, adapter: JobAdapter) -> tuple[str, ...]:
     """Register declared handlers with a worker. This does not schedule or commit any job."""
+    handlers = app.iter_handlers("job")
+    identities = [f"{handler.feature.key}.{handler.declaration.names[0]}" for handler in handlers]
+    if len(identities) != len(set(identities)):
+        raise ValueError("Declared job names must be unique within each feature")
     keys = []
-    for compiled in app.iter_handlers("job"):
+    for compiled, key in zip(handlers, identities, strict=True):
         model = cast(type[BaseModel], compiled.declaration.metadata["payload"])
         argument = cast(str, compiled.declaration.metadata["argument"])
 
@@ -58,6 +62,6 @@ def bind_jobs(app: App, adapter: JobAdapter) -> tuple[str, ...]:
 
             return invoke
 
-        adapter.register(compiled.key, bind(compiled.handler, model, argument))
-        keys.append(compiled.key)
+        adapter.register(key, bind(compiled.handler, model, argument))
+        keys.append(key)
     return tuple(keys)

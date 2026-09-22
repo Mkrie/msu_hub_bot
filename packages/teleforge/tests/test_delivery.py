@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters.callback_data import CallbackData
 from aiogram.methods import (
     EditMessageCaption,
     EditMessageMedia,
@@ -21,6 +22,7 @@ from aiogram.methods import (
 from aiogram.types import (
     CallbackQuery,
     Chat,
+    InaccessibleMessage,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
@@ -30,11 +32,14 @@ from aiogram.types import (
     Message,
     MessageEntity,
     PhotoSize,
+    Update,
     User,
 )
 from aiogram.utils.formatting import Bold, Text
 
+from teleforge.app import App
 from teleforge.context import CallbackContext, Context, context_for
+from teleforge.declarations import callback
 from teleforge.delivery import (
     DeliveryError,
     DeliveryTarget,
@@ -42,6 +47,7 @@ from teleforge.delivery import (
     edit_response,
     send_response,
 )
+from teleforge.feature import Feature
 from teleforge.formatting import ResponseError, ResponseLimitError, format_text, split_text, units
 from teleforge.testing import RecordingBot, RecordingSession
 
@@ -200,6 +206,8 @@ async def test_partial_delivery_reports_confirmed_prefix_and_never_retries() -> 
     assert failure.value.attempted_part == 1
     assert failure.value.total_parts == 2
     assert failure.value.uncertain
+    assert failure.value.progress.confirmed == failure.value.confirmed
+    assert failure.value.progress.phase == "failed"
     assert len(bot.requests) == 2
 
 
@@ -284,6 +292,21 @@ async def test_native_inline_targets_require_no_fabricated_chat() -> None:
     assert method.inline_message_id == "inline-identity"
     with pytest.raises(ResponseError, match="no known chat"):
         await send_response(bot, target, "new message")
+
+
+@pytest.mark.asyncio
+async def test_inaccessible_callback_never_guesses_reply_topic_or_business_scope() -> None:
+    bot = RecordingBot()
+    event = query(message=InaccessibleMessage(chat=Chat(id=-100123, type="supergroup"), message_id=10, date=0))
+    ctx = CallbackContext(bot, event)
+    with pytest.raises(ResponseError, match="explicit DeliveryTarget"):
+        await ctx.reply("new message")
+    assert not bot.requests
+    await ctx.reply(
+        "explicit reply", to=DeliveryTarget(chat_id=-100123, thread_id=17, business_connection_id="known-business")
+    )
+    assert bot.requests[0].message_thread_id == 17
+    assert bot.requests[0].business_connection_id == "known-business"
 
 
 @pytest.mark.asyncio
@@ -445,16 +468,23 @@ async def test_uncertain_acknowledgement_is_never_retried() -> None:
 
 @pytest.mark.asyncio
 async def test_context_does_not_answer_while_primary_exception_unwinds() -> None:
-    bot = RecordingBot()
-    ctx = CallbackContext(bot, query())
     primary = RuntimeError("domain failure")
-    with pytest.raises(RuntimeError) as failure:
-        raise primary
+
+    class BrokenButton(CallbackData, prefix="broken"):
+        pass
+
+    class BrokenFeature(Feature, key="test.delivery-error"):
+        @callback(BrokenButton)
+        async def broken(self, ctx: CallbackContext) -> None:
+            raise primary
+
+    # Any fallback acknowledgement would fail too and must not mask the domain error.
+    bot = RecordingBot(session=RecordingSession([OSError("acknowledgement failed")]))
+    async with App(BrokenFeature()) as app:
+        with pytest.raises(RuntimeError) as failure:
+            await app.feed_update(bot, Update(update_id=1, callback_query=query(data=BrokenButton().pack())))
     assert failure.value is primary
-    assert not ctx.acknowledgement.attempted
-    # The error owner can still choose an alert; there is no implicit finally answer.
-    await ctx.answer("Could not finish", show_alert=True)
-    assert bot.requests[0].show_alert is True
+    assert not bot.requests
 
 
 @pytest.mark.asyncio

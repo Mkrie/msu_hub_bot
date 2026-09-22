@@ -21,6 +21,7 @@ from .context import CallbackContext, Context
 from .declarations import Declaration, attach_declaration, declarations_of
 from .delivery import MediaSource
 from .feature import Feature
+from .inputs import _ValidatedPayload
 
 _Handler = TypeVar("_Handler", bound=Callable[..., Any])
 _PREFIX = "tf:"
@@ -100,11 +101,14 @@ class _Parameter:
 
 def _parameters(method: Callable[..., Any]) -> list[_Parameter]:
     feature, _ = _bound(method)
-    namespace = {name: value for cls in reversed(type(feature).__mro__) for name, value in vars(cls).items()}
+    namespace: dict[str, Any] = {}
+    for cls in reversed(type(feature).__mro__):
+        namespace.update(vars(cls))
+        namespace[cls.__name__] = cls
     hints = get_type_hints(method, localns=namespace, include_extras=True)
     parameters = []
     for name, parameter in inspect.signature(method).parameters.items():
-        if name == "ctx":
+        if name in {"ctx", "context"}:
             continue
         if parameter.kind not in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
             raise CardError("Card methods accept named arguments, without *args or **kwargs")
@@ -129,7 +133,14 @@ def _schema(action_method: Callable[..., Any]) -> tuple[str, list[_Parameter], C
         if previous is None:
             parameters.append(parameter)
             by_name[parameter.name] = parameter
-    identity = repr((feature.key, name, renderer_name, [(p.name, p.annotation) for p in parameters]))
+    # Annotation repr can contain function addresses (Annotated validators), so
+    # buttons would stop matching after every process restart. The public input
+    # schema is stable; validators still run on each decoded callback.
+    identity = json.dumps(
+        [feature.key, name, renderer_name, [(p.name, p.adapter.json_schema()) for p in parameters]],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     digest = hashlib.blake2s(identity.encode(), digest_size=6).digest()
     return base64.urlsafe_b64encode(digest).decode(), parameters, renderer
 
@@ -146,11 +157,30 @@ def _validate(
         if value is inspect.Parameter.empty:
             raise CardError(f"Missing card argument {parameter.name!r}")
         try:
+            encoded_before = parameter.adapter.dump_python(value, mode="json", warnings=False)
             result[parameter.name] = (
                 parameter.adapter.validate_json(json.dumps(value, allow_nan=False), strict=True)
                 if json_values
                 else parameter.adapter.validate_python(value, strict=True)
             )
+            parsed = result[parameter.name]
+            # Pydantic's Literal validator uses equality even in strict mode:
+            # true can otherwise select Literal[1], and 1 can select Literal[True].
+            if isinstance(value, bool) != isinstance(parsed, bool) or (type(value) is float and type(parsed) is int):
+                raise CardError(f"Invalid card argument {parameter.name!r}")
+            before = json.dumps(encoded_before, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            after = json.dumps(
+                parameter.adapter.dump_python(parsed, mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            if after != before:
+                raise CardError(
+                    f"Card argument {parameter.name!r} must preserve its encoded value; normalize before building a Button"
+                )
+        except CardError:
+            raise
         except (ValueError, TypeError, ValidationError) as exc:
             raise CardError(f"Invalid card argument {parameter.name!r}") from exc
     return result
@@ -182,7 +212,8 @@ class _ActionFilter(Filter):
             )
         except ValueError, TypeError:
             return False
-        return {"_teleforge_payload": arguments, "_teleforge_card_arguments": arguments}
+        validated = _ValidatedPayload(arguments)
+        return {"_teleforge_payload": validated, "_teleforge_card_arguments": validated}
 
 
 @dataclass
@@ -211,6 +242,13 @@ class _CardLocks:
                 del self._locks[key]
 
 
+def _locks_for(feature: Feature, renderer: str) -> _CardLocks:
+    # Declarations are inherited/shared class metadata. Runtime coalescing must
+    # instead belong to the particular application-scoped feature instance.
+    registries = cast(dict[str, _CardLocks], vars(feature).setdefault("_teleforge_card_locks", {}))
+    return registries.setdefault(renderer, _CardLocks())
+
+
 def _keyboard(view: Card, renderer: Callable[..., Any], arguments: Mapping[str, object]) -> InlineKeyboardMarkup:
     owner, renderer_name = _bound(renderer)
     render_arguments = {p.name: arguments[p.name] for p in _parameters(renderer) if p.name in arguments}
@@ -234,27 +272,35 @@ def _keyboard(view: Card, renderer: Callable[..., Any], arguments: Mapping[str, 
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def _render(ctx: Context, renderer: Callable[..., Any], arguments: Mapping[str, object]) -> Card:
+async def _render(
+    ctx: Context,
+    renderer: Callable[..., Any],
+    arguments: Mapping[str, object],
+    *,
+    action_arguments: bool = False,
+) -> tuple[Card, dict[str, Any]]:
     _declaration(renderer, "card")
     parameters = _parameters(renderer)
-    values = _validate(parameters, {p.name: arguments[p.name] for p in parameters if p.name in arguments})
-    result = renderer(ctx=ctx, **values)
+    selected = {p.name: arguments[p.name] for p in parameters if p.name in arguments} if action_arguments else arguments
+    values = dict(selected) if isinstance(arguments, _ValidatedPayload) else _validate(parameters, selected)
+    context_values = {name: ctx for name in inspect.signature(renderer).parameters if name in {"ctx", "context"}}
+    result = renderer(**context_values, **values)
     if inspect.isawaitable(result):
         result = await result
     if not isinstance(result, Card):
         raise CardError("A card renderer must return Card")
-    return result
+    return result, values
 
 
 async def show(ctx: Context, renderer: Callable[..., Any], **arguments: object) -> object:
     """Render and send one card. The application binds durable UI identity if needed."""
-    view = await _render(ctx, renderer, arguments)
-    return await ctx.reply(**view._content(_keyboard(view, renderer, arguments)), fixed=True)
+    view, values = await _render(ctx, renderer, arguments)
+    return await ctx.reply(**view._content(_keyboard(view, renderer, values)), fixed=True)
 
 
 def card[H: Callable[..., Any]](method: H) -> H:
     """Mark a pure feature renderer; direct method calls remain ordinary Python."""
-    attach_declaration(method, Declaration(kind="card", metadata={"card": True, "_locks": _CardLocks()}))
+    attach_declaration(method, Declaration(kind="card", metadata={"card": True}))
     return method
 
 
@@ -292,7 +338,8 @@ def action(
                 raise CardError("Managed actions require an accessible message sent by this bot")
             arguments = cast(dict[str, object], data["_teleforge_card_arguments"])
             renderer = cast(Callable[..., Any], getattr(feature, card))
-            locks = cast(_CardLocks, _declaration(renderer, "card").metadata["_locks"])
+            _declaration(renderer, "card")
+            locks = _locks_for(feature, card)
             if ack == "early":
                 await ctx.answer()
             async with locks.hold((ctx.bot.id, message.chat.id, message.message_id), coalesce=coalesce) as acquired:
@@ -301,8 +348,8 @@ def action(
                 result = await invoke()
                 if refresh and result is None:
                     try:
-                        view = await _render(ctx, renderer, arguments)
-                        await ctx.edit(**view._content(_keyboard(view, renderer, arguments)))
+                        view, values = await _render(ctx, renderer, arguments, action_arguments=True)
+                        await ctx.edit(**view._content(_keyboard(view, renderer, values)))
                     except Exception as exc:
                         raise CardRefreshError(card) from exc
                 return result

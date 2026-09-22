@@ -91,3 +91,29 @@ async def test_job_failure_is_observed_by_application_worker_without_replaying()
     with pytest.raises(RuntimeError, match="application outcome"):
         await worker.handlers[key]({"record_id": 1}, lease="one")
     assert feature.records == [(1, "one")]
+
+
+def test_declared_job_name_survives_internal_method_renaming() -> None:
+    class Renamed(Feature, key="reminders"):
+        @job("deliver", payload=Delivery)
+        async def deliver_current_version(self, payload: Delivery) -> None:
+            pass
+
+    worker = Worker()
+    assert bind_jobs(App(Renamed()), worker) == ("reminders.deliver",)
+
+
+def test_duplicate_job_names_fail_before_mutating_worker_registration() -> None:
+    class Duplicate(Feature):
+        @job("deliver", payload=Delivery)
+        async def first(self, payload: Delivery) -> None:
+            pass
+
+        @job("deliver", payload=Delivery)
+        async def second(self, payload: Delivery) -> None:
+            pass
+
+    worker = Worker()
+    with pytest.raises(ValueError, match="unique"):
+        bind_jobs(App(Duplicate()), worker)
+    assert worker.handlers == {}

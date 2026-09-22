@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
-from typing import Any
+from typing import Annotated, Any, Literal
 
 import pytest
 from aiogram.methods import AnswerCallbackQuery, EditMessageText, SendMessage
 from aiogram.types import CallbackQuery, Chat, Message, User
+from pydantic import AfterValidator
 
 from teleforge.cards import Button, Card, CardError, CardRefreshError, action, card, show
 from teleforge.context import CallbackContext, Context
@@ -260,3 +261,140 @@ async def test_explicit_refresh_barrier_preserves_committed_action_without_edit(
     await click(bot, feature, ui, callbacks[0])
     assert feature.value == 1
     assert not any(isinstance(request, EditMessageText) for request in bot.requests)
+
+
+async def test_numeric_literal_payload_does_not_accept_boolean_or_float_equivalents() -> None:
+    class LiteralCounter(Counter):
+        @action(card="panel")
+        async def increase(self, ctx: Context, item: int, revision: Literal[0, 1]) -> None:
+            await self.change(ctx, revision, 1)
+
+    bot, feature = RecordingBot(), LiteralCounter()
+    ui, callbacks = await open_card(bot, feature)
+    prefix = callbacks[0].rsplit(":", 1)[0]
+    assert await click(bot, feature, ui, prefix + ":[3,false]") is False
+    assert await click(bot, feature, ui, prefix + ":[3,0.0]") is False
+    assert feature.value == 0
+
+
+async def test_renderer_defaults_are_bound_into_actions_before_action_defaults() -> None:
+    class Defaults(Counter):
+        @card
+        async def panel(self, ctx: Context, item: int = 1) -> Card:
+            return Card(f"Item {item}", buttons=((Button("+", self.increase, revision=0),),))
+
+        @action(card="panel")
+        async def increase(self, ctx: Context, item: int = 2, revision: int = 0) -> None:
+            self.value = item
+
+    bot, feature = RecordingBot(), Defaults()
+    sent = await show(Context(bot, message()), feature.panel)
+    assert isinstance(sent, Message) and sent.reply_markup is not None
+    payload = sent.reply_markup.inline_keyboard[0][0].callback_data
+    assert payload is not None
+    await click(bot, feature, sent, payload)
+    assert feature.value == 1
+
+
+async def test_unknown_renderer_argument_fails_before_send() -> None:
+    with pytest.raises(CardError, match="Unknown"):
+        await show(Context(RecordingBot(), message()), Counter().panel, item=3, typo=4)
+
+
+async def test_card_coalescing_is_owned_by_each_feature_instance() -> None:
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class Refresh(Counter):
+        def __init__(self, *, pause: bool) -> None:
+            super().__init__()
+            self.pause = pause
+
+        @action(card="panel", coalesce=True)
+        async def increase(self, ctx: Context, item: int, revision: int) -> None:
+            if self.pause:
+                entered.set()
+                await release.wait()
+            self.value += 1
+
+    first, second = Refresh(pause=True), Refresh(pause=False)
+    first_bot, second_bot = RecordingBot(), RecordingBot()
+    first_ui, first_callbacks = await open_card(first_bot, first)
+    second_ui, second_callbacks = await open_card(second_bot, second)
+    assert first_ui.message_id == second_ui.message_id
+    pending = asyncio.create_task(click(first_bot, first, first_ui, first_callbacks[0]))
+    try:
+        await entered.wait()
+        await click(second_bot, second, second_ui, second_callbacks[0])
+        assert second.value == 1
+    finally:
+        release.set()
+        await pending
+
+
+async def test_validator_function_addresses_do_not_change_button_identity() -> None:
+    def application() -> Counter:
+        def validate(value: int) -> int:
+            return value
+
+        class Typed(Counter, key="stable"):
+            Revision = Annotated[int, AfterValidator(validate)]
+
+            @action(card="panel")
+            async def increase(self, ctx: Context, item: int, revision: Revision) -> None:
+                await self.change(ctx, revision, 1)
+
+        return Typed()
+
+    first, second = application(), application()
+    _, before_restart = await open_card(RecordingBot(), first)
+    bot = RecordingBot()
+    ui, after_restart = await open_card(bot, second)
+    assert before_restart == after_restart
+    await click(bot, second, ui, before_restart[0])
+    assert second.value == 1
+
+
+async def test_cancelled_waiter_releases_only_its_own_card_lock_registration() -> None:
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class Waiting(Counter):
+        @action(card="panel")
+        async def increase(self, ctx: Context, item: int, revision: int) -> None:
+            entered.set()
+            await release.wait()
+            self.value += 1
+
+    bot, feature = RecordingBot(), Waiting()
+    ui, callbacks = await open_card(bot, feature)
+    first = asyncio.create_task(click(bot, feature, ui, callbacks[0]))
+    await entered.wait()
+    waiter = asyncio.create_task(click(bot, feature, ui, callbacks[0]))
+    await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    release.set()
+    await first
+    await click(bot, feature, ui, callbacks[0])
+    assert feature.value == 2
+
+
+async def test_transforming_callback_validator_cannot_retarget_the_displayed_record() -> None:
+    def change_identity(value: int) -> int:
+        return value + 1
+
+    class Transforming(Counter):
+        Item = Annotated[int, AfterValidator(change_identity)]
+
+        @card
+        async def panel(self, ctx: Context, item: Item) -> Card:
+            return Card(f"Record {item}", buttons=((Button("+", self.increase, revision=0),),))
+
+        @action(card="panel")
+        async def increase(self, ctx: Context, item: Item, revision: int) -> None:
+            self.value = item
+
+    bot = RecordingBot()
+    with pytest.raises(CardError, match="normalize before building"):
+        await open_card(bot, Transforming())
+    assert not bot.requests
