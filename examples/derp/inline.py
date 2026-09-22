@@ -2,7 +2,7 @@
 
 import uuid
 
-from aiogram import F, html
+from aiogram import Bot, F, html
 from aiogram.methods import AnswerInlineQuery
 from aiogram.types import (
     ChosenInlineResult,
@@ -111,7 +111,7 @@ class InlineAnswers(Feature, key="inline"):
         return event.answer([result], button=button, cache_time=300, is_personal=True)
 
     @chosen_inline_result()
-    async def answer(self, chosen_result: ChosenInlineResult, *, user_model: UserModel | None = None) -> None:
+    async def answer(self, chosen_result: ChosenInlineResult, bot: Bot, *, user_model: UserModel | None = None) -> None:
         if not chosen_result.inline_message_id:
             return
         if user_model is None:
@@ -132,4 +132,4 @@ class InlineAnswers(Feature, key="inline"):
                 else:
                     text, markup = _presentation(outcome)
         # Keep Derp's Markdown/HTML conversion and fixed-inline fallback intact.
-        await MessageSender(bot=chosen_result.bot, chat_id=0).edit_inline(chosen_result.inline_message_id, text, reply_markup=markup)
+        await MessageSender(bot=bot, chat_id=0).edit_inline(chosen_result.inline_message_id, text, reply_markup=markup)
